@@ -63,6 +63,8 @@ class ClaudeAgent:
         self._continue_as_new_policy = (
             continue_as_new_policy or ContinueAsNewPolicy()
         )
+        self._context = self._context_manager_factory()
+        self._context_initialized = False
 
     async def run(
         self,
@@ -71,14 +73,18 @@ class ClaudeAgent:
         state: ClaudeAgentState | None = None,
         max_turns: int = 20,
     ) -> ClaudeAgentResult:
-        context = self._context_manager_factory()
         if state is None:
             if user_prompt is None:
                 raise ValueError("user_prompt is required when state is not provided")
-            await context.initialize(user_prompt)
+            if self._context_initialized:
+                await self._context.record_user_message(user_prompt)
+            else:
+                await self._context.initialize(user_prompt)
+                self._context_initialized = True
             completed_turns = 0
         else:
-            context.restore(state.context_snapshot)
+            self._context.restore(state.context_snapshot)
+            self._context_initialized = True
             completed_turns = state.turns
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
@@ -90,14 +96,18 @@ class ClaudeAgent:
                     system_prompt=self._system_prompt,
                     model=self._model,
                     max_tokens=self._max_tokens,
-                    tools=tool_schemas,
-                    chat_history=await context.messages_for_model(),
+                    tools=[_tool_param_to_dict(tool) for tool in tool_schemas],
+                    chat_history=[
+                        _message_param_to_dict(message)
+                        for message in await self._context.messages_for_model()
+                    ],
                 ),
                 summary="claude",
                 **self._claude_activity_options.to_execute_activity_kwargs(),
             )
 
-            await context.record_assistant_message(response.message)
+            response_message = cast(MessageParam, response.message)
+            await self._context.record_assistant_message(response_message)
 
             if response.stop_reason != "tool_use":
                 return ClaudeAgentResult(
@@ -106,24 +116,24 @@ class ClaudeAgent:
                     turns=turn,
                 )
 
-            tool_results = await self._execute_requested_tools(response.message)
-            await context.record_tool_results(tool_results)
+            tool_results = await self._execute_requested_tools(response_message)
+            await self._context.record_tool_results(tool_results)
             if self._should_return_continue_as_new():
                 return ClaudeAgentResult(
                     message=response.message,
                     stop_reason=response.stop_reason,
                     turns=turn,
                     continuation_state=ClaudeAgentState(
-                        context_snapshot=context.snapshot(),
+                        context_snapshot=self._context.snapshot(),
                         turns=turn,
                     ),
                 )
 
         return ClaudeAgentResult(
-            message=MessageParam(
-                role="assistant",
-                content=f"Stopped after reaching max_turns={max_turns}.",
-            ),
+            message={
+                "role": "assistant",
+                "content": f"Stopped after reaching max_turns={max_turns}.",
+            },
             stop_reason="max_tokens",
             turns=max_turns,
         )
@@ -188,7 +198,7 @@ class ClaudeAgentState:
 
 @dataclass
 class ClaudeAgentResult:
-    message: MessageParam
+    message: dict[str, Any]
     stop_reason: ClaudeStopReason | None
     turns: int
     continuation_state: ClaudeAgentState | None = None
@@ -203,15 +213,15 @@ class ClaudeRequest:
     system_prompt: str
     model: str
     max_tokens: int
-    tools: list[ToolParam]
-    chat_history: list[MessageParam]
+    tools: list[dict[str, Any]]
+    chat_history: list[dict[str, Any]]
 
 
 @dataclass
 class ClaudeResponse:
     id: str
     model: str
-    message: MessageParam
+    message: dict[str, Any]
     stop_reason: ClaudeStopReason | None
     stop_sequence: str | None
     usage: dict[str, Any]
@@ -219,22 +229,25 @@ class ClaudeResponse:
 
 @activity.defn
 async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
-    async with AsyncAnthropic() as client:
-        response = await client.messages.create(
-            model=request.model,
-            max_tokens=request.max_tokens,
-            system=request.system_prompt,
-            messages=request.chat_history,
-            tools=request.tools,
-        )
+    create_params: dict[str, Any] = {
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "system": request.system_prompt,
+        "messages": request.chat_history,
+    }
+    if request.tools:
+        create_params["tools"] = request.tools
+
+    async with AsyncAnthropic(max_retries=0) as client:
+        response = await client.messages.create(**create_params)
 
     return ClaudeResponse(
         id=response.id,
         model=response.model,
-        message=MessageParam(
-            role=response.role,
-            content=response.content,
-        ),
+        message={
+            "role": response.role,
+            "content": [block.to_dict() for block in response.content],
+        },
         stop_reason=response.stop_reason,
         stop_sequence=response.stop_sequence,
         usage=response.usage.to_dict(),
@@ -256,3 +269,26 @@ def _tool_use_blocks(message: MessageParam) -> list[dict[str, Any]]:
         if block_dict.get("type") == "tool_use":
             blocks.append(block_dict)
     return blocks
+
+
+def _message_param_to_dict(message: MessageParam) -> dict[str, Any]:
+    content = message["content"]
+    if isinstance(content, str):
+        message_content: str | list[Any] = content
+    else:
+        message_content = [_block_to_dict(block) for block in content]
+
+    return {
+        "role": message["role"],
+        "content": message_content,
+    }
+
+
+def _tool_param_to_dict(tool: ToolParam) -> dict[str, Any]:
+    return dict(cast(Mapping[str, Any], tool))
+
+
+def _block_to_dict(block: Any) -> dict[str, Any]:
+    if isinstance(block, dict):
+        return dict(cast(Mapping[str, Any], block))
+    return cast(dict[str, Any], block.to_dict())

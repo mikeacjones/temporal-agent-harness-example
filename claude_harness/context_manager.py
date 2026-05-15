@@ -13,6 +13,9 @@ class ContextManager(Protocol):
     async def initialize(self, user_prompt: str) -> None:
         pass
 
+    async def record_user_message(self, user_prompt: str) -> None:
+        pass
+
     def restore(self, snapshot: ContextSnapshot) -> None:
         pass
 
@@ -52,7 +55,11 @@ class SlidingWindowContextManager:
             raise ValueError("max_tool_result_chars must be at least 1")
 
     async def initialize(self, user_prompt: str) -> None:
-        self._messages = [MessageParam(role="user", content=user_prompt)]
+        self._messages = []
+        await self.record_user_message(user_prompt)
+
+    async def record_user_message(self, user_prompt: str) -> None:
+        self._messages.append(MessageParam(role="user", content=user_prompt))
 
     def restore(self, snapshot: ContextSnapshot) -> None:
         version = snapshot.get("version")
