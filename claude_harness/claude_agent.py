@@ -10,11 +10,15 @@ from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam
 from temporalio import activity, workflow
 
-from .tools import ToolResult, ToolSet
+from .tools import ActivityOptions, ToolResult, ToolSet
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
 ]
+
+DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
+    start_to_close_timeout=timedelta(minutes=2)
+)
 
 
 class ClaudeAgent:
@@ -27,6 +31,8 @@ class ClaudeAgent:
         max_tokens: int = 4096,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        activity_options: ActivityOptions | None = None,
+        claude_activity_options: ActivityOptions | None = None,
     ):
         self._system_prompt = system_prompt
         self._tools = tools
@@ -34,6 +40,10 @@ class ClaudeAgent:
         self._max_tokens = max_tokens
         self._tool_names = tool_names
         self._stream_id = stream_id
+        self._activity_options = activity_options
+        self._claude_activity_options = (
+            claude_activity_options or DEFAULT_CLAUDE_ACTIVITY_OPTIONS
+        )
 
     async def run(self, user_prompt: str, *, max_turns: int = 20) -> ClaudeAgentResult:
         chat_history: list[MessageParam] = [
@@ -51,8 +61,8 @@ class ClaudeAgent:
                     tools=tool_schemas,
                     chat_history=chat_history,
                 ),
-                start_to_close_timeout=timedelta(minutes=2),
                 summary="claude",
+                **self._claude_activity_options.to_execute_activity_kwargs(),
             )
 
             if response.stop_reason != "tool_use":
@@ -82,7 +92,10 @@ class ClaudeAgent:
                 error=True,
             )
         return await self._tools.execute_tool(
-            tool_name, kwargs, stream_id=self._stream_id
+            tool_name,
+            kwargs,
+            stream_id=self._stream_id,
+            activity_options=self._activity_options,
         )
 
     async def _execute_requested_tools(
