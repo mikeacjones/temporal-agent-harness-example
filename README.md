@@ -92,7 +92,7 @@ The harness keeps the summary convention while allowing each step to use the Tem
 
 ## Complete Long-Running Tool Example
 
-This can live in one tool file. The worker still needs to import that file and register the child workflow class plus the direct activities used by that child workflow, but the tool, request/response types, child workflow, signal handler, and activity functions can be owned together.
+This can live in one tool file. The worker still needs to import that file and register the child workflow class plus the direct activity used by that child workflow, but the tool, guard, request/response types, child workflow, signal handler, and activity functions can be owned together.
 
 ```python
 # substitute_item_tool.py
@@ -104,7 +104,13 @@ from typing import Literal
 from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.tools import ToolContext, ToolResult, ToolType
+    from claude_harness.tools import (
+        GuardContext,
+        GuardResult,
+        ToolContext,
+        ToolResult,
+        ToolType,
+    )
     from my_agent.registry import TOOLS
 
 
@@ -130,7 +136,6 @@ class SubstitutionConfirmationResult:
     status: ConfirmationStatus
     accepted: bool
     email: SubstitutionEmail
-    applied: dict[str, str] | None = None
 
 
 @activity.defn
@@ -144,17 +149,6 @@ async def send_substitution_email(
         message_id="email-message-id",
         confirmation_workflow_id=confirmation_workflow_id,
     )
-
-
-@activity.defn
-async def apply_substitution(
-    request: SubstitutionConfirmationRequest,
-) -> dict[str, str]:
-    return {
-        "order_id": request.order_id,
-        "removed": request.unavailable_sku,
-        "added": request.substitute_sku,
-    }
 
 
 @workflow.defn
@@ -198,27 +192,62 @@ class SubstitutionConfirmationWorkflow:
                 email=email,
             )
 
-        applied = await workflow.execute_activity(
-            apply_substitution,
-            request,
-            start_to_close_timeout=timedelta(minutes=2),
-            summary="substitute_item:apply_substitution",
-        )
         return SubstitutionConfirmationResult(
             status="accepted",
             accepted=True,
             email=email,
-            applied=applied,
         )
+
+
+async def _apply_substitution(
+    order_id: str,
+    unavailable_sku: str,
+    substitute_sku: str,
+) -> dict[str, str]:
+    return {
+        "order_id": order_id,
+        "removed": unavailable_sku,
+        "added": substitute_sku,
+    }
+
+
+@TOOLS.guard(name="confirm_substitution_with_customer", fulfills=ToolType.MUTATING)
+async def confirm_substitution_with_customer(ctx: GuardContext) -> GuardResult:
+    result = await workflow.execute_child_workflow(
+        SubstitutionConfirmationWorkflow.run,
+        SubstitutionConfirmationRequest(
+            order_id=ctx.tool_args["order_id"],
+            unavailable_sku=ctx.tool_args["unavailable_sku"],
+            substitute_sku=ctx.tool_args["substitute_sku"],
+            customer_email=ctx.tool_args["customer_email"],
+        ),
+        id=f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}",
+        static_summary=f"{ctx.guard_name}:customer_confirmation",
+    )
+
+    if not result.accepted:
+        return GuardResult(
+            passed=False,
+            reason=result.status,
+            llm_payload={
+                "error": "Customer did not approve the substitution.",
+                "confirmation": asdict(result),
+            },
+        )
+
+    return GuardResult(
+        passed=True,
+        internal_payload={"confirmation": asdict(result)},
+    )
 
 
 @TOOLS.tool(
     name="substitute_item",
     description=(
-        "Ask a customer to confirm an item substitution, wait up to 5 days for "
-        "their response, and apply the substitution if accepted."
+        "Substitute an unavailable order item after customer confirmation."
     ),
     tool_type=ToolType.MUTATING,
+    pre_guards=[confirm_substitution_with_customer],
 )
 async def substitute_item(
     ctx: ToolContext,
@@ -227,25 +256,30 @@ async def substitute_item(
     substitute_sku: str,
     customer_email: str,
 ) -> ToolResult:
-    result = await workflow.execute_child_workflow(
-        SubstitutionConfirmationWorkflow.run,
-        SubstitutionConfirmationRequest(
-            order_id=order_id,
-            unavailable_sku=unavailable_sku,
-            substitute_sku=substitute_sku,
-            customer_email=customer_email,
-        ),
-        id=f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}",
-        static_summary=f"{ctx.tool_name}:customer_confirmation",
+    applied = await ctx.activity(
+        _apply_substitution,
+        step="apply_substitution",
+        args={
+            "order_id": order_id,
+            "unavailable_sku": unavailable_sku,
+            "substitute_sku": substitute_sku,
+        },
+        start_to_close_timeout=timedelta(minutes=2),
     )
-    return ToolResult(payload=asdict(result), error=False)
+    return ToolResult(
+        payload={
+            "substitution_applied": True,
+            "applied": applied,
+        },
+        error=False,
+    )
 ```
 
 The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `SubstitutionConfirmationWorkflow.confirm_substitution`.
 
-This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, it is durable orchestration: a child workflow sends an email, waits for a customer signal or a five-day timer, then conditionally mutates the order.
+This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the guard performs durable policy orchestration: a child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
 
-Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool and workflow shape the same and move the direct activity functions behind importable module-level functions.
+Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool, guard, and workflow shape the same and move the activity functions behind importable module-level functions.
 
 ## Guards
 
@@ -315,7 +349,6 @@ from claude_harness.claude_agent import call_claude
 from claude_harness.tools import run_guard_activity, run_tool_activity
 from my_agent.tools.substitute_item_tool import (
     SubstitutionConfirmationWorkflow,
-    apply_substitution,
     send_substitution_email,
 )
 
@@ -324,7 +357,6 @@ activities = [
     run_tool_activity,
     run_guard_activity,
     send_substitution_email,
-    apply_substitution,
 ]
 
 workflows = [
