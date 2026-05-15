@@ -1,216 +1,40 @@
+from __future__ import annotations
+
 import inspect
-import importlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from enum import StrEnum
-from collections.abc import Iterable
 from typing import Any, Awaitable, Callable, cast, get_type_hints
 
 from anthropic.types import ToolParam
-from temporalio import activity as temporal_activity
-from temporalio.common import Priority, RetryPolicy
-from temporalio import workflow
-from temporalio.exceptions import ApplicationError
-from temporalio.workflow import ActivityCancellationType, VersioningIntent
 from pydantic import create_model
+from temporalio import activity as temporal_activity
+from temporalio import workflow
+from temporalio.common import Priority, RetryPolicy
+from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
-from .streaming import StreamContext
-
-ActivityFn = Callable[..., Any]
-ToolFn = Callable[..., Awaitable["ToolResult"]]
-GuardFn = Callable[..., Any]
-RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
-RUN_GUARD_ACTIVITY_NAME = "claude_harness.run_guard_activity"
-
-
-class ToolType(StrEnum):
-    READ = "read"
-    MUTATING = "mutating"
-    ADMIN = "admin"
-
-
-class GuardTiming(StrEnum):
-    PRE = "pre"
-    POST = "post"
-
-
-@dataclass(frozen=True)
-class ActivityOptions:
-    task_queue: str | None = None
-    schedule_to_close_timeout: timedelta | None = None
-    schedule_to_start_timeout: timedelta | None = None
-    start_to_close_timeout: timedelta | None = None
-    heartbeat_timeout: timedelta | None = None
-    retry_policy: RetryPolicy | None = None
-    cancellation_type: ActivityCancellationType | None = None
-    versioning_intent: VersioningIntent | None = None
-    priority: Priority | None = None
-
-    def with_overrides(
-        self,
-        *,
-        task_queue: str | None = None,
-        schedule_to_close_timeout: timedelta | None = None,
-        schedule_to_start_timeout: timedelta | None = None,
-        start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
-        retry_policy: RetryPolicy | None = None,
-        cancellation_type: ActivityCancellationType | None = None,
-        versioning_intent: VersioningIntent | None = None,
-        priority: Priority | None = None,
-    ) -> "ActivityOptions":
-        return ActivityOptions(
-            task_queue=self.task_queue if task_queue is None else task_queue,
-            schedule_to_close_timeout=(
-                self.schedule_to_close_timeout
-                if schedule_to_close_timeout is None
-                else schedule_to_close_timeout
-            ),
-            schedule_to_start_timeout=(
-                self.schedule_to_start_timeout
-                if schedule_to_start_timeout is None
-                else schedule_to_start_timeout
-            ),
-            start_to_close_timeout=(
-                self.start_to_close_timeout
-                if start_to_close_timeout is None
-                else start_to_close_timeout
-            ),
-            heartbeat_timeout=(
-                self.heartbeat_timeout
-                if heartbeat_timeout is None
-                else heartbeat_timeout
-            ),
-            retry_policy=self.retry_policy if retry_policy is None else retry_policy,
-            cancellation_type=(
-                self.cancellation_type
-                if cancellation_type is None
-                else cancellation_type
-            ),
-            versioning_intent=(
-                self.versioning_intent
-                if versioning_intent is None
-                else versioning_intent
-            ),
-            priority=self.priority if priority is None else priority,
-        )
-
-    def to_execute_activity_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        for name in (
-            "task_queue",
-            "schedule_to_close_timeout",
-            "schedule_to_start_timeout",
-            "start_to_close_timeout",
-            "heartbeat_timeout",
-            "retry_policy",
-            "cancellation_type",
-            "versioning_intent",
-            "priority",
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                kwargs[name] = value
-        return kwargs
-
-
-DEFAULT_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=5)
+from .activity_options import (
+    DEFAULT_ACTIVITY_OPTIONS,
+    ActivityOptions,
+    activity_options_with_overrides,
 )
+from .activity_router import ActivityFn, call_activity, function_ref, resolve_function_ref
+from .guards import (
+    GuardActivityRequest,
+    GuardContext,
+    GuardDef,
+    GuardFn,
+    GuardSet,
+    GuardPolicy,
+    GuardResult,
+    GuardTiming,
+    run_guard_activity,
+)
+from .streaming import StreamContext
+from .tool_types import ToolType
 
-
-@dataclass(frozen=True)
-class GuardPolicy:
-    required_pre: frozenset[ToolType] = frozenset({ToolType.ADMIN})
-    required_post: frozenset[ToolType] = frozenset()
-
-
-@dataclass
-class GuardResult:
-    passed: bool
-    reason: str | None = None
-    llm_payload: dict[str, Any] | None = None
-    internal_payload: dict[str, Any] | None = None
-
-
-@dataclass
-class GuardContext:
-    guard_name: str
-    tool_name: str
-    tool_type: ToolType
-    tool_args: dict[str, Any]
-    tool_result: "ToolResult | None" = None
-    stream_id: str | None = None
-    activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
-    _activity_count: int = field(default=0, init=False)
-    _used_unstepped_activity: bool = field(default=False, init=False)
-
-    async def activity(
-        self,
-        fn: ActivityFn,
-        *,
-        step: str | None = None,
-        args: dict[str, Any] | None = None,
-        activity_options: ActivityOptions | None = None,
-        task_queue: str | None = None,
-        schedule_to_close_timeout: timedelta | None = None,
-        schedule_to_start_timeout: timedelta | None = None,
-        start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
-        retry_policy: RetryPolicy | None = None,
-        cancellation_type: ActivityCancellationType | None = None,
-        activity_id: str | None = None,
-        versioning_intent: VersioningIntent | None = None,
-        priority: Priority | None = None,
-    ) -> Any:
-        function_ref = _function_ref(fn)
-        summary = self.guard_name if step is None else f"{self.guard_name}:{step}"
-        options = _activity_options_with_overrides(
-            self.activity_options,
-            activity_options=activity_options,
-            task_queue=task_queue,
-            schedule_to_close_timeout=schedule_to_close_timeout,
-            schedule_to_start_timeout=schedule_to_start_timeout,
-            start_to_close_timeout=start_to_close_timeout,
-            heartbeat_timeout=heartbeat_timeout,
-            retry_policy=retry_policy,
-            cancellation_type=cancellation_type,
-            versioning_intent=versioning_intent,
-            priority=priority,
-        )
-        activity_kwargs = options.to_execute_activity_kwargs()
-        if activity_id is not None:
-            activity_kwargs["activity_id"] = activity_id
-
-        self._record_activity_call(step)
-
-        return await workflow.execute_activity(
-            RUN_GUARD_ACTIVITY_NAME,
-            GuardActivityRequest(
-                function_ref=function_ref,
-                args=args or {},
-                guard_name=self.guard_name,
-                step=step,
-                stream_id=self.stream_id,
-            ),
-            summary=summary,
-            **activity_kwargs,
-        )
-
-    def _record_activity_call(self, step: str | None) -> None:
-        if step is None and self._activity_count > 0:
-            raise ValueError(
-                f"Guard {self.guard_name} called multiple activities; pass step=..."
-            )
-        if step is not None and self._used_unstepped_activity:
-            raise ValueError(
-                f"Guard {self.guard_name} mixed an unstepped activity with stepped "
-                "activities"
-            )
-
-        self._activity_count += 1
-        if step is None:
-            self._used_unstepped_activity = True
+ToolFn = Callable[..., Awaitable["ToolResult"]]
+RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
 
 
 @dataclass
@@ -246,9 +70,8 @@ class ToolContext:
         versioning_intent: VersioningIntent | None = None,
         priority: Priority | None = None,
     ) -> Any:
-        function_ref = _function_ref(fn)
         summary = self.tool_name if step is None else f"{self.tool_name}:{step}"
-        options = _activity_options_with_overrides(
+        options = activity_options_with_overrides(
             self.activity_options,
             activity_options=activity_options,
             task_queue=task_queue,
@@ -270,7 +93,7 @@ class ToolContext:
         return await workflow.execute_activity(
             RUN_TOOL_ACTIVITY_NAME,
             ToolActivityRequest(
-                function_ref=function_ref,
+                function_ref=function_ref(fn),
                 args=args or {},
                 tool_name=self.tool_name,
                 step=step,
@@ -312,22 +135,6 @@ class ToolActivityRequest:
 
 
 @dataclass
-class GuardActivityRequest:
-    function_ref: str
-    args: dict[str, Any]
-    guard_name: str | None = None
-    step: str | None = None
-    stream_id: str | None = None
-
-
-@dataclass
-class GuardDef:
-    name: str
-    fulfills: frozenset[ToolType]
-    fn: GuardFn
-
-
-@dataclass
 class ToolDef:
     schema: ToolParam
     tool_type: ToolType
@@ -339,9 +146,7 @@ class ToolDef:
 class ToolSet:
     def __init__(self, *, guard_policy: GuardPolicy | None = None) -> None:
         self._tool_registry: dict[str, ToolDef] = {}
-        self._guard_registry: dict[str, GuardDef] = {}
-        self._guard_functions: dict[GuardFn, GuardDef] = {}
-        self._guard_policy = guard_policy or GuardPolicy()
+        self._guards = GuardSet(guard_policy=guard_policy)
 
     def tool_names(self) -> list[str]:
         return list(self._tool_registry)
@@ -363,22 +168,26 @@ class ToolSet:
         activity_options: ActivityOptions | None = None,
     ) -> ToolResult:
         tool = self.get_tool(name)
-        self._validate_guard_requirements(tool)
+        self._guards.validate_tool_guards(
+            tool_type=tool.tool_type,
+            pre_guards=tool.pre_guards,
+            post_guards=tool.post_guards,
+        )
         tool_args = args or {}
         resolved_activity_options = activity_options or DEFAULT_ACTIVITY_OPTIONS
 
-        pre_guard_result = await self._execute_guards(
+        pre_guard_failure = await self._guards.execute_guards(
             tool.pre_guards,
             GuardTiming.PRE,
-            tool,
-            name,
-            tool_args,
-            None,
-            stream_id,
-            resolved_activity_options,
+            tool_name=name,
+            tool_type=tool.tool_type,
+            tool_args=tool_args,
+            tool_result=None,
+            stream_id=stream_id,
+            activity_options=resolved_activity_options,
         )
-        if pre_guard_result is not None:
-            return pre_guard_result
+        if pre_guard_failure is not None:
+            return ToolResult(payload=pre_guard_failure.payload, error=True)
 
         ctx = ToolContext(
             tool_name=name,
@@ -388,18 +197,18 @@ class ToolSet:
         )
         tool_result = await _call_tool(tool.fn, ctx, tool_args)
 
-        post_guard_result = await self._execute_guards(
+        post_guard_failure = await self._guards.execute_guards(
             tool.post_guards,
             GuardTiming.POST,
-            tool,
-            name,
-            tool_args,
-            tool_result,
-            stream_id,
-            resolved_activity_options,
+            tool_name=name,
+            tool_type=tool.tool_type,
+            tool_args=tool_args,
+            tool_result=tool_result,
+            stream_id=stream_id,
+            activity_options=resolved_activity_options,
         )
-        if post_guard_result is not None:
-            return post_guard_result
+        if post_guard_failure is not None:
+            return ToolResult(payload=post_guard_failure.payload, error=True)
 
         return tool_result
 
@@ -426,8 +235,8 @@ class ToolSet:
                 ),
                 tool_type=tool_type,
                 fn=fn,
-                pre_guards=self._guard_defs_for(pre_guards or []),
-                post_guards=self._guard_defs_for(post_guards or []),
+                pre_guards=self._guards.defs_for(pre_guards or []),
+                post_guards=self._guards.defs_for(post_guards or []),
             )
             return fn
 
@@ -439,80 +248,7 @@ class ToolSet:
         name: str,
         fulfills: ToolType | Iterable[ToolType],
     ):
-        def decorator(fn: GuardFn) -> GuardFn:
-            if name in self._guard_registry:
-                raise ValueError(f"Duplicate guard name: {name}")
-
-            guard = GuardDef(
-                name=name,
-                fulfills=_tool_type_set(fulfills),
-                fn=fn,
-            )
-            self._guard_registry[name] = guard
-            self._guard_functions[fn] = guard
-            return fn
-
-        return decorator
-
-    def _guard_defs_for(self, guards: Iterable[GuardFn]) -> list[GuardDef]:
-        return [self._guard_def_for(guard) for guard in guards]
-
-    def _guard_def_for(self, guard: GuardFn) -> GuardDef:
-        try:
-            return self._guard_functions[guard]
-        except KeyError as err:
-            raise ValueError(
-                f"Guard {guard.__name__} is not registered; decorate it with "
-                "ToolSet.guard before using it in a tool"
-            ) from err
-
-    def _validate_guard_requirements(self, tool: ToolDef) -> None:
-        if tool.tool_type in self._guard_policy.required_pre and not tool.pre_guards:
-            raise ValueError(
-                f"Tool type {tool.tool_type} requires at least one pre guard"
-            )
-        if tool.tool_type in self._guard_policy.required_post and not tool.post_guards:
-            raise ValueError(
-                f"Tool type {tool.tool_type} requires at least one post guard"
-            )
-
-        for guard in tool.pre_guards:
-            if tool.tool_type not in guard.fulfills:
-                raise ValueError(
-                    f"Pre guard {guard.name} does not fulfill {tool.tool_type}"
-                )
-        for guard in tool.post_guards:
-            if tool.tool_type not in guard.fulfills:
-                raise ValueError(
-                    f"Post guard {guard.name} does not fulfill {tool.tool_type}"
-                )
-
-    async def _execute_guards(
-        self,
-        guards: list[GuardDef],
-        timing: GuardTiming,
-        tool: ToolDef,
-        tool_name: str,
-        tool_args: dict[str, Any],
-        tool_result: ToolResult | None,
-        stream_id: str | None,
-        activity_options: ActivityOptions,
-    ) -> ToolResult | None:
-        for guard in guards:
-            ctx = GuardContext(
-                guard_name=guard.name,
-                tool_name=tool_name,
-                tool_type=tool.tool_type,
-                tool_args=tool_args,
-                tool_result=tool_result,
-                stream_id=stream_id,
-                activity_options=activity_options,
-            )
-            result = await _call_guard(guard.fn, ctx)
-            if not result.passed:
-                return _guard_failure_tool_result(guard, timing, result)
-
-        return None
+        return self._guards.guard(name=name, fulfills=fulfills)
 
 
 def _input_schema_for_tool(fn: ToolFn) -> dict[str, Any]:
@@ -552,24 +288,13 @@ def _input_schema_for_tool(fn: ToolFn) -> dict[str, Any]:
 
 @temporal_activity.defn(name=RUN_TOOL_ACTIVITY_NAME)
 async def run_tool_activity(request: ToolActivityRequest) -> Any:
-    fn = _resolve_function_ref(request.function_ref)
+    fn = resolve_function_ref(request.function_ref)
     stream = StreamContext(
         stream_id=request.stream_id,
         tool_name=request.tool_name,
         step=request.step,
     )
-    return await _call_activity(fn, request.args, stream)
-
-
-@temporal_activity.defn(name=RUN_GUARD_ACTIVITY_NAME)
-async def run_guard_activity(request: GuardActivityRequest) -> Any:
-    fn = _resolve_function_ref(request.function_ref)
-    stream = StreamContext(
-        stream_id=request.stream_id,
-        tool_name=request.guard_name,
-        step=request.step,
-    )
-    return await _call_activity(fn, request.args, stream)
+    return await call_activity(fn, request.args, stream)
 
 
 async def _call_tool(
@@ -580,127 +305,6 @@ async def _call_tool(
     if inspect.isawaitable(result):
         return await result
     return result
-
-
-async def _call_guard(fn: GuardFn, ctx: GuardContext) -> GuardResult:
-    kwargs = _kwargs_for_guard(fn, ctx)
-    result = fn(**kwargs)
-    if inspect.isawaitable(result):
-        result = await result
-
-    if not isinstance(result, GuardResult):
-        raise TypeError(f"Guard {fn.__name__} must return GuardResult")
-
-    return result
-
-
-async def _call_activity(
-    fn: ActivityFn, args: dict[str, Any], stream: StreamContext
-) -> Any:
-    result = fn(**_kwargs_for_activity(fn, stream, args))
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-def _function_ref(fn: ActivityFn) -> str:
-    module_name = getattr(fn, "__module__", None)
-    qualname = getattr(fn, "__qualname__", None)
-    if not module_name or not qualname or "<locals>" in qualname:
-        raise ValueError(
-            f"Activity function {fn} must be an importable module-level function"
-        )
-
-    return f"{module_name}:{qualname}"
-
-
-def _resolve_function_ref(function_ref: str) -> ActivityFn:
-    module_name, separator, qualname = function_ref.partition(":")
-    if not separator or not module_name or not qualname:
-        raise ApplicationError(
-            f"Invalid tool activity function reference: {function_ref}",
-            type="InvalidToolActivityFunctionRef",
-            non_retryable=True,
-        )
-
-    try:
-        obj: Any = importlib.import_module(module_name)
-        for attr in qualname.split("."):
-            obj = getattr(obj, attr)
-    except (ImportError, AttributeError) as err:
-        raise ApplicationError(
-            f"Unable to resolve tool activity function: {function_ref}",
-            type="UnknownToolActivityFunction",
-            non_retryable=True,
-        ) from err
-
-    if not callable(obj):
-        raise ApplicationError(
-            f"Tool activity function reference is not callable: {function_ref}",
-            type="InvalidToolActivityFunctionRef",
-            non_retryable=True,
-        )
-
-    return cast(ActivityFn, obj)
-
-
-def _tool_type_set(fulfills: ToolType | Iterable[ToolType]) -> frozenset[ToolType]:
-    if isinstance(fulfills, ToolType):
-        return frozenset({fulfills})
-
-    tool_types = frozenset(fulfills)
-    if not tool_types:
-        raise ValueError("Guard must fulfill at least one ToolType")
-    invalid_tool_types = [t for t in tool_types if not isinstance(t, ToolType)]
-    if invalid_tool_types:
-        raise TypeError("Guard fulfills must contain only ToolType values")
-    return tool_types
-
-
-def _guard_failure_tool_result(
-    guard: GuardDef, timing: GuardTiming, result: GuardResult
-) -> ToolResult:
-    return ToolResult(
-        payload=result.llm_payload
-        or {
-            "error": "Guard failed",
-            "guard": guard.name,
-            "timing": timing.value,
-            "reason": result.reason or "Guard did not pass",
-        },
-        error=True,
-    )
-
-
-def _activity_options_with_overrides(
-    defaults: ActivityOptions,
-    *,
-    activity_options: ActivityOptions | None = None,
-    task_queue: str | None = None,
-    schedule_to_close_timeout: timedelta | None = None,
-    schedule_to_start_timeout: timedelta | None = None,
-    start_to_close_timeout: timedelta | None = None,
-    heartbeat_timeout: timedelta | None = None,
-    retry_policy: RetryPolicy | None = None,
-    cancellation_type: ActivityCancellationType | None = None,
-    versioning_intent: VersioningIntent | None = None,
-    priority: Priority | None = None,
-) -> ActivityOptions:
-    options = defaults
-    if activity_options is not None:
-        options = options.with_overrides(**activity_options.to_execute_activity_kwargs())
-
-    return options.with_overrides(
-        task_queue=task_queue,
-        schedule_to_close_timeout=schedule_to_close_timeout,
-        schedule_to_start_timeout=schedule_to_start_timeout,
-        start_to_close_timeout=start_to_close_timeout,
-        heartbeat_timeout=heartbeat_timeout,
-        retry_policy=retry_policy,
-        cancellation_type=cancellation_type,
-        versioning_intent=versioning_intent,
-        priority=priority,
-    )
 
 
 def _kwargs_for_tool(
@@ -730,58 +334,5 @@ def _kwargs_for_tool(
     if unexpected_args:
         names = ", ".join(sorted(unexpected_args))
         raise TypeError(f"Unexpected tool argument(s) for {fn.__name__}: {names}")
-
-    return kwargs
-
-
-def _kwargs_for_guard(fn: GuardFn, ctx: GuardContext) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    type_hints = get_type_hints(fn)
-    kwargs: dict[str, Any] = {}
-
-    for name, parameter in signature.parameters.items():
-        if name in ("self", "cls"):
-            continue
-
-        annotation = type_hints.get(name, parameter.annotation)
-        if annotation is GuardContext:
-            kwargs[name] = ctx
-            continue
-
-        if parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"Missing required guard argument {fn.__name__}.{name}")
-
-    return kwargs
-
-
-def _kwargs_for_activity(
-    fn: ActivityFn, stream: StreamContext, args: dict[str, Any]
-) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    type_hints = get_type_hints(fn)
-    kwargs: dict[str, Any] = {}
-    consumed_args: set[str] = set()
-
-    for name, parameter in signature.parameters.items():
-        if name in ("self", "cls"):
-            continue
-
-        annotation = type_hints.get(name, parameter.annotation)
-        if annotation is StreamContext:
-            kwargs[name] = stream
-            continue
-
-        if name in args:
-            kwargs[name] = args[name]
-            consumed_args.add(name)
-        elif parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"Missing required activity argument {fn.__name__}.{name}")
-
-    unexpected_args = set(args) - consumed_args
-    if unexpected_args:
-        names = ", ".join(sorted(unexpected_args))
-        raise TypeError(
-            f"Unexpected activity argument(s) for {fn.__name__}: {names}"
-        )
 
     return kwargs

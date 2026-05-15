@@ -10,7 +10,8 @@ from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam
 from temporalio import activity, workflow
 
-from .tools import ActivityOptions, ToolResult, ToolSet
+from .activity_options import ActivityOptions
+from .tools import ToolResult, ToolSet
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
