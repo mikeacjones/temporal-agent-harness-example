@@ -11,6 +11,11 @@ from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam
 from temporalio import activity, workflow
 
 from .activity_options import ActivityOptions
+from .context_manager import (
+    ContextManagerFactory,
+    ContextSnapshot,
+    SlidingWindowContextManager,
+)
 from .tools import ToolResult, ToolSet
 
 ClaudeStopReason = Literal[
@@ -20,6 +25,11 @@ ClaudeStopReason = Literal[
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
     start_to_close_timeout=timedelta(minutes=2)
 )
+
+
+@dataclass(frozen=True)
+class ContinueAsNewPolicy:
+    enabled: bool = True
 
 
 class ClaudeAgent:
@@ -34,6 +44,8 @@ class ClaudeAgent:
         stream_id: str | None = None,
         activity_options: ActivityOptions | None = None,
         claude_activity_options: ActivityOptions | None = None,
+        context_manager_factory: ContextManagerFactory | None = None,
+        continue_as_new_policy: ContinueAsNewPolicy | None = None,
     ):
         self._system_prompt = system_prompt
         self._tools = tools
@@ -45,14 +57,33 @@ class ClaudeAgent:
         self._claude_activity_options = (
             claude_activity_options or DEFAULT_CLAUDE_ACTIVITY_OPTIONS
         )
+        self._context_manager_factory: ContextManagerFactory = (
+            context_manager_factory or SlidingWindowContextManager
+        )
+        self._continue_as_new_policy = (
+            continue_as_new_policy or ContinueAsNewPolicy()
+        )
 
-    async def run(self, user_prompt: str, *, max_turns: int = 20) -> ClaudeAgentResult:
-        chat_history: list[MessageParam] = [
-            MessageParam(role="user", content=user_prompt)
-        ]
+    async def run(
+        self,
+        user_prompt: str | None = None,
+        *,
+        state: ClaudeAgentState | None = None,
+        max_turns: int = 20,
+    ) -> ClaudeAgentResult:
+        context = self._context_manager_factory()
+        if state is None:
+            if user_prompt is None:
+                raise ValueError("user_prompt is required when state is not provided")
+            await context.initialize(user_prompt)
+            completed_turns = 0
+        else:
+            context.restore(state.context_snapshot)
+            completed_turns = state.turns
+
         tool_schemas = self._tools.tool_schemas(self._tool_names)
 
-        for turn in range(1, max_turns + 1):
+        for turn in range(completed_turns + 1, max_turns + 1):
             response = await workflow.execute_activity(
                 call_claude,
                 ClaudeRequest(
@@ -60,11 +91,13 @@ class ClaudeAgent:
                     model=self._model,
                     max_tokens=self._max_tokens,
                     tools=tool_schemas,
-                    chat_history=chat_history,
+                    chat_history=await context.messages_for_model(),
                 ),
                 summary="claude",
                 **self._claude_activity_options.to_execute_activity_kwargs(),
             )
+
+            await context.record_assistant_message(response.message)
 
             if response.stop_reason != "tool_use":
                 return ClaudeAgentResult(
@@ -73,9 +106,18 @@ class ClaudeAgent:
                     turns=turn,
                 )
 
-            chat_history.append(response.message)
             tool_results = await self._execute_requested_tools(response.message)
-            chat_history.append(MessageParam(role="user", content=tool_results))
+            await context.record_tool_results(tool_results)
+            if self._should_return_continue_as_new():
+                return ClaudeAgentResult(
+                    message=response.message,
+                    stop_reason=response.stop_reason,
+                    turns=turn,
+                    continuation_state=ClaudeAgentState(
+                        context_snapshot=context.snapshot(),
+                        turns=turn,
+                    ),
+                )
 
         return ClaudeAgentResult(
             message=MessageParam(
@@ -84,6 +126,12 @@ class ClaudeAgent:
             ),
             stop_reason="max_tokens",
             turns=max_turns,
+        )
+
+    def _should_return_continue_as_new(self) -> bool:
+        return (
+            self._continue_as_new_policy.enabled
+            and workflow.info().is_continue_as_new_suggested()
         )
 
     async def _execute_tool(self, tool_name: str, **kwargs: Any) -> ToolResult:
@@ -133,10 +181,21 @@ class ClaudeAgent:
 
 
 @dataclass
+class ClaudeAgentState:
+    context_snapshot: ContextSnapshot
+    turns: int
+
+
+@dataclass
 class ClaudeAgentResult:
     message: MessageParam
     stop_reason: ClaudeStopReason | None
     turns: int
+    continuation_state: ClaudeAgentState | None = None
+
+    @property
+    def needs_continue_as_new(self) -> bool:
+        return self.continuation_state is not None
 
 
 @dataclass
