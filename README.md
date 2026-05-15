@@ -90,16 +90,18 @@ async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
 
 The harness keeps the summary convention while allowing each step to use the Temporal execution policy it actually needs.
 
-## Complete Long-Running Tool Example
+## Reusable Guard Workflow Example
 
-This can live in one tool file. The worker still needs to import that file and register the child workflow class plus the direct activity used by that child workflow, but the tool, guard, request/response types, child workflow, signal handler, and activity functions can be owned together.
+This example shows a reusable customer confirmation guard. `CUSTOMER_CHANGE` is an example company-specific tool category: the point is that a class of tools can require the same guard, while the guard chooses the right confirmation path from the tool context.
+
+The confirmation workflow is shown in the same file for readability, but it is intentionally reusable. In a real app it could live in a shared `guards/customer_confirmation.py` module and be used by tools such as `substitute_item`, `change_shipping_address`, or `cancel_order`.
 
 ```python
-# substitute_item_tool.py
+# customer_change_tools.py
 import asyncio
 from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from temporalio import activity, workflow
 
@@ -118,81 +120,81 @@ ConfirmationStatus = Literal["accepted", "rejected", "timed_out"]
 
 
 @dataclass
-class SubstitutionConfirmationRequest:
-    order_id: str
-    unavailable_sku: str
-    substitute_sku: str
+class CustomerConfirmationRequest:
     customer_email: str
+    template: str
+    payload: dict[str, Any]
 
 
 @dataclass
-class SubstitutionEmail:
+class CustomerConfirmationEmail:
     message_id: str
     confirmation_workflow_id: str
 
 
 @dataclass
-class SubstitutionConfirmationResult:
+class CustomerConfirmationResult:
     status: ConfirmationStatus
     accepted: bool
-    email: SubstitutionEmail
+    email: CustomerConfirmationEmail
 
 
 @activity.defn
-async def send_substitution_email(
-    request: SubstitutionConfirmationRequest,
+async def send_customer_confirmation_email(
+    request: CustomerConfirmationRequest,
     confirmation_workflow_id: str,
-) -> SubstitutionEmail:
+) -> CustomerConfirmationEmail:
     # The email should link to an app endpoint that signals
-    # SubstitutionConfirmationWorkflow.confirm_substitution on this workflow id.
-    return SubstitutionEmail(
+    # CustomerConfirmationWorkflow.confirm on this workflow id.
+    # request.template selects the email template; request.payload fills it.
+    return CustomerConfirmationEmail(
         message_id="email-message-id",
         confirmation_workflow_id=confirmation_workflow_id,
     )
 
 
 @workflow.defn
-class SubstitutionConfirmationWorkflow:
+class CustomerConfirmationWorkflow:
     def __init__(self) -> None:
         self._accepted: bool | None = None
 
     @workflow.signal
-    async def confirm_substitution(self, accepted: bool) -> None:
+    async def confirm(self, accepted: bool) -> None:
         self._accepted = accepted
 
     @workflow.run
     async def run(
-        self, request: SubstitutionConfirmationRequest
-    ) -> SubstitutionConfirmationResult:
+        self, request: CustomerConfirmationRequest
+    ) -> CustomerConfirmationResult:
         confirmation_workflow_id = workflow.info().workflow_id
         email = await workflow.execute_activity(
-            send_substitution_email,
+            send_customer_confirmation_email,
             args=[request, confirmation_workflow_id],
             start_to_close_timeout=timedelta(minutes=1),
-            summary="substitute_item:email_customer",
+            summary=f"customer_confirmation:{request.template}",
         )
 
         try:
             await workflow.wait_condition(
                 lambda: self._accepted is not None,
                 timeout=timedelta(days=5),
-                timeout_summary="substitution_confirmation_timeout",
+                timeout_summary="customer_confirmation_timeout",
             )
         except asyncio.TimeoutError:
-            return SubstitutionConfirmationResult(
+            return CustomerConfirmationResult(
                 status="timed_out",
                 accepted=False,
                 email=email,
             )
 
         if not self._accepted:
-            return SubstitutionConfirmationResult(
+            return CustomerConfirmationResult(
                 status="rejected",
                 accepted=False,
                 email=email,
             )
 
-        return SubstitutionConfirmationResult(
+        return CustomerConfirmationResult(
             status="accepted",
             accepted=True,
             email=email,
@@ -211,18 +213,39 @@ async def _apply_substitution(
     }
 
 
-@TOOLS.guard(name="confirm_substitution_with_customer", fulfills=ToolType.MUTATING)
-async def confirm_substitution_with_customer(ctx: GuardContext) -> GuardResult:
-    result = await workflow.execute_child_workflow(
-        SubstitutionConfirmationWorkflow.run,
-        SubstitutionConfirmationRequest(
-            order_id=ctx.tool_args["order_id"],
-            unavailable_sku=ctx.tool_args["unavailable_sku"],
-            substitute_sku=ctx.tool_args["substitute_sku"],
+def _customer_confirmation_request(ctx: GuardContext) -> CustomerConfirmationRequest:
+    if ctx.tool_name == "substitute_item":
+        return CustomerConfirmationRequest(
             customer_email=ctx.tool_args["customer_email"],
-        ),
-        id=f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}",
-        static_summary=f"{ctx.guard_name}:customer_confirmation",
+            template="substitute_item",
+            payload={
+                "order_id": ctx.tool_args["order_id"],
+                "unavailable_sku": ctx.tool_args["unavailable_sku"],
+                "substitute_sku": ctx.tool_args["substitute_sku"],
+            },
+        )
+
+    if ctx.tool_name == "change_shipping_address":
+        return CustomerConfirmationRequest(
+            customer_email=ctx.tool_args["customer_email"],
+            template="change_shipping_address",
+            payload={
+                "order_id": ctx.tool_args["order_id"],
+                "new_address": ctx.tool_args["new_address"],
+            },
+        )
+
+    raise ValueError(f"No customer confirmation configured for {ctx.tool_name}")
+
+
+@TOOLS.guard(name="confirm_customer_change", fulfills=ToolType.CUSTOMER_CHANGE)
+async def confirm_customer_change(ctx: GuardContext) -> GuardResult:
+    request = _customer_confirmation_request(ctx)
+    result = await workflow.execute_child_workflow(
+        CustomerConfirmationWorkflow.run,
+        request,
+        id=f"{workflow.info().workflow_id}-{ctx.tool_name}-confirmation-{workflow.uuid4()}",
+        static_summary=f"{ctx.guard_name}:{ctx.tool_name}",
     )
 
     if not result.accepted:
@@ -230,7 +253,7 @@ async def confirm_substitution_with_customer(ctx: GuardContext) -> GuardResult:
             passed=False,
             reason=result.status,
             llm_payload={
-                "error": "Customer did not approve the substitution.",
+                "error": "Customer did not approve the requested change.",
                 "confirmation": asdict(result),
             },
         )
@@ -246,8 +269,8 @@ async def confirm_substitution_with_customer(ctx: GuardContext) -> GuardResult:
     description=(
         "Substitute an unavailable order item after customer confirmation."
     ),
-    tool_type=ToolType.MUTATING,
-    pre_guards=[confirm_substitution_with_customer],
+    tool_type=ToolType.CUSTOMER_CHANGE,
+    pre_guards=[confirm_customer_change],
 )
 async def substitute_item(
     ctx: ToolContext,
@@ -275,11 +298,13 @@ async def substitute_item(
     )
 ```
 
-The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `SubstitutionConfirmationWorkflow.confirm_substitution`.
+The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `CustomerConfirmationWorkflow.confirm`.
 
-This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the guard performs durable policy orchestration: a child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
+This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the guard performs durable policy orchestration: a reusable child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
 
 Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool, guard, and workflow shape the same and move the activity functions behind importable module-level functions.
+
+Adding `change_shipping_address` would be another tool with `tool_type=ToolType.CUSTOMER_CHANGE` and `pre_guards=[confirm_customer_change]`; the guard would choose the address-change template from `ctx.tool_name`.
 
 ## Guards
 
@@ -347,21 +372,21 @@ Applications using this harness should register the Claude activity plus the gen
 ```python
 from claude_harness.claude_agent import call_claude
 from claude_harness.tools import run_guard_activity, run_tool_activity
-from my_agent.tools.substitute_item_tool import (
-    SubstitutionConfirmationWorkflow,
-    send_substitution_email,
+from my_agent.tools.customer_change_tools import (
+    CustomerConfirmationWorkflow,
+    send_customer_confirmation_email,
 )
 
 activities = [
     call_claude,
     run_tool_activity,
     run_guard_activity,
-    send_substitution_email,
+    send_customer_confirmation_email,
 ]
 
 workflows = [
     AgentWorkflow,
-    SubstitutionConfirmationWorkflow,
+    CustomerConfirmationWorkflow,
 ]
 ```
 
