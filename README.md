@@ -50,6 +50,222 @@ await ctx.activity(_update_customer, step="update")
 
 This keeps the activity type generic while making Temporal history useful to humans.
 
+## Activity Defaults
+
+Agent construction is where the application sets normal activity behavior for tools and guards: task queues, timeouts, retry policy, cancellation behavior, and related Temporal options.
+
+```python
+from datetime import timedelta
+
+from temporalio.common import RetryPolicy
+
+from claude_harness.claude_agent import ClaudeAgent
+from claude_harness.tools import ActivityOptions
+
+agent = ClaudeAgent(
+    "You are an internal operations agent.",
+    TOOLS,
+    model="claude-sonnet-4-5",
+    activity_options=ActivityOptions(
+        schedule_to_start_timeout=timedelta(seconds=30),
+        start_to_close_timeout=timedelta(minutes=5),
+        retry_policy=RetryPolicy(maximum_attempts=3),
+    ),
+)
+```
+
+Tool and guard authors can override those defaults for a specific activity step:
+
+```python
+async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
+    result = await ctx.activity(
+        _export_report_activity,
+        step="export",
+        args={"report_id": report_id},
+        start_to_close_timeout=timedelta(hours=1),
+        retry_policy=RetryPolicy(maximum_attempts=1),
+    )
+    return ToolResult(payload=result, error=False)
+```
+
+The harness keeps the summary convention while allowing each step to use the Temporal execution policy it actually needs.
+
+## Complete Long-Running Tool Example
+
+This can live in one tool file. The worker still needs to import that file and register the child workflow class, but the tool, request/response types, child workflow, signal handler, and activity functions can be owned together.
+
+```python
+# substitute_item_tool.py
+import asyncio
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Literal
+
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from claude_harness.tools import ToolContext, ToolResult, ToolType
+    from my_agent.registry import TOOLS
+
+
+ConfirmationStatus = Literal["accepted", "rejected", "timed_out"]
+
+
+@dataclass
+class SubstitutionConfirmationRequest:
+    order_id: str
+    unavailable_sku: str
+    substitute_sku: str
+    customer_email: str
+
+
+@dataclass
+class SubstitutionConfirmationResult:
+    status: ConfirmationStatus
+    accepted: bool
+
+
+@workflow.defn
+class SubstitutionConfirmationWorkflow:
+    def __init__(self) -> None:
+        self._accepted: bool | None = None
+
+    @workflow.signal
+    async def confirm_substitution(self, accepted: bool) -> None:
+        self._accepted = accepted
+
+    @workflow.run
+    async def run(
+        self, request: SubstitutionConfirmationRequest
+    ) -> SubstitutionConfirmationResult:
+        try:
+            await workflow.wait_condition(
+                lambda: self._accepted is not None,
+                timeout=timedelta(days=5),
+                timeout_summary="substitution_confirmation_timeout",
+            )
+        except asyncio.TimeoutError:
+            return SubstitutionConfirmationResult(
+                status="timed_out",
+                accepted=False,
+            )
+
+        if self._accepted:
+            return SubstitutionConfirmationResult(status="accepted", accepted=True)
+        return SubstitutionConfirmationResult(status="rejected", accepted=False)
+
+
+async def _send_substitution_email(
+    order_id: str,
+    unavailable_sku: str,
+    substitute_sku: str,
+    customer_email: str,
+    confirmation_workflow_id: str,
+) -> dict[str, str]:
+    # The email should link to an app endpoint that signals
+    # SubstitutionConfirmationWorkflow.confirm_substitution on this workflow id.
+    return {
+        "message_id": "email-message-id",
+        "confirmation_workflow_id": confirmation_workflow_id,
+    }
+
+
+async def _apply_substitution(
+    order_id: str,
+    unavailable_sku: str,
+    substitute_sku: str,
+) -> dict[str, str]:
+    return {
+        "order_id": order_id,
+        "removed": unavailable_sku,
+        "added": substitute_sku,
+    }
+
+
+@TOOLS.tool(
+    name="substitute_item",
+    description=(
+        "Ask a customer to confirm an item substitution, wait up to 5 days for "
+        "their response, and apply the substitution if accepted."
+    ),
+    tool_type=ToolType.MUTATING,
+)
+async def substitute_item(
+    ctx: ToolContext,
+    order_id: str,
+    unavailable_sku: str,
+    substitute_sku: str,
+    customer_email: str,
+) -> ToolResult:
+    confirmation_workflow_id = (
+        f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}"
+    )
+
+    confirmation = await workflow.start_child_workflow(
+        SubstitutionConfirmationWorkflow.run,
+        SubstitutionConfirmationRequest(
+            order_id=order_id,
+            unavailable_sku=unavailable_sku,
+            substitute_sku=substitute_sku,
+            customer_email=customer_email,
+        ),
+        id=confirmation_workflow_id,
+        static_summary=f"{ctx.tool_name}:customer_confirmation",
+    )
+
+    email = await ctx.activity(
+        _send_substitution_email,
+        step="email_customer",
+        args={
+            "order_id": order_id,
+            "unavailable_sku": unavailable_sku,
+            "substitute_sku": substitute_sku,
+            "customer_email": customer_email,
+            "confirmation_workflow_id": confirmation_workflow_id,
+        },
+        start_to_close_timeout=timedelta(minutes=1),
+    )
+
+    result = await confirmation
+    if not result.accepted:
+        return ToolResult(
+            payload={
+                "status": result.status,
+                "email": email,
+                "confirmation_workflow_id": confirmation_workflow_id,
+                "substitution_applied": False,
+            },
+            error=False,
+        )
+
+    applied = await ctx.activity(
+        _apply_substitution,
+        step="apply_substitution",
+        args={
+            "order_id": order_id,
+            "unavailable_sku": unavailable_sku,
+            "substitute_sku": substitute_sku,
+        },
+        start_to_close_timeout=timedelta(minutes=2),
+    )
+    return ToolResult(
+        payload={
+            "status": result.status,
+            "email": email,
+            "confirmation_workflow_id": confirmation_workflow_id,
+            "substitution_applied": True,
+            "applied": applied,
+        },
+        error=False,
+    )
+```
+
+The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `SubstitutionConfirmationWorkflow.confirm_substitution`.
+
+This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, it is durable orchestration: send an email, wait for a customer signal or a five-day timer, then conditionally mutate the order.
+
+Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool and workflow shape the same and move the activity functions behind importable module-level functions.
+
 ## Guards
 
 Tools are categorized with `ToolType`. The harness can require guards for specific categories. Today, `ToolType.ADMIN` requires a pre-guard by default.
@@ -116,11 +332,17 @@ Applications using this harness should register the Claude activity plus the gen
 ```python
 from claude_harness.claude_agent import call_claude
 from claude_harness.tools import run_guard_activity, run_tool_activity
+from my_agent.tools.substitute_item_tool import SubstitutionConfirmationWorkflow
 
 activities = [
     call_claude,
     run_tool_activity,
     run_guard_activity,
+]
+
+workflows = [
+    AgentWorkflow,
+    SubstitutionConfirmationWorkflow,
 ]
 ```
 
