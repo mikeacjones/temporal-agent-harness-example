@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any, Literal, Mapping, cast
 
 from anthropic import AsyncAnthropic
-from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam
+from anthropic.types import MessageParam, ToolResultBlockParam
 from temporalio import activity, workflow
 from temporalio.exceptions import is_cancelled_exception
 
@@ -199,7 +199,7 @@ class ClaudeAgent:
         )
 
     async def _call_claude(
-        self, tool_schemas: list[ToolParam]
+        self, tool_schemas: list[dict[str, Any]]
     ) -> ClaudeResponse | None:
         self._claude_call_sequence += 1
         tool_params = [_tool_param_to_dict(tool) for tool in tool_schemas]
@@ -553,7 +553,7 @@ def _message_param_to_dict(message: MessageParam) -> dict[str, Any]:
     }
 
 
-def _tool_param_to_dict(tool: ToolParam) -> dict[str, Any]:
+def _tool_param_to_dict(tool: dict[str, Any]) -> dict[str, Any]:
     return dict(cast(Mapping[str, Any], tool))
 
 

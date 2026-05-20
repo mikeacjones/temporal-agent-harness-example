@@ -6,6 +6,70 @@ It is an example of how a team might build a small, opinionated Claude harness a
 
 The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
 
+## Opinionated Architecture
+
+The main design choice is to separate reusable harness behavior from application ownership. The harness should encode the agent platform rules a company wants every Claude agent to follow. The application still owns the workflow shape, product UX, authentication, tool availability, and business-specific policies.
+
+| Layer | Owns | Does Not Own |
+| --- | --- | --- |
+| `claude_harness` | Claude request/response activities, the agent loop, context management, tool and guard registration, guard enforcement, generic activity routing, activity summary conventions, continuation snapshots, interrupt/steering semantics, and a streaming protocol. | Product auth, OAuth flows, UI state, user/session persistence, business workflows, concrete streaming transports, or provider-specific app state. |
+| Application workflow | Durable conversation orchestration, signal/query/update surface, agent construction, tool availability, approval state, continue-as-new policy, and how returned harness state is carried forward. | Direct network I/O, UI rendering, or provider login flows. |
+| Tools and guards | Business capabilities and policy. They run in workflow context, can call child workflows, wait on signals/timers, and use `ctx.activity(...)` for side effects. | Hidden side effects from workflow code. Durable side effects should go through activities or child workflows. |
+| Activities | Non-deterministic work: Claude calls, API calls, database writes, emails, OAuth-token-backed provider calls, and long-running side effects. | Agent policy decisions that need to replay deterministically. |
+| Worker process | Registration of workflows, activities, generic routers, data converter/codecs, and optional sideband stream sinks. | Per-user product state beyond what the application explicitly loads. |
+| UI / API server | Login, OAuth, chat selection, signals, queries, event-stream display, and approval controls. | Durable agent memory or hidden changes to workflow state. |
+
+This boundary is intentionally strict. For example, GitHub OAuth belongs to the simple chat application, not the harness. The workflow can receive a stable connection id or session id and let activities resolve the actual token. Passing a JWT or OAuth token through workflow history would make the wrong thing durable.
+
+Sideband streaming follows the same rule. The harness defines a protocol and emits best-effort events when a sink is configured. The UI chooses how to transport and render those events. Partial streamed text is not durable conversation state until the Claude activity completes and the workflow commits the assistant message.
+
+## Turn Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant UI as UI / API Server
+    participant Registry as User Chats Workflow
+    participant WF as Application Agent Workflow
+    participant Harness as ClaudeAgent Harness
+    participant ClaudeAct as call_claude Activity
+    participant Claude as Claude API
+    participant Tool as Tool / Guard Workflow Code
+    participant Router as Generic Tool/Guard Activity
+    participant External as External API / DB / Email
+    participant Stream as Optional Sideband Stream
+
+    User->>UI: Send message, steering, interrupt, or approval
+    UI->>Registry: Create/list/delete chat workflows
+    UI->>WF: Signal chat input or control event
+    UI->>WF: Query durable state
+    WF->>Harness: agent.run(user_message)
+    Harness->>ClaudeAct: Execute Claude activity
+    ClaudeAct->>Claude: Create or stream message
+    opt Stream sink configured
+        ClaudeAct-->>Stream: Token deltas and Claude lifecycle events
+    end
+    ClaudeAct-->>Harness: Claude response
+    alt Claude requests tools
+        Harness->>Tool: Execute requested tools in workflow context
+        Tool->>Tool: Run pre-guards sequentially
+        Tool->>Router: ctx.activity(..., summary="tool:step")
+        Router->>External: Perform side effect
+        opt Stream sink configured
+            Router-->>Stream: Tool or guard progress
+        end
+        Router-->>Tool: Activity result
+        Tool->>Tool: Run post-guards sequentially
+        Tool-->>Harness: ToolResult or guarded failure payload
+        Harness->>ClaudeAct: Next Claude call with tool_result blocks
+    else Final assistant response
+        Harness-->>WF: ClaudeAgentResult and continuation state
+        WF-->>UI: Committed transcript via query/SSE
+        UI-->>User: Render durable chat plus non-durable stream visibility
+    end
+```
+
 ## What This Shows
 
 - Agent loops can be ordinary Temporal workflow code.

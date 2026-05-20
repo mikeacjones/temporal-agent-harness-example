@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, cast, get_type_hints
 
-from anthropic.types import ToolParam
 from pydantic import create_model
 from temporalio import activity as temporal_activity
 from temporalio import workflow
@@ -35,6 +34,7 @@ from .tool_types import ToolType
 
 ToolFn = Callable[..., Awaitable["ToolResult"]]
 GuardReference = GuardFn | str
+ToolParam = dict[str, Any]
 RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
 _TOOL_METADATA_ATTR = "__claude_harness_tool__"
 _GUARD_METADATA_ATTR = "__claude_harness_guard__"
@@ -346,11 +346,11 @@ class ToolSet:
             raise ValueError(f"Duplicate tool name: {name}")
 
         self._tool_registry[name] = ToolDef(
-            schema=ToolParam(
-                name=name,
-                description=description,
-                input_schema=_input_schema_for_tool(fn),
-            ),
+            schema={
+                "name": name,
+                "description": description,
+                "input_schema": _input_schema_for_tool(fn),
+            },
             tool_type=tool_type,
             fn=fn,
             pre_guards=pre_guards,
