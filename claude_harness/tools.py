@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Awaitable, Callable, cast, get_type_hints
+from typing import Any, Awaitable, Callable, Literal, cast, get_type_hints
 
 from pydantic import create_model
 from temporalio import activity as temporal_activity
@@ -33,8 +33,10 @@ from .streaming import StreamContext
 from .tool_types import ToolType
 
 ToolFn = Callable[..., Awaitable["ToolResult"]]
+DynamicToolFn = Callable[["ToolContext", dict[str, Any]], Awaitable["ToolResult"]]
 GuardReference = GuardFn | str
 ToolParam = dict[str, Any]
+ToolArgsMode = Literal["signature", "raw"]
 RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
 _TOOL_METADATA_ATTR = "__claude_harness_tool__"
 _GUARD_METADATA_ATTR = "__claude_harness_guard__"
@@ -193,9 +195,10 @@ class ToolActivityRequest:
 class ToolDef:
     schema: ToolParam
     tool_type: ToolType
-    fn: ToolFn
+    fn: ToolFn | DynamicToolFn
     pre_guards: list[GuardDef]
     post_guards: list[GuardDef]
+    args_mode: ToolArgsMode = "signature"
 
 
 class ToolSet:
@@ -279,6 +282,43 @@ class ToolSet:
                 )
             self._register_guard(fn)
 
+    def add_dynamic_tool(
+        self,
+        *,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        tool_type: ToolType,
+        fn: DynamicToolFn,
+        pre_guards: Iterable[GuardReference] | None = None,
+        post_guards: Iterable[GuardReference] | None = None,
+    ) -> None:
+        self._register_tool(
+            name=name,
+            description=description,
+            tool_type=tool_type,
+            fn=fn,
+            pre_guards=self._resolve_guard_refs(
+                pre_guards or (),
+                provider_guards={},
+            ),
+            post_guards=self._resolve_guard_refs(
+                post_guards or (),
+                provider_guards={},
+            ),
+            input_schema=input_schema,
+            args_mode="raw",
+        )
+
+    def add_mcp_provider(self, provider: object) -> object:
+        register = getattr(provider, "register", None)
+        if not callable(register):
+            raise TypeError(
+                f"MCP provider {type(provider).__name__} must expose register(tools)"
+            )
+        register(self)
+        return provider
+
     async def execute_tool(
         self,
         name: str,
@@ -315,7 +355,14 @@ class ToolSet:
             stream_id=stream_id,
             activity_options=resolved_activity_options,
         )
-        tool_result = await _call_tool(tool.fn, ctx, tool_args)
+        if tool.args_mode == "raw":
+            tool_result = await _call_dynamic_tool(
+                cast(DynamicToolFn, tool.fn),
+                ctx,
+                tool_args,
+            )
+        else:
+            tool_result = await _call_tool(cast(ToolFn, tool.fn), ctx, tool_args)
 
         post_guard_failure = await self._guards.execute_guards(
             tool.post_guards,
@@ -338,23 +385,31 @@ class ToolSet:
         name: str,
         description: str,
         tool_type: ToolType,
-        fn: ToolFn,
+        fn: ToolFn | DynamicToolFn,
         pre_guards: list[GuardDef],
         post_guards: list[GuardDef],
+        input_schema: dict[str, Any] | None = None,
+        args_mode: ToolArgsMode = "signature",
     ) -> None:
         if name in self._tool_registry:
             raise ValueError(f"Duplicate tool name: {name}")
 
+        schema_input = (
+            input_schema
+            if input_schema is not None
+            else _input_schema_for_tool(cast(ToolFn, fn))
+        )
         self._tool_registry[name] = ToolDef(
             schema={
                 "name": name,
                 "description": description,
-                "input_schema": _input_schema_for_tool(fn),
+                "input_schema": schema_input,
             },
             tool_type=tool_type,
             fn=fn,
             pre_guards=pre_guards,
             post_guards=post_guards,
+            args_mode=args_mode,
         )
 
     def _resolve_guard_refs(
@@ -487,6 +542,15 @@ async def _call_tool(
 ) -> ToolResult:
     kwargs = _kwargs_for_tool(fn, ctx, args)
     result = fn(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _call_dynamic_tool(
+    fn: DynamicToolFn, ctx: ToolContext, args: dict[str, Any]
+) -> ToolResult:
+    result = fn(ctx, args)
     if inspect.isawaitable(result):
         return await result
     return result

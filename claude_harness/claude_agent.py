@@ -23,8 +23,9 @@ from .context_manager import (
     SlidingWindowContextManager,
     estimate_token_count,
 )
+from .activity_router import function_ref
 from .streaming import StreamContext, stream_sink_configured
-from .tools import ToolResult, ToolSet
+from .tools import RUN_TOOL_ACTIVITY_NAME, ToolActivityRequest, ToolResult, ToolSet
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
@@ -347,6 +348,17 @@ class ClaudeAgent:
         tool_input = cast(dict[str, Any], block["input"])
         tool_use_id = cast(str, block["id"])
 
+        await self._emit_tool_stream_event(
+            tool_name=tool_name,
+            step="start",
+            kind="claude_tool_start",
+            payload={
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "input": _json_preview(tool_input),
+            },
+        )
+
         try:
             result = await self._execute_tool(tool_name, **tool_input)
         except Exception as err:
@@ -355,12 +367,49 @@ class ClaudeAgent:
                 error=True,
             )
 
+        await self._emit_tool_stream_event(
+            tool_name=tool_name,
+            step="complete",
+            kind="claude_tool_complete",
+            payload={
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "is_error": result.error,
+                "payload": _json_preview(result.payload),
+            },
+        )
+
         return ToolResultBlockParam(
             type="tool_result",
             tool_use_id=tool_use_id,
             content=json.dumps(result.payload),
             is_error=result.error,
         )
+
+    async def _emit_tool_stream_event(
+        self,
+        *,
+        tool_name: str,
+        step: str,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self._stream_id is None:
+            return
+
+        with suppress(Exception):
+            await workflow.execute_activity(
+                RUN_TOOL_ACTIVITY_NAME,
+                ToolActivityRequest(
+                    function_ref=function_ref(_emit_claude_tool_stream_event),
+                    args={"kind": kind, "payload": payload},
+                    tool_name=tool_name,
+                    step=step,
+                    stream_id=self._stream_id,
+                ),
+                summary=f"claude_tool:{tool_name}:{step}",
+                **self._claude_activity_options.to_execute_activity_kwargs(),
+            )
 
 
 @dataclass
@@ -435,6 +484,16 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
         stop_sequence=response.stop_sequence,
         usage=response.usage.to_dict(),
     )
+
+
+async def _emit_claude_tool_stream_event(
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    stream: StreamContext,
+) -> dict[str, str]:
+    await stream.emit(payload, kind=kind)
+    return {"status": "emitted"}
 
 
 async def _create_claude_message(
@@ -516,6 +575,7 @@ async def _stream_claude_message(
             "model": response.model,
             "sequence": stream_sequence,
             "stop_reason": response.stop_reason,
+            "text": _text_from_content_blocks(response.content),
             "usage": response.usage.to_dict(),
         },
         kind="claude_complete",
@@ -561,6 +621,27 @@ def _block_to_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, dict):
         return dict(cast(Mapping[str, Any], block))
     return cast(dict[str, Any], block.to_dict())
+
+
+def _text_from_content_blocks(content: Any) -> str:
+    text_parts: list[str] = []
+    for block in content:
+        block_dict = _block_to_dict(block)
+        if block_dict.get("type") == "text":
+            text = block_dict.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+    return "\n".join(text_parts)
+
+
+def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:
+    try:
+        encoded = json.dumps(value, sort_keys=True)
+    except TypeError:
+        encoded = repr(value)
+    if len(encoded) <= max_chars:
+        return encoded
+    return f"{encoded[:max_chars]}...[truncated]"
 
 
 def _formatted_control_message(
