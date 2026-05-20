@@ -59,3 +59,7 @@ def configure_stream_sink(
     global _stream_sink, _raise_stream_errors
     _stream_sink = sink
     _raise_stream_errors = raise_stream_errors
+
+
+def stream_sink_configured() -> bool:
+    return _stream_sink is not None

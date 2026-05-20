@@ -183,8 +183,14 @@ class GuardSet:
         except KeyError as err:
             raise ValueError(
                 f"Guard {guard.__name__} is not registered; decorate it with "
-                "ToolSet.guard before using it in a tool"
+                "claude_harness.tools.guard and register it before using it in a tool"
             ) from err
+
+    def get_guard(self, name: str) -> GuardDef:
+        try:
+            return self._guard_registry[name]
+        except KeyError as err:
+            raise ValueError(f"Unknown guard: {name}") from err
 
     def validate_tool_guards(
         self,

@@ -34,7 +34,62 @@ from .streaming import StreamContext
 from .tool_types import ToolType
 
 ToolFn = Callable[..., Awaitable["ToolResult"]]
+GuardReference = GuardFn | str
 RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
+_TOOL_METADATA_ATTR = "__claude_harness_tool__"
+_GUARD_METADATA_ATTR = "__claude_harness_guard__"
+
+
+@dataclass(frozen=True)
+class ToolMetadata:
+    name: str
+    description: str
+    tool_type: ToolType
+    pre_guards: tuple[GuardReference, ...] = ()
+    post_guards: tuple[GuardReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class GuardMetadata:
+    name: str
+    fulfills: ToolType | Iterable[ToolType]
+
+
+def tool(
+    *,
+    name: str,
+    description: str,
+    tool_type: ToolType,
+    pre_guards: Iterable[GuardReference] | None = None,
+    post_guards: Iterable[GuardReference] | None = None,
+):
+    def decorator(fn: ToolFn) -> ToolFn:
+        setattr(
+            fn,
+            _TOOL_METADATA_ATTR,
+            ToolMetadata(
+                name=name,
+                description=description,
+                tool_type=tool_type,
+                pre_guards=tuple(pre_guards or ()),
+                post_guards=tuple(post_guards or ()),
+            ),
+        )
+        return fn
+
+    return decorator
+
+
+def guard(
+    *,
+    name: str,
+    fulfills: ToolType | Iterable[ToolType],
+):
+    def decorator(fn: GuardFn) -> GuardFn:
+        setattr(fn, _GUARD_METADATA_ATTR, GuardMetadata(name=name, fulfills=fulfills))
+        return fn
+
+    return decorator
 
 
 @dataclass
@@ -159,6 +214,71 @@ class ToolSet:
     def get_tool(self, name: str) -> ToolDef:
         return self._tool_registry[name]
 
+    def add_provider(self, provider: object) -> object:
+        guard_defs: dict[str, GuardDef] = {}
+        methods = list(_provider_methods(provider))
+
+        for method in methods:
+            metadata = _guard_metadata(method)
+            if metadata is None:
+                continue
+            guard_defs[metadata.name] = self._register_guard(method)
+
+        for method in methods:
+            metadata = _tool_metadata(method)
+            if metadata is None:
+                continue
+            self._register_tool(
+                name=metadata.name,
+                description=metadata.description,
+                tool_type=metadata.tool_type,
+                fn=method,
+                pre_guards=self._resolve_guard_refs(
+                    metadata.pre_guards,
+                    provider_guards=guard_defs,
+                ),
+                post_guards=self._resolve_guard_refs(
+                    metadata.post_guards,
+                    provider_guards=guard_defs,
+                ),
+            )
+
+        return provider
+
+    def add_tool(self, *tools: ToolFn) -> None:
+        for fn in tools:
+            metadata = _tool_metadata(fn)
+            if metadata is None:
+                raise ValueError(
+                    f"Tool {fn.__name__} is missing @tool metadata; decorate it "
+                    "with claude_harness.tools.tool before registering it"
+                )
+
+            self._register_tool(
+                name=metadata.name,
+                description=metadata.description,
+                tool_type=metadata.tool_type,
+                fn=fn,
+                pre_guards=self._resolve_guard_refs(
+                    metadata.pre_guards,
+                    provider_guards={},
+                ),
+                post_guards=self._resolve_guard_refs(
+                    metadata.post_guards,
+                    provider_guards={},
+                ),
+            )
+
+    def add_guard(self, *guards: GuardFn) -> None:
+        for fn in guards:
+            metadata = _guard_metadata(fn)
+            if metadata is None:
+                raise ValueError(
+                    f"Guard {fn.__name__} is missing @guard metadata; decorate it "
+                    "with claude_harness.tools.guard before registering it"
+                )
+            self._register_guard(fn)
+
     async def execute_tool(
         self,
         name: str,
@@ -212,43 +332,108 @@ class ToolSet:
 
         return tool_result
 
-    def tool(
+    def _register_tool(
         self,
         *,
         name: str,
         description: str,
         tool_type: ToolType,
-        pre_guards: list[GuardFn] | None = None,
-        post_guards: list[GuardFn] | None = None,
-    ):
-        def decorator(
-            fn: Callable[..., Awaitable[ToolResult]],
-        ) -> Callable[..., Awaitable[ToolResult]]:
-            if name in self._tool_registry:
-                raise ValueError(f"Duplicate tool name: {name}")
+        fn: ToolFn,
+        pre_guards: list[GuardDef],
+        post_guards: list[GuardDef],
+    ) -> None:
+        if name in self._tool_registry:
+            raise ValueError(f"Duplicate tool name: {name}")
 
-            self._tool_registry[name] = ToolDef(
-                schema=ToolParam(
-                    name=name,
-                    description=description,
-                    input_schema=_input_schema_for_tool(fn),
-                ),
-                tool_type=tool_type,
-                fn=fn,
-                pre_guards=self._guards.defs_for(pre_guards or []),
-                post_guards=self._guards.defs_for(post_guards or []),
-            )
-            return fn
+        self._tool_registry[name] = ToolDef(
+            schema=ToolParam(
+                name=name,
+                description=description,
+                input_schema=_input_schema_for_tool(fn),
+            ),
+            tool_type=tool_type,
+            fn=fn,
+            pre_guards=pre_guards,
+            post_guards=post_guards,
+        )
 
-        return decorator
-
-    def guard(
+    def _resolve_guard_refs(
         self,
+        guards: Iterable[GuardReference],
         *,
-        name: str,
-        fulfills: ToolType | Iterable[ToolType],
-    ):
-        return self._guards.guard(name=name, fulfills=fulfills)
+        provider_guards: dict[str, GuardDef],
+    ) -> list[GuardDef]:
+        guard_defs: list[GuardDef] = []
+        for guard_ref in guards:
+            if isinstance(guard_ref, str):
+                guard_defs.append(
+                    provider_guards.get(guard_ref) or self._guards.get_guard(guard_ref)
+                )
+            else:
+                guard_defs.append(self._register_guard(guard_ref))
+        return guard_defs
+
+    def _register_guard(self, fn: GuardFn) -> GuardDef:
+        try:
+            return self._guards.def_for(fn)
+        except ValueError:
+            pass
+
+        metadata = _guard_metadata(fn)
+        if metadata is None:
+            raise ValueError(
+                f"Guard {fn.__name__} is not registered; decorate it with "
+                "claude_harness.tools.guard before using it in a tool"
+            )
+
+        registered_guard = self._guards.guard(
+            name=metadata.name,
+            fulfills=metadata.fulfills,
+        )(fn)
+        return self._guards.def_for(registered_guard)
+
+
+def _provider_methods(provider: object) -> Iterable[Callable[..., Any]]:
+    seen: set[str] = set()
+    for cls in reversed(type(provider).mro()):
+        for name, value in vars(cls).items():
+            if name in seen:
+                continue
+            seen.add(name)
+            if _tool_metadata(value) is None and _guard_metadata(value) is None:
+                continue
+            method = getattr(provider, name)
+            if not callable(method):
+                raise TypeError(
+                    f"Provider attribute {type(provider).__name__}.{name} "
+                    "is decorated but is not callable"
+                )
+            yield method
+
+
+def _tool_metadata(fn: Any) -> ToolMetadata | None:
+    return cast(
+        ToolMetadata | None,
+        _decorator_metadata(fn, _TOOL_METADATA_ATTR),
+    )
+
+
+def _guard_metadata(fn: Any) -> GuardMetadata | None:
+    return cast(
+        GuardMetadata | None,
+        _decorator_metadata(fn, _GUARD_METADATA_ATTR),
+    )
+
+
+def _decorator_metadata(fn: Any, attr: str) -> Any:
+    metadata = getattr(fn, attr, None)
+    if metadata is not None:
+        return metadata
+
+    wrapped = getattr(fn, "__func__", None)
+    if wrapped is None:
+        return None
+    return getattr(wrapped, attr, None)
 
 
 def _input_schema_for_tool(fn: ToolFn) -> dict[str, Any]:
