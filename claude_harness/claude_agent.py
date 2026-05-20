@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Literal, Mapping, cast
 
@@ -12,7 +13,7 @@ from anthropic.types import MessageParam, ToolResultBlockParam
 from temporalio import activity, workflow
 from temporalio.exceptions import is_cancelled_exception
 
-from .activity_options import ActivityOptions
+from .activity_options import DEFAULT_ACTIVITY_OPTIONS, ActivityOptions
 from .context_manager import (
     ContextManagerFactory,
     ContextSnapshot,
@@ -24,6 +25,12 @@ from .context_manager import (
     estimate_token_count,
 )
 from .activity_router import function_ref
+from .llm_guards import (
+    LlmGuardAction,
+    LlmGuardExecution,
+    LlmGuardFn,
+    LlmGuardPipeline,
+)
 from .streaming import StreamContext, stream_sink_configured
 from .tools import RUN_TOOL_ACTIVITY_NAME, ToolActivityRequest, ToolResult, ToolSet
 
@@ -55,6 +62,9 @@ class ClaudeAgent:
         stream_id: str | None = None,
         activity_options: ActivityOptions | None = None,
         claude_activity_options: ActivityOptions | None = None,
+        llm_guard_activity_options: ActivityOptions | None = None,
+        pre_llm_guards: Iterable[LlmGuardFn] | None = None,
+        post_llm_guards: Iterable[LlmGuardFn] | None = None,
         context_manager_factory: ContextManagerFactory | None = None,
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         context_safety_margin_tokens: int = DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
@@ -70,6 +80,13 @@ class ClaudeAgent:
         self._activity_options = activity_options
         self._claude_activity_options = (
             claude_activity_options or DEFAULT_CLAUDE_ACTIVITY_OPTIONS
+        )
+        self._llm_guard_activity_options = (
+            llm_guard_activity_options or activity_options or DEFAULT_ACTIVITY_OPTIONS
+        )
+        self._llm_guards = LlmGuardPipeline(
+            pre_guards=pre_llm_guards,
+            post_guards=post_llm_guards,
         )
         self._max_context_tokens = max_context_tokens
         self._context_safety_margin_tokens = context_safety_margin_tokens
@@ -87,6 +104,9 @@ class ClaudeAgent:
         self._pending_interrupts: list[str] = []
         self._interrupt_requested = False
         self._claude_call_sequence = 0
+        self._terminated = False
+        self._termination_reason: str | None = None
+        self._llm_guard_state: dict[str, Any] = {}
 
     def steer(
         self,
@@ -124,6 +144,9 @@ class ClaudeAgent:
         state: ClaudeAgentState | None = None,
         max_turns: int = 20,
     ) -> ClaudeAgentResult:
+        if self._terminated:
+            return self._terminated_result(turns=state.turns if state else 0)
+
         if state is None:
             if user_prompt is None:
                 raise ValueError("user_prompt is required when state is not provided")
@@ -136,6 +159,7 @@ class ClaudeAgent:
         else:
             self._context.restore(state.context_snapshot)
             self._context_initialized = True
+            self._llm_guard_state = dict(state.llm_guard_state)
             completed_turns = state.turns
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
@@ -160,6 +184,18 @@ class ClaudeAgent:
             tool_use_blocks = _tool_use_blocks(response_message)
             await self._context.record_assistant_message(response_message)
 
+            if response.guard_action is not None:
+                if response.guard_action == LlmGuardAction.TERMINATE.value:
+                    self._terminated = True
+                    self._termination_reason = response.guard_reason
+                return ClaudeAgentResult(
+                    message=response.message,
+                    stop_reason=response.stop_reason,
+                    turns=turn,
+                    guard_action=response.guard_action,
+                    guard_reason=response.guard_reason,
+                )
+
             if not tool_use_blocks:
                 if self._interrupt_requested:
                     await self._flush_interrupt_context()
@@ -169,6 +205,8 @@ class ClaudeAgent:
                     message=response.message,
                     stop_reason=response.stop_reason,
                     turns=turn,
+                    guard_action=response.guard_action,
+                    guard_reason=response.guard_reason,
                 )
 
             tool_results = await self._execute_requested_tools(tool_use_blocks)
@@ -187,7 +225,10 @@ class ClaudeAgent:
                     continuation_state=ClaudeAgentState(
                         context_snapshot=self._context.snapshot(),
                         turns=turn,
+                        llm_guard_state=dict(self._llm_guard_state),
                     ),
+                    guard_action=response.guard_action,
+                    guard_reason=response.guard_reason,
                 )
 
         return ClaudeAgentResult(
@@ -217,22 +258,38 @@ class ClaudeAgent:
             safety_margin_tokens=self._context_safety_margin_tokens,
             chars_per_token=self._context_chars_per_token,
         )
+        request = ClaudeRequest(
+            system_prompt=self._system_prompt,
+            model=self._model,
+            max_tokens=self._max_tokens,
+            tools=tool_params,
+            chat_history=[
+                _message_param_to_dict(message)
+                for message in await self._context.messages_for_model(
+                    context_budget
+                )
+            ],
+            stream_id=self._stream_id,
+            stream_sequence=self._claude_call_sequence,
+        )
+
+        pre_guard_execution = await self._llm_guards.execute_pre(
+            request=_claude_request_to_dict(request),
+            state=self._llm_guard_state,
+            stream_id=self._stream_id,
+            activity_options=self._llm_guard_activity_options,
+        )
+        request = _claude_request_from_dict(pre_guard_execution.request)
+        if pre_guard_execution.halted:
+            self._llm_guard_state = pre_guard_execution.state
+            return _claude_response_from_guard_execution(
+                pre_guard_execution,
+                model=request.model,
+            )
+
         claude_handle = workflow.start_activity(
             call_claude,
-            ClaudeRequest(
-                system_prompt=self._system_prompt,
-                model=self._model,
-                max_tokens=self._max_tokens,
-                tools=tool_params,
-                chat_history=[
-                    _message_param_to_dict(message)
-                    for message in await self._context.messages_for_model(
-                        context_budget
-                    )
-                ],
-                stream_id=self._stream_id,
-                stream_sequence=self._claude_call_sequence,
-            ),
+            request,
             summary="claude",
             **self._claude_activity_options.to_execute_activity_kwargs(),
         )
@@ -245,7 +302,26 @@ class ClaudeAgent:
                 await self._discard_interrupted_claude_call(claude_handle)
                 return None
 
-            return await claude_handle
+            response = await claude_handle
+            post_guard_execution = await self._llm_guards.execute_post(
+                request=_claude_request_to_dict(request),
+                response=_claude_response_to_dict(response),
+                state=pre_guard_execution.state,
+                stream_id=self._stream_id,
+                activity_options=self._llm_guard_activity_options,
+            )
+            if post_guard_execution.halted:
+                self._llm_guard_state = post_guard_execution.state
+                return _claude_response_from_guard_execution(
+                    post_guard_execution,
+                    model=response.model,
+                )
+
+            self._llm_guard_state = post_guard_execution.state
+            return _claude_response_from_dict(
+                post_guard_execution.response
+                or _claude_response_to_dict(response)
+            )
         except BaseException as err:
             if self._interrupt_requested and is_cancelled_exception(err):
                 return None
@@ -411,11 +487,24 @@ class ClaudeAgent:
                 **self._claude_activity_options.to_execute_activity_kwargs(),
             )
 
+    def _terminated_result(self, *, turns: int) -> ClaudeAgentResult:
+        return ClaudeAgentResult(
+            message={
+                "role": "assistant",
+                "content": "The agent was terminated.",
+            },
+            stop_reason="refusal",
+            turns=turns,
+            guard_action=LlmGuardAction.TERMINATE.value,
+            guard_reason=self._termination_reason,
+        )
+
 
 @dataclass
 class ClaudeAgentState:
     context_snapshot: ContextSnapshot
     turns: int
+    llm_guard_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -424,10 +513,16 @@ class ClaudeAgentResult:
     stop_reason: ClaudeStopReason | None
     turns: int
     continuation_state: ClaudeAgentState | None = None
+    guard_action: str | None = None
+    guard_reason: str | None = None
 
     @property
     def needs_continue_as_new(self) -> bool:
         return self.continuation_state is not None
+
+    @property
+    def terminated(self) -> bool:
+        return self.guard_action == LlmGuardAction.TERMINATE.value
 
 
 @dataclass
@@ -449,6 +544,79 @@ class ClaudeResponse:
     stop_reason: ClaudeStopReason | None
     stop_sequence: str | None
     usage: dict[str, Any]
+    guard_action: str | None = None
+    guard_reason: str | None = None
+
+
+def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
+    return {
+        "system_prompt": request.system_prompt,
+        "model": request.model,
+        "max_tokens": request.max_tokens,
+        "tools": [_copy_mapping(tool) for tool in request.tools],
+        "chat_history": [_copy_mapping(message) for message in request.chat_history],
+        "stream_id": request.stream_id,
+        "stream_sequence": request.stream_sequence,
+    }
+
+
+def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
+    return ClaudeRequest(
+        system_prompt=cast(str, request["system_prompt"]),
+        model=cast(str, request["model"]),
+        max_tokens=cast(int, request["max_tokens"]),
+        tools=_mapping_list(request.get("tools", [])),
+        chat_history=_mapping_list(request.get("chat_history", [])),
+        stream_id=cast(str | None, request.get("stream_id")),
+        stream_sequence=cast(int | None, request.get("stream_sequence")),
+    )
+
+
+def _claude_response_to_dict(response: ClaudeResponse) -> dict[str, Any]:
+    return {
+        "id": response.id,
+        "model": response.model,
+        "message": _copy_mapping(response.message),
+        "stop_reason": response.stop_reason,
+        "stop_sequence": response.stop_sequence,
+        "usage": _copy_mapping(response.usage),
+        "guard_action": response.guard_action,
+        "guard_reason": response.guard_reason,
+    }
+
+
+def _claude_response_from_dict(response: dict[str, Any]) -> ClaudeResponse:
+    return ClaudeResponse(
+        id=cast(str, response["id"]),
+        model=cast(str, response["model"]),
+        message=_copy_mapping(response["message"]),
+        stop_reason=cast(ClaudeStopReason | None, response.get("stop_reason")),
+        stop_sequence=cast(str | None, response.get("stop_sequence")),
+        usage=_copy_mapping(response.get("usage", {})),
+        guard_action=cast(str | None, response.get("guard_action")),
+        guard_reason=cast(str | None, response.get("guard_reason")),
+    )
+
+
+def _claude_response_from_guard_execution(
+    execution: LlmGuardExecution,
+    *,
+    model: str,
+) -> ClaudeResponse:
+    response = execution.response or {
+        "id": "guard:llm",
+        "model": model,
+        "message": {
+            "role": "assistant",
+            "content": "The response was blocked by an LLM guard.",
+        },
+        "stop_reason": "refusal",
+        "stop_sequence": None,
+        "usage": {},
+    }
+    response["guard_action"] = execution.action.value
+    response["guard_reason"] = execution.reason
+    return _claude_response_from_dict(response)
 
 
 @activity.defn
@@ -611,6 +779,14 @@ def _message_param_to_dict(message: MessageParam) -> dict[str, Any]:
         "role": message["role"],
         "content": message_content,
     }
+
+
+def _mapping_list(value: Any) -> list[dict[str, Any]]:
+    return [_copy_mapping(item) for item in cast(list[Any], value)]
+
+
+def _copy_mapping(value: Any) -> dict[str, Any]:
+    return dict(cast(Mapping[str, Any], value))
 
 
 def _tool_param_to_dict(tool: dict[str, Any]) -> dict[str, Any]:
