@@ -44,7 +44,7 @@ class LlmGuardResult:
     state: dict[str, Any] | None = None
 
     @classmethod
-    def continue_(
+    def allow(
         cls,
         *,
         request: dict[str, Any] | None = None,
@@ -312,7 +312,7 @@ async def call_llm_guard(
         result = await result
 
     if result is None:
-        return LlmGuardResult.continue_()
+        return LlmGuardResult.allow()
     if not isinstance(result, LlmGuardResult):
         raise TypeError(f"LLM guard {_guard_name(fn)} must return LlmGuardResult")
 
