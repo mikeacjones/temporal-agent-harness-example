@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, cast
 
@@ -10,23 +10,22 @@ with workflow.unsafe.imports_passed_through():
     from claude_harness.claude_agent import ClaudeAgent, ContinueAsNewPolicy
     from claude_harness.mcp import HttpMcpProvider
     from claude_harness.mcp_types import HttpMcpServerConfig
-    from claude_harness.streaming import StreamContext
     from claude_harness.tool_types import ToolType
     from claude_harness.tools import ToolContext, ToolResult, ToolSet, tool
     from simple_chat_agent import TASK_QUEUE
+    from simple_chat_agent.tools.approval import (
+        ApprovalDecision,
+        ChildToolApprovalRequest,
+        MutatingToolApprovalProvider,
+    )
+    from simple_chat_agent.tools.artifacts import ArtifactProvider
     from simple_chat_agent.tools.fetch_url import fetch_url
     from simple_chat_agent.tools.github import GitHubProvider
+    from simple_chat_agent.tools.python_sandbox import python_sandbox
 
 
 CREATE_SUBAGENT_TOOL = "create_subagent"
-_DISALLOWED_SUBAGENT_TOOLS = frozenset(
-    {
-        CREATE_SUBAGENT_TOOL,
-        "create_artifact",
-        "github_open_issue",
-        "python_sandbox",
-    }
-)
+_DISALLOWED_SUBAGENT_TOOLS = frozenset({CREATE_SUBAGENT_TOOL})
 _DEFAULT_SUBAGENT_MAX_TURNS = 8
 _MAX_SUBAGENT_MAX_TURNS = 12
 _DEFAULT_SUBAGENT_MAX_TOKENS = 16_000
@@ -42,6 +41,9 @@ class SubagentRequest:
     max_turns: int = _DEFAULT_SUBAGENT_MAX_TURNS
     tool_names: list[str] = field(default_factory=list)
     denied_tool_names: list[str] = field(default_factory=list)
+    parent_workflow_id: str | None = None
+    user_ref: str | None = None
+    conversation_id: str | None = None
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     stream_id: str | None = None
@@ -62,10 +64,14 @@ class SubagentProvider:
         self,
         *,
         default_model: Callable[[], str],
+        user_ref: Callable[[], str | None],
+        conversation_id: Callable[[], str | None],
         github_connection_id: Callable[[], str | None],
         mcp_servers: Callable[[], list[HttpMcpServerConfig]] | None = None,
     ) -> None:
         self._default_model = default_model
+        self._user_ref = user_ref
+        self._conversation_id = conversation_id
         self._github_connection_id = github_connection_id
         self._mcp_servers = mcp_servers or (lambda: [])
 
@@ -74,8 +80,9 @@ class SubagentProvider:
         description=(
             "Create a child Claude agent for a delegated task. Pass an explicit "
             "subset of tool_names for the child to use. The child inherits this "
-            "chat's streaming sideband. Mutating tools and recursive subagents "
-            "are not delegated."
+            "chat's streaming sideband. Mutating delegated tools request "
+            "approval through this parent chat. Recursive subagents are not "
+            "delegated."
         ),
         tool_type=ToolType.READ,
     )
@@ -113,21 +120,6 @@ class SubagentProvider:
             f"{workflow.info().workflow_id}-subagent-{workflow.uuid4()}"
         )
 
-        await ctx.activity(
-            _emit_subagent_event,
-            step="start",
-            args={
-                "kind": "subagent_start",
-                "payload": {
-                    "workflow_id": child_workflow_id,
-                    "model": model or self._default_model(),
-                    "tool_names": granted_tool_names,
-                    "denied_tool_names": denied_tool_names,
-                    "task_preview": task[:280],
-                },
-            },
-        )
-
         result = await workflow.execute_child_workflow(
             SubagentWorkflow.run,
             SubagentRequest(
@@ -138,6 +130,9 @@ class SubagentProvider:
                 max_turns=max_turns,
                 tool_names=granted_tool_names,
                 denied_tool_names=denied_tool_names,
+                parent_workflow_id=workflow.info().workflow_id,
+                user_ref=self._user_ref(),
+                conversation_id=self._conversation_id(),
                 github_connection_id=self._github_connection_id(),
                 mcp_servers=list(self._mcp_servers()),
                 stream_id=ctx.stream_id,
@@ -147,29 +142,36 @@ class SubagentProvider:
             static_summary=f"{CREATE_SUBAGENT_TOOL}:run",
         )
 
-        await ctx.activity(
-            _emit_subagent_event,
-            step="complete",
-            args={
-                "kind": "subagent_complete",
-                "payload": {
-                    "workflow_id": child_workflow_id,
-                    "stop_reason": result.stop_reason,
-                    "turns": result.turns,
-                },
-            },
-        )
-
         return ToolResult(payload=asdict(result), error=False)
 
 
 @workflow.defn
 class SubagentWorkflow:
+    def __init__(self) -> None:
+        self._approval_decisions: dict[str, ApprovalDecision] = {}
+        self._approval_counter = 0
+        self._parent_workflow_id: str | None = None
+
+    @workflow.signal
+    async def resolve_delegated_approval(
+        self,
+        approval_id: str,
+        decision: str,
+    ) -> None:
+        if decision in ("allow", "always_allow", "deny"):
+            self._approval_decisions[approval_id] = cast(ApprovalDecision, decision)
+
     @workflow.run
     async def run(self, request: SubagentRequest) -> SubagentResponse:
+        parent_workflow_id = _parent_workflow_id(request)
+        self._parent_workflow_id = parent_workflow_id
         tools = _build_subagent_tools(
-            request.github_connection_id,
-            request.mcp_servers,
+            parent_workflow_id=parent_workflow_id or workflow.info().workflow_id,
+            user_ref=request.user_ref,
+            conversation_id=request.conversation_id,
+            github_connection_id=request.github_connection_id,
+            mcp_servers=request.mcp_servers,
+            request_mutating_tool_approval=self._request_parent_tool_approval,
         )
         tool_names, denied_tool_names = _split_requested_tools(
             _dedupe(request.tool_names),
@@ -199,27 +201,69 @@ class SubagentWorkflow:
             denied_tool_names=denied_tool_names,
         )
 
+    async def _request_parent_tool_approval(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> ApprovalDecision:
+        if self._parent_workflow_id is None:
+            return "deny"
 
-async def _emit_subagent_event(
-    kind: str,
-    payload: dict[str, Any],
-    *,
-    stream: StreamContext,
-) -> dict[str, str]:
-    await stream.emit(payload, kind=kind)
-    return {"status": "emitted"}
+        self._approval_counter += 1
+        approval_id = f"child-approval-{self._approval_counter}"
+        parent = workflow.get_external_workflow_handle(self._parent_workflow_id)
+        await parent.signal(
+            "request_child_approval",
+            ChildToolApprovalRequest(
+                child_workflow_id=workflow.info().workflow_id,
+                child_approval_id=approval_id,
+                tool_name=tool_name,
+                tool_args=dict(tool_args),
+            ),
+        )
+        await workflow.wait_condition(
+            lambda: approval_id in self._approval_decisions
+        )
+        return self._approval_decisions.pop(approval_id)
 
 
 def _build_subagent_tools(
+    parent_workflow_id: str,
+    user_ref: str | None,
+    conversation_id: str | None,
     github_connection_id: str | None,
     mcp_servers: list[HttpMcpServerConfig],
+    request_mutating_tool_approval: Callable[
+        [str, dict[str, Any]], Awaitable[ApprovalDecision]
+    ]
+    | None = None,
 ) -> ToolSet:
     tools = ToolSet()
-    tools.add_tool(fetch_url)
-    tools.add_provider(GitHubProvider(lambda: github_connection_id))
+    tools.add_provider(MutatingToolApprovalProvider(request_mutating_tool_approval))
+    tools.add_provider(
+        ArtifactProvider(
+            user_ref=lambda: user_ref,
+            conversation_id=lambda: conversation_id,
+            workflow_id=lambda: parent_workflow_id,
+        )
+    )
+    tools.add_tool(fetch_url, python_sandbox)
+    tools.add_provider(
+        GitHubProvider(lambda: github_connection_id),
+        exclude_tools=_DISALLOWED_SUBAGENT_TOOLS,
+    )
     for server in mcp_servers:
         tools.add_mcp_provider(HttpMcpProvider(server))
     return tools
+
+
+def _parent_workflow_id(request: SubagentRequest) -> str | None:
+    if request.parent_workflow_id is not None:
+        return request.parent_workflow_id
+    parent = workflow.info().parent
+    if parent is None:
+        return None
+    return parent.workflow_id
 
 
 def _split_requested_tools(

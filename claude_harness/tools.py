@@ -217,7 +217,15 @@ class ToolSet:
     def get_tool(self, name: str) -> ToolDef:
         return self._tool_registry[name]
 
-    def add_provider(self, provider: object) -> object:
+    def add_provider(
+        self,
+        provider: object,
+        *,
+        include_tools: Iterable[str] | None = None,
+        exclude_tools: Iterable[str] | None = None,
+    ) -> object:
+        included = set(include_tools) if include_tools is not None else None
+        excluded = set(exclude_tools or ())
         guard_defs: dict[str, GuardDef] = {}
         methods = list(_provider_methods(provider))
 
@@ -230,6 +238,10 @@ class ToolSet:
         for method in methods:
             metadata = _tool_metadata(method)
             if metadata is None:
+                continue
+            if included is not None and metadata.name not in included:
+                continue
+            if metadata.name in excluded:
                 continue
             self._register_tool(
                 name=metadata.name,

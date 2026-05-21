@@ -24,15 +24,14 @@ from .context_manager import (
     SlidingWindowContextManager,
     estimate_token_count,
 )
-from .activity_router import function_ref
 from .llm_guards import (
     LlmGuardAction,
     LlmGuardExecution,
     LlmGuardFn,
     LlmGuardPipeline,
 )
-from .streaming import StreamContext, stream_sink_configured
-from .tools import RUN_TOOL_ACTIVITY_NAME, ToolActivityRequest, ToolResult, ToolSet
+from .streaming import StreamContext
+from .tools import ToolResult, ToolSet
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
@@ -41,8 +40,10 @@ SteeringMode = Literal["immediate", "after_next_tool_result"]
 InterruptPartialResponsePolicy = Literal["discard"]
 
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=2)
+    start_to_close_timeout=timedelta(minutes=10),
+    heartbeat_timeout=timedelta(seconds=10),
 )
+CLAUDE_HEARTBEAT_INTERVAL_SECONDS = 5
 FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 
 
@@ -425,17 +426,6 @@ class ClaudeAgent:
         tool_input = cast(dict[str, Any], block["input"])
         tool_use_id = cast(str, block["id"])
 
-        await self._emit_tool_stream_event(
-            tool_name=tool_name,
-            step="start",
-            kind="claude_tool_start",
-            payload={
-                "tool_use_id": tool_use_id,
-                "tool_name": tool_name,
-                "input": _json_preview(tool_input),
-            },
-        )
-
         try:
             result = await self._execute_tool(tool_name, **tool_input)
         except Exception as err:
@@ -444,49 +434,12 @@ class ClaudeAgent:
                 error=True,
             )
 
-        await self._emit_tool_stream_event(
-            tool_name=tool_name,
-            step="complete",
-            kind="claude_tool_complete",
-            payload={
-                "tool_use_id": tool_use_id,
-                "tool_name": tool_name,
-                "is_error": result.error,
-                "payload": _json_preview(result.payload),
-            },
-        )
-
         return ToolResultBlockParam(
             type="tool_result",
             tool_use_id=tool_use_id,
             content=json.dumps(result.payload),
             is_error=result.error,
         )
-
-    async def _emit_tool_stream_event(
-        self,
-        *,
-        tool_name: str,
-        step: str,
-        kind: str,
-        payload: dict[str, Any],
-    ) -> None:
-        if self._stream_id is None:
-            return
-
-        with suppress(Exception):
-            await workflow.execute_activity(
-                RUN_TOOL_ACTIVITY_NAME,
-                ToolActivityRequest(
-                    function_ref=function_ref(_emit_claude_tool_stream_event),
-                    args={"kind": kind, "payload": payload},
-                    tool_name=tool_name,
-                    step=step,
-                    stream_id=self._stream_id,
-                ),
-                summary=f"claude_tool:{tool_name}:{step}",
-                **self._claude_activity_options.to_execute_activity_kwargs(),
-            )
 
     def _terminated_result(self, *, turns: int) -> ClaudeAgentResult:
         return ClaudeAgentResult(
@@ -641,15 +594,12 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
         create_params["tools"] = request.tools
 
     async with AsyncAnthropic(max_retries=0) as client:
-        if request.stream_id is None or not stream_sink_configured():
-            response = await _create_claude_message(client, create_params)
-        else:
-            response = await _stream_claude_message(
-                client,
-                create_params,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-            )
+        response = await _stream_claude_message(
+            client,
+            create_params,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+        )
 
     return ClaudeResponse(
         id=response.id,
@@ -664,93 +614,71 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
     )
 
 
-async def _emit_claude_tool_stream_event(
-    kind: str,
-    payload: dict[str, Any],
-    *,
-    stream: StreamContext,
-) -> dict[str, str]:
-    await stream.emit(payload, kind=kind)
-    return {"status": "emitted"}
-
-
-async def _create_claude_message(
-    client: AsyncAnthropic,
-    create_params: dict[str, Any],
-) -> Any:
-    message_task = asyncio.create_task(client.messages.create(**create_params))
-    cancel_task = asyncio.create_task(activity.wait_for_cancelled())
-
-    try:
-        done, _pending = await asyncio.wait(
-            {message_task, cancel_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if cancel_task in done:
-            message_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await message_task
-            raise asyncio.CancelledError()
-
-        return message_task.result()
-    finally:
-        cancel_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cancel_task
-
-
 async def _stream_claude_message(
     client: AsyncAnthropic,
     create_params: dict[str, Any],
     *,
-    stream_id: str,
+    stream_id: str | None,
     stream_sequence: int | None,
 ) -> Any:
     stream = StreamContext(stream_id=stream_id, tool_name="claude")
+    heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
+    activity.heartbeat(heartbeat_state.payload("starting"))
+    heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))
     await stream.emit({"sequence": stream_sequence}, kind="claude_start")
 
-    async with client.messages.stream(
-        **create_params,
-        extra_headers=_streaming_extra_headers(create_params),
-    ) as message_stream:
-        cancel_task = asyncio.create_task(activity.wait_for_cancelled())
-        event_iterator = message_stream.__aiter__()
-        tool_input_blocks: dict[int, _ToolInputStreamState] = {}
-        try:
-            while True:
-                next_event_task = asyncio.create_task(anext(event_iterator))
-                done, _pending = await asyncio.wait(
-                    {next_event_task, cancel_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                if cancel_task in done:
-                    next_event_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await next_event_task
-                    await stream.emit(
-                        {"sequence": stream_sequence},
-                        kind="claude_cancelled",
+    try:
+        async with client.messages.stream(
+            **create_params,
+            extra_headers=_streaming_extra_headers(create_params),
+        ) as message_stream:
+            heartbeat_state.phase = "streaming"
+            cancel_task = asyncio.create_task(activity.wait_for_cancelled())
+            event_iterator = message_stream.__aiter__()
+            tool_input_blocks: dict[int, _ToolInputStreamState] = {}
+            try:
+                while True:
+                    next_event_task = asyncio.create_task(anext(event_iterator))
+                    done, _pending = await asyncio.wait(
+                        {next_event_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    raise asyncio.CancelledError()
 
-                try:
-                    event = next_event_task.result()
-                except StopAsyncIteration:
-                    break
+                    if cancel_task in done:
+                        heartbeat_state.phase = "cancelled"
+                        activity.heartbeat(heartbeat_state.payload("cancelled"))
+                        next_event_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await next_event_task
+                        await stream.emit(
+                            {"sequence": stream_sequence},
+                            kind="claude_cancelled",
+                        )
+                        raise asyncio.CancelledError()
 
-                await _emit_claude_raw_stream_event(
-                    stream=stream,
-                    event=event,
-                    stream_sequence=stream_sequence,
-                    tool_input_blocks=tool_input_blocks,
-                )
-        finally:
-            cancel_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await cancel_task
+                    try:
+                        event = next_event_task.result()
+                    except StopAsyncIteration:
+                        break
 
-        response = await message_stream.get_final_message()
+                    heartbeat_state.record_event(event)
+                    activity.heartbeat(heartbeat_state.payload("event"))
+                    await _emit_claude_raw_stream_event(
+                        stream=stream,
+                        event=event,
+                        stream_sequence=stream_sequence,
+                        tool_input_blocks=tool_input_blocks,
+                    )
+            finally:
+                cancel_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancel_task
+
+            response = await message_stream.get_final_message()
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
     await stream.emit(
         {
@@ -763,7 +691,40 @@ async def _stream_claude_message(
         },
         kind="claude_complete",
     )
+    heartbeat_state.phase = "complete"
+    heartbeat_state.stop_reason = cast(str | None, response.stop_reason)
+    activity.heartbeat(heartbeat_state.payload("complete"))
     return response
+
+
+@dataclass
+class _ClaudeHeartbeatState:
+    sequence: int | None
+    phase: str = "starting"
+    events: int = 0
+    last_event_type: str | None = None
+    stop_reason: str | None = None
+
+    def record_event(self, event: Any) -> None:
+        self.events += 1
+        self.last_event_type = cast(str | None, getattr(event, "type", None))
+
+    def payload(self, heartbeat_reason: str) -> dict[str, Any]:
+        return {
+            "kind": "claude_stream",
+            "heartbeat_reason": heartbeat_reason,
+            "sequence": self.sequence,
+            "phase": self.phase,
+            "events": self.events,
+            "last_event_type": self.last_event_type,
+            "stop_reason": self.stop_reason,
+        }
+
+
+async def _heartbeat_claude_stream(state: _ClaudeHeartbeatState) -> None:
+    while True:
+        await asyncio.sleep(CLAUDE_HEARTBEAT_INTERVAL_SECONDS)
+        activity.heartbeat(state.payload("timer"))
 
 
 def _streaming_extra_headers(create_params: dict[str, Any]) -> dict[str, str] | None:

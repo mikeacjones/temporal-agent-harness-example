@@ -3603,11 +3603,7 @@ INDEX_HTML = r"""
     }
 
     function isClaudeToolEvent(event) {
-      return (
-        event.kind === "claude_tool_start" ||
-        event.kind === "claude_tool_complete" ||
-        event.kind?.startsWith("claude_tool_input_")
-      );
+      return event.kind?.startsWith("claude_tool_input_");
     }
 
     function mergeStreamToolEvent(events, event) {

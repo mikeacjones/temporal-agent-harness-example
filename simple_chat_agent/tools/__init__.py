@@ -116,6 +116,8 @@ def build_tools(
     tools.add_provider(
         SubagentProvider(
             default_model=default_model,
+            user_ref=user_ref,
+            conversation_id=conversation_id,
             github_connection_id=github_connection_id,
             mcp_servers=lambda: list(
                 mcp_servers() if mcp_servers is not None else ()

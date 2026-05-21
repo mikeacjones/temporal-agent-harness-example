@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from claude_harness.guards import GuardContext, GuardResult
@@ -9,6 +10,14 @@ from claude_harness.tools import guard
 
 ApprovalDecision = Literal["allow", "always_allow", "deny"]
 ApprovalRequest = Callable[[str, dict[str, Any]], Awaitable[ApprovalDecision]]
+
+
+@dataclass
+class ChildToolApprovalRequest:
+    child_workflow_id: str
+    child_approval_id: str
+    tool_name: str
+    tool_args: dict[str, Any]
 
 
 class MutatingToolApprovalProvider:

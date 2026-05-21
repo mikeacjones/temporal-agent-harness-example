@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
+import uvicorn
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -14,6 +16,13 @@ from claude_harness.mcp import (
 from claude_harness.streaming import configure_stream_sink
 from claude_harness.tools import run_tool_activity
 from simple_chat_agent import TASK_QUEUE
+from simple_chat_agent.codec_server import (
+    codec_server_enabled,
+    codec_server_host,
+    codec_server_port,
+    codec_server_url,
+    create_codec_app,
+)
 from simple_chat_agent.env import load_dotenv
 from simple_chat_agent.external_storage import simple_chat_data_converter
 from simple_chat_agent.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
@@ -28,9 +37,10 @@ async def main() -> None:
     configure_stream_sink(JsonlStreamSink())
     configure_mcp_auth_resolver(resolve_mcp_auth_headers)
     configure_mcp_http_auth_resolver(resolve_mcp_http_auth)
+    data_converter = simple_chat_data_converter()
     client = await Client.connect(
         "localhost:7233",
-        data_converter=simple_chat_data_converter(),
+        data_converter=data_converter,
     )
 
     worker = Worker(
@@ -39,7 +49,39 @@ async def main() -> None:
         workflows=[SimpleChatWorkflow, UserChatsWorkflow, SubagentWorkflow],
         activities=[call_claude, run_tool_activity, run_guard_activity],
     )
-    await worker.run()
+    if not codec_server_enabled():
+        await worker.run()
+        return
+
+    codec_server = uvicorn.Server(
+        uvicorn.Config(
+            create_codec_app(data_converter),
+            host=codec_server_host(),
+            port=codec_server_port(),
+            log_level="info",
+        )
+    )
+    print(f"Temporal Web codec server listening on {codec_server_url()}")
+    await _run_worker_and_codec_server(worker, codec_server)
+
+
+async def _run_worker_and_codec_server(
+    worker: Worker,
+    codec_server: uvicorn.Server,
+) -> None:
+    tasks = [
+        asyncio.create_task(worker.run(), name="temporal-worker"),
+        asyncio.create_task(codec_server.serve(), name="codec-server"),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        with suppress(asyncio.CancelledError):
+            await task
+    for task in done:
+        task.result()
 
 
 if __name__ == "__main__":

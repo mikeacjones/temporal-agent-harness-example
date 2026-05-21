@@ -14,10 +14,13 @@ with workflow.unsafe.imports_passed_through():
         SteeringMode,
     )
     from simple_chat_agent.tools import build_tools, tool_names_for_connections
+    from simple_chat_agent.tools.approval import (
+        ApprovalDecision,
+        ChildToolApprovalRequest,
+    )
 
 
 ChatRole = Literal["user", "assistant", "system"]
-ApprovalDecision = Literal["allow", "always_allow", "deny"]
 DEFAULT_MAX_TOKENS = 64_000
 
 
@@ -40,6 +43,8 @@ class PendingApproval:
     tool_args: dict[str, Any]
     summary: str
     memory_key: str
+    requesting_workflow_id: str | None = None
+    requesting_approval_id: str | None = None
 
 
 @dataclass
@@ -185,7 +190,8 @@ class SimpleChatWorkflow:
                 )
             )
             return
-        if approval_id not in self._pending_approvals:
+        approval = self._pending_approvals.get(approval_id)
+        if approval is None:
             self._transcript.append(
                 ChatMessage(
                     role="system",
@@ -194,7 +200,55 @@ class SimpleChatWorkflow:
             )
             return
 
+        if (
+            approval.requesting_workflow_id is not None
+            and approval.requesting_approval_id is not None
+        ):
+            self._pending_approvals.pop(approval_id, None)
+            if decision == "always_allow":
+                self._approval_memory.add(approval.memory_key)
+            await self._signal_child_approval(
+                workflow_id=approval.requesting_workflow_id,
+                approval_id=approval.requesting_approval_id,
+                decision=cast(ApprovalDecision, decision),
+            )
+            return
+
         self._approval_decisions[approval_id] = cast(ApprovalDecision, decision)
+
+    @workflow.signal
+    async def request_child_approval(
+        self,
+        request: ChildToolApprovalRequest,
+    ) -> None:
+        memory_key = _approval_memory_key(request.tool_name, request.tool_args)
+        if memory_key in self._approval_memory:
+            await self._signal_child_approval(
+                workflow_id=request.child_workflow_id,
+                approval_id=request.child_approval_id,
+                decision="allow",
+            )
+            return
+
+        for approval in self._pending_approvals.values():
+            if (
+                approval.requesting_workflow_id == request.child_workflow_id
+                and approval.requesting_approval_id == request.child_approval_id
+            ):
+                return
+
+        self._approval_counter += 1
+        approval_id = f"approval-{self._approval_counter}"
+        summary = _approval_summary(request.tool_name, request.tool_args)
+        self._pending_approvals[approval_id] = PendingApproval(
+            approval_id=approval_id,
+            tool_name=request.tool_name,
+            tool_args=dict(request.tool_args),
+            summary=f"Subagent requested: {summary}",
+            memory_key=memory_key,
+            requesting_workflow_id=request.child_workflow_id,
+            requesting_approval_id=request.child_approval_id,
+        )
 
     @workflow.query
     def state(self) -> SimpleChatState:
@@ -352,6 +406,29 @@ class SimpleChatWorkflow:
             self._approval_memory.add(memory_key)
 
         return decision
+
+    async def _signal_child_approval(
+        self,
+        *,
+        workflow_id: str,
+        approval_id: str,
+        decision: ApprovalDecision,
+    ) -> None:
+        try:
+            await workflow.get_external_workflow_handle(workflow_id).signal(
+                "resolve_delegated_approval",
+                args=[approval_id, decision],
+            )
+        except Exception as err:
+            self._transcript.append(
+                ChatMessage(
+                    role="system",
+                    content=(
+                        "Could not deliver approval decision to subagent "
+                        f"{workflow_id}: {type(err).__name__}: {err}"
+                    ),
+                )
+            )
 
     def _continue_as_new_input(
         self,

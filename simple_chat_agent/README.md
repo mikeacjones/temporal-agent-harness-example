@@ -49,6 +49,11 @@ Start the worker in another terminal:
 uv run python -m simple_chat_agent.worker
 ```
 
+The worker also starts a Temporal Web codec server at
+`http://127.0.0.1:8001` by default. Configure Temporal Web's codec endpoint to
+that URL to decode claim-checked payloads from the local JSON-file external
+storage.
+
 Start the web UI in a third terminal:
 
 ```bash
@@ -124,6 +129,11 @@ Useful overrides:
 ```bash
 SIMPLE_CHAT_DB_PATH=.simple_chat_agent/simple_chat.sqlite3
 SIMPLE_CHAT_ARTIFACT_DIR=.simple_chat_agent/artifacts
+SIMPLE_CHAT_EXTERNAL_STORAGE_PATH=.simple_chat_agent/external_payloads.json
+SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES=1024
+SIMPLE_CHAT_CODEC_SERVER_ENABLED=true
+SIMPLE_CHAT_CODEC_SERVER_HOST=127.0.0.1
+SIMPLE_CHAT_CODEC_SERVER_PORT=8001
 TEMPORAL_UI_URL=http://localhost:8233
 ```
 
