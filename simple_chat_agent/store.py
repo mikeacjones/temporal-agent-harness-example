@@ -315,6 +315,25 @@ class AppStore:
             ).fetchone()
         return _oauth_connection_from_row(row)
 
+    def get_oauth_connection_by_provider(
+        self, provider: str
+    ) -> OAuthConnectionRecord | None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select *
+                from oauth_connections
+                where provider = ?
+                order by updated_at desc
+                limit 2
+                """,
+                (provider,),
+            ).fetchall()
+
+        if len(rows) > 1:
+            raise ValueError(f"Multiple OAuth connections found for provider: {provider}")
+        return _oauth_connection_from_row(rows[0] if rows else None)
+
     def delete_oauth_connection(self, *, user_id: str, provider: str) -> None:
         with self._connect() as conn:
             conn.execute(

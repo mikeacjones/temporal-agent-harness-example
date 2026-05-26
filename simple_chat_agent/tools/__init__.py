@@ -38,6 +38,7 @@ class AppToolSet(ToolSet):
         super().__init__()
         self._available_tool_names = available_tool_names
         self._mcp_servers = mcp_servers or (lambda: ())
+        self._mcp_tool_sources: dict[str, tuple[str, str, str | None, str]] = {}
 
     def tool_names(self) -> list[str]:
         self._sync_mcp_tools()
@@ -73,19 +74,37 @@ class AppToolSet(ToolSet):
         return set(self._available_tool_names())
 
     def _sync_mcp_tools(self) -> None:
+        desired_tools: dict[
+            str,
+            tuple[HttpMcpServerConfig, Any, tuple[str, str, str | None, str]],
+        ] = {}
         for server in self._mcp_servers():
-            missing_tools = [
-                tool
-                for tool in server.tools
-                if (tool.public_name or server.public_tool_name(tool.name))
-                not in self._tool_registry
-            ]
-            if not missing_tools:
+            if not server.enabled:
+                continue
+            for tool in server.tools:
+                public_name = tool.public_name or server.public_tool_name(tool.name)
+                if public_name in desired_tools:
+                    continue
+                desired_tools[public_name] = (
+                    server,
+                    tool,
+                    (server.server_id, server.server_url, server.auth_ref, tool.name),
+                )
+
+        for name in list(self._mcp_tool_sources):
+            if name not in desired_tools:
+                self._mcp_tool_sources.pop(name, None)
+                self._tool_registry.pop(name, None)
+
+        for name, (server, tool, source) in desired_tools.items():
+            if self._mcp_tool_sources.get(name) == source and name in self._tool_registry:
+                continue
+            if name in self._tool_registry and name not in self._mcp_tool_sources:
                 continue
 
-            self.add_mcp_provider(
-                HttpMcpProvider(replace(server, tools=missing_tools))
-            )
+            self._tool_registry.pop(name, None)
+            self.add_mcp_provider(HttpMcpProvider(replace(server, tools=[tool])))
+            self._mcp_tool_sources[name] = source
 
 
 def build_tools(

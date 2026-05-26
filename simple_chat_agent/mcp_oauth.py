@@ -6,12 +6,27 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.auth.utils import (
+    build_oauth_authorization_server_metadata_discovery_urls,
+    build_protected_resource_metadata_discovery_urls,
+    create_client_info_from_metadata_url,
+    create_client_registration_request,
+    create_oauth_metadata_request,
+    get_client_metadata_scopes,
+    handle_auth_metadata_response,
+    handle_protected_resource_response,
+    handle_registration_response,
+    should_use_client_metadata_url,
+)
+from mcp.client.streamable_http import MCP_PROTOCOL_VERSION
 from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthClientMetadata,
     OAuthToken,
 )
+from mcp.types import LATEST_PROTOCOL_VERSION
 
 from simple_chat_agent.mcp_auth import mcp_oauth_provider
 from simple_chat_agent.store import AppStore, OAuthConnectionRecord
@@ -153,6 +168,32 @@ def mcp_oauth_provider_for_flow(
     )
 
 
+async def authorize_mcp_oauth_flow(
+    *,
+    flow: PendingMcpOAuthFlow,
+    store: AppStore,
+) -> None:
+    provider = mcp_oauth_provider_for_flow(flow=flow, store=store)
+
+    # The MCP SDK currently starts OAuth from an HTTPX 401/403 auth flow. Some
+    # servers expose list_tools anonymously, so the app needs an explicit path.
+    await provider._initialize()
+    provider.context.protocol_version = LATEST_PROTOCOL_VERSION
+
+    async with httpx.AsyncClient() as client:
+        await _discover_oauth_metadata(provider, client)
+        provider.context.client_metadata.scope = get_client_metadata_scopes(
+            None,
+            provider.context.protected_resource_metadata,
+            provider.context.oauth_metadata,
+        )
+        await _ensure_client_info(provider, client)
+
+        token_request = await provider._perform_authorization()
+        token_response = await client.send(token_request)
+        await provider._handle_token_response(token_response)
+
+
 def mcp_oauth_provider_for_connection(
     *,
     connection: OAuthConnectionRecord,
@@ -175,6 +216,74 @@ def mcp_oauth_provider_for_connection(
         redirect_handler=_raise_reauthorization_required,
         callback_handler=_raise_reauthorization_required_callback,
     )
+
+
+async def _discover_oauth_metadata(
+    provider: OAuthClientProvider,
+    client: httpx.AsyncClient,
+) -> None:
+    context = provider.context
+    headers = {MCP_PROTOCOL_VERSION: LATEST_PROTOCOL_VERSION}
+
+    for url in build_protected_resource_metadata_discovery_urls(
+        None,
+        context.server_url,
+    ):
+        response = await client.get(url, headers=headers)
+        protected_resource_metadata = await handle_protected_resource_response(
+            response
+        )
+        if protected_resource_metadata is None:
+            continue
+
+        await provider._validate_resource_match(protected_resource_metadata)
+        context.protected_resource_metadata = protected_resource_metadata
+        if protected_resource_metadata.authorization_servers:
+            context.auth_server_url = str(
+                protected_resource_metadata.authorization_servers[0]
+            )
+        break
+
+    for url in build_oauth_authorization_server_metadata_discovery_urls(
+        context.auth_server_url,
+        context.server_url,
+    ):
+        response = await client.send(create_oauth_metadata_request(url))
+        ok, oauth_metadata = await handle_auth_metadata_response(response)
+        if not ok:
+            break
+        if oauth_metadata is not None:
+            context.oauth_metadata = oauth_metadata
+            break
+
+
+async def _ensure_client_info(
+    provider: OAuthClientProvider,
+    client: httpx.AsyncClient,
+) -> None:
+    context = provider.context
+    if context.client_info is not None:
+        return
+
+    if should_use_client_metadata_url(
+        context.oauth_metadata,
+        context.client_metadata_url,
+    ):
+        client_info = create_client_info_from_metadata_url(
+            context.client_metadata_url,
+            redirect_uris=context.client_metadata.redirect_uris,
+        )
+    else:
+        registration_request = create_client_registration_request(
+            context.oauth_metadata,
+            context.client_metadata,
+            context.get_authorization_base_url(context.server_url),
+        )
+        registration_response = await client.send(registration_request)
+        client_info = await handle_registration_response(registration_response)
+
+    context.client_info = client_info
+    await context.storage.set_client_info(client_info)
 
 
 def _server_id_from_provider(provider: str) -> str:

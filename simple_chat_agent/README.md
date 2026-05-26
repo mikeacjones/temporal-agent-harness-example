@@ -104,7 +104,7 @@ Supported auth modes:
 
 - `none`: unauthenticated HTTP MCP server.
 - `bearer`: user-provided bearer token stored in the app store.
-- `oauth`: MCP OAuth discovery flow, when supported by the MCP server.
+- `oauth`: explicit MCP OAuth authorization, when supported by the MCP server.
 
 Configured MCP servers are stored in the user entity workflow and broadcast to
 active chat workflows as tool availability updates. The workflow receives the

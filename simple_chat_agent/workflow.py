@@ -11,6 +11,7 @@ with workflow.unsafe.imports_passed_through():
         ClaudeAgent,
         ClaudeAgentResult,
         ClaudeAgentState,
+        ClaudeThinkingConfig,
         SteeringMode,
     )
     from simple_chat_agent.tools import build_tools, tool_names_for_connections
@@ -54,6 +55,7 @@ class SimpleChatInput:
     system_prompt: str = "You are a concise test chatbot."
     model: str = "claude-sonnet-4-5"
     max_tokens: int = DEFAULT_MAX_TOKENS
+    thinking: ClaudeThinkingConfig | None = None
     max_turns: int = 20
     stream_id: str | None = None
     available_tool_names: list[str] = field(default_factory=list)
@@ -73,6 +75,8 @@ class SimpleChatState:
     pending_messages: int
     user_ref: str | None = None
     conversation_id: str | None = None
+    model: str | None = None
+    thinking: ClaudeThinkingConfig | None = None
     available_tool_names: list[str] = field(default_factory=list)
     github_connected: bool = False
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
@@ -92,6 +96,8 @@ class SimpleChatWorkflow:
         self._active_message_index: int | None = None
         self._user_ref: str | None = None
         self._conversation_id: str | None = None
+        self._model: str | None = None
+        self._thinking: ClaudeThinkingConfig | None = None
         self._available_tool_names: set[str] = set()
         self._github_connection_id: str | None = None
         self._mcp_servers: list[HttpMcpServerConfig] = []
@@ -257,6 +263,8 @@ class SimpleChatWorkflow:
             pending_messages=len(self._pending_messages),
             user_ref=self._user_ref,
             conversation_id=self._conversation_id,
+            model=self._model,
+            thinking=self._thinking,
             available_tool_names=sorted(self._available_tool_names),
             github_connected=self._github_connection_id is not None,
             mcp_servers=list(self._mcp_servers),
@@ -281,6 +289,8 @@ class SimpleChatWorkflow:
         self._approval_counter = chat_input.approval_counter
         self._user_ref = chat_input.user_ref
         self._conversation_id = chat_input.conversation_id
+        self._model = chat_input.model
+        self._thinking = chat_input.thinking
         self._github_connection_id = chat_input.github_connection_id
         self._mcp_servers = list(chat_input.mcp_servers)
         self._available_tool_names = set(
@@ -305,6 +315,7 @@ class SimpleChatWorkflow:
             tools,
             model=chat_input.model,
             max_tokens=chat_input.max_tokens,
+            thinking=chat_input.thinking,
             stream_id=chat_input.stream_id or workflow.info().workflow_id,
         )
         self._status = "idle"
@@ -441,6 +452,7 @@ class SimpleChatWorkflow:
             system_prompt=chat_input.system_prompt,
             model=chat_input.model,
             max_tokens=chat_input.max_tokens,
+            thinking=chat_input.thinking,
             max_turns=chat_input.max_turns,
             stream_id=chat_input.stream_id,
             available_tool_names=sorted(self._available_tool_names),

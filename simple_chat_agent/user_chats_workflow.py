@@ -8,9 +8,15 @@ from temporalio import workflow
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
+    from claude_harness.claude_agent import ClaudeThinkingConfig
     from claude_harness.mcp_types import HttpMcpServerConfig
     from simple_chat_agent import TASK_QUEUE
-    from simple_chat_agent.workflow import SimpleChatInput, SimpleChatWorkflow
+    from simple_chat_agent.workflow import (
+        ChatMessage,
+        QueuedChatMessage,
+        SimpleChatInput,
+        SimpleChatWorkflow,
+    )
 
 
 CHAT_REGISTRY_PREFIX = "simple-chat-user-"
@@ -28,6 +34,8 @@ class CreateChatRequest:
     model: str
     max_tokens: int
     max_turns: int
+    thinking: ClaudeThinkingConfig | None = None
+    initial_message: str | None = None
     available_tool_names: list[str] = field(default_factory=list)
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
@@ -83,6 +91,21 @@ class UserChatsWorkflow:
     @workflow.update
     async def create_chat(self, request: CreateChatRequest) -> ChatRecord:
         workflow_id = f"simple-chat-{workflow.uuid4()}"
+        initial_message = (
+            request.initial_message.strip()
+            if request.initial_message is not None
+            else ""
+        )
+        transcript = (
+            [ChatMessage(role="user", content=initial_message)]
+            if initial_message
+            else []
+        )
+        pending_messages = (
+            [QueuedChatMessage(content=initial_message, transcript_index=0)]
+            if initial_message
+            else []
+        )
         handle = await workflow.start_child_workflow(
             SimpleChatWorkflow.run,
             SimpleChatInput(
@@ -91,11 +114,14 @@ class UserChatsWorkflow:
                 system_prompt=request.system_prompt,
                 model=request.model,
                 max_tokens=request.max_tokens,
+                thinking=request.thinking,
                 max_turns=request.max_turns,
                 stream_id=workflow_id,
                 available_tool_names=list(request.available_tool_names),
                 github_connection_id=request.github_connection_id,
                 mcp_servers=list(request.mcp_servers),
+                transcript=transcript,
+                pending_messages=pending_messages,
             ),
             id=workflow_id,
             task_queue=TASK_QUEUE,
@@ -106,7 +132,7 @@ class UserChatsWorkflow:
         record = ChatRecord(
             workflow_id=workflow_id,
             run_id=handle.first_execution_run_id or "",
-            title="New chat",
+            title=_conversation_title(initial_message),
             status="active",
             created_at=now,
             updated_at=now,
@@ -218,3 +244,12 @@ class UserChatsWorkflow:
                 )
             except Exception:
                 pass
+
+
+def _conversation_title(message: str) -> str:
+    normalized = " ".join(message.split())
+    if not normalized:
+        return "New chat"
+    if len(normalized) <= 64:
+        return normalized
+    return f"{normalized[:61]}..."

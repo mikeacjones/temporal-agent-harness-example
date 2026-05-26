@@ -14,11 +14,17 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.service import RPCError, RPCStatusCode
 
+from claude_harness.claude_agent import (
+    ClaudeThinkingConfig,
+    ClaudeThinkingEffort,
+    DEFAULT_THINKING_BUDGET_TOKENS,
+    MIN_THINKING_BUDGET_TOKENS,
+)
 from claude_harness.mcp import (
     discover_http_mcp_tools,
     configure_mcp_auth_resolver,
@@ -54,7 +60,7 @@ from simple_chat_agent.mcp_auth import (
 )
 from simple_chat_agent.mcp_oauth import (
     PendingMcpOAuthFlow,
-    mcp_oauth_provider_for_flow,
+    authorize_mcp_oauth_flow,
 )
 from simple_chat_agent.streaming import stream_path
 from simple_chat_agent.store import AppStore, ArtifactRecord
@@ -84,6 +90,21 @@ from simple_chat_agent.workflow import (
 
 STATE_POLL_INTERVAL_SECONDS = 0.1
 STREAM_POLL_INTERVAL_SECONDS = 0.02
+DEFAULT_THINKING_EFFORT: ClaudeThinkingEffort = "medium"
+ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-7",)
+DEFAULT_MODEL_OPTIONS = [
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-7",
+    "claude-haiku-4-5",
+]
+
+
+class ThinkingSessionRequest(BaseModel):
+    enabled: bool = False
+    budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
+    effort: ClaudeThinkingEffort = DEFAULT_THINKING_EFFORT
 
 
 class CreateSessionRequest(BaseModel):
@@ -91,6 +112,8 @@ class CreateSessionRequest(BaseModel):
     model: str | None = None
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_turns: int = 20
+    thinking: ThinkingSessionRequest = Field(default_factory=ThinkingSessionRequest)
+    initial_message: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -148,6 +171,23 @@ async def index() -> str:
 async def me(request: Request) -> dict[str, str]:
     user = _current_user(request)
     return {"user_id": user.user_id, "username": user.username}
+
+
+@app.get("/api/config")
+async def config(request: Request) -> dict[str, Any]:
+    _current_user(request)
+    return {
+        "default_model": _default_model(),
+        "model_options": _model_options(),
+        "thinking": {
+            "enabled": False,
+            "budget_tokens": DEFAULT_THINKING_BUDGET_TOKENS,
+            "min_budget_tokens": MIN_THINKING_BUDGET_TOKENS,
+            "effort": DEFAULT_THINKING_EFFORT,
+            "effort_options": ["low", "medium", "high", "xhigh", "max"],
+            "adaptive_model_prefixes": list(ADAPTIVE_THINKING_MODEL_PREFIXES),
+        },
+    }
 
 
 @app.post("/api/login")
@@ -215,14 +255,20 @@ async def create_session(
     )
     registry = await _ensure_user_chats_workflow(user.user_id)
     mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
+    model = session_request.model or _default_model()
     conversation = await registry.execute_update(
         UserChatsWorkflow.create_chat,
         CreateChatRequest(
             system_prompt=session_request.system_prompt,
-            model=session_request.model
-            or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            model=model,
             max_tokens=session_request.max_tokens,
             max_turns=session_request.max_turns,
+            thinking=_thinking_config_from_request(
+                session_request.thinking,
+                model=model,
+                max_tokens=session_request.max_tokens,
+            ),
+            initial_message=session_request.initial_message,
             available_tool_names=tool_names_for_connections(
                 github_connection_id=github_connection_id,
                 mcp_servers=mcp_servers,
@@ -452,10 +498,13 @@ async def tools(request: Request) -> dict[str, Any]:
             *[
                 {
                     "provider": f"mcp:{server.server_id}",
+                    "server_id": server.server_id,
+                    "server_url": server.server_url,
+                    "tool_prefix": server.tool_prefix,
+                    "auth_mode": server.auth_mode,
                     "label": server.label,
                     "configured": True,
-                    "connected": server.auth_ref is not None
-                    or server.auth_mode == "none",
+                    "connected": _mcp_server_connected(user, server),
                     "enabled": server.enabled,
                     "login": server.server_url,
                     "scopes": server.auth_mode,
@@ -509,9 +558,10 @@ async def add_mcp_server(
     if request.auth_mode == "bearer":
         if not request.bearer_token:
             raise HTTPException(status_code=400, detail="Bearer token is required.")
-        auth_ref = _store().upsert_oauth_connection(
+        auth_ref = mcp_oauth_provider(server_id)
+        _store().upsert_oauth_connection(
             user_id=user.user_id,
-            provider=mcp_oauth_provider(server_id),
+            provider=auth_ref,
             access_token=request.bearer_token,
             token_type="Bearer",
             scope="",
@@ -618,6 +668,24 @@ async def start_mcp_oauth(
     server_id: str | None = None,
 ) -> RedirectResponse:
     user = _current_user(request)
+    auth_url = await _start_mcp_oauth_flow(
+        user=user,
+        label=label,
+        server_url=server_url,
+        tool_prefix=tool_prefix,
+        server_id=server_id,
+    )
+    return RedirectResponse(auth_url)
+
+
+async def _start_mcp_oauth_flow(
+    *,
+    user: AuthenticatedUser,
+    label: str,
+    server_url: str,
+    tool_prefix: str,
+    server_id: str | None = None,
+) -> str:
     normalized_label = label.strip()
     normalized_server_url = server_url.strip()
     normalized_tool_prefix = tool_prefix.strip()
@@ -628,9 +696,19 @@ async def start_mcp_oauth(
     if not normalized_tool_prefix:
         raise HTTPException(status_code=400, detail="MCP tool prefix is required.")
 
+    existing_server = None
+    if server_id is None:
+        existing_server = await _find_matching_mcp_server(
+            user,
+            server_url=normalized_server_url,
+            tool_prefix=normalized_tool_prefix,
+        )
+
     flow = PendingMcpOAuthFlow(
         user_id=user.user_id,
-        server_id=_mcp_server_id(server_id),
+        server_id=_mcp_server_id(
+            server_id or (existing_server.server_id if existing_server else None)
+        ),
         server_url=normalized_server_url,
         tool_prefix=normalized_tool_prefix,
         label=normalized_label,
@@ -654,7 +732,7 @@ async def start_mcp_oauth(
         raise HTTPException(status_code=400, detail=flow.start_error)
     if not flow.auth_url:
         raise HTTPException(status_code=500, detail="MCP OAuth did not start.")
-    return RedirectResponse(flow.auth_url)
+    return flow.auth_url
 
 
 @app.get("/oauth/mcp/callback")
@@ -753,20 +831,25 @@ async def github_oauth_callback(
 
 async def _complete_mcp_oauth_flow(flow: PendingMcpOAuthFlow) -> None:
     try:
-        discovered_url, tools = await _discover_oauth_mcp_tools_for_flow(flow)
+        await authorize_mcp_oauth_flow(flow=flow, store=_store())
         connection = _store().get_oauth_connection(
             user_id=flow.user_id,
             provider=mcp_oauth_provider(flow.server_id),
         )
-        if connection is None:
+        if connection is None or not connection.access_token:
             raise RuntimeError("MCP OAuth completed without storing a connection.")
 
+        discovered_url, tools = await _discover_mcp_tools_for_user_request(
+            flow.server_url,
+            tool_prefix=flow.tool_prefix,
+            auth_ref=mcp_oauth_provider(flow.server_id),
+        )
         server = HttpMcpServerConfig(
             server_id=flow.server_id,
             label=flow.label,
             server_url=discovered_url,
             tool_prefix=flow.tool_prefix,
-            auth_ref=connection.connection_id,
+            auth_ref=mcp_oauth_provider(flow.server_id),
             auth_mode="oauth",
             tools=tools,
         )
@@ -779,32 +862,6 @@ async def _complete_mcp_oauth_flow(flow: PendingMcpOAuthFlow) -> None:
         raise
     finally:
         _mcp_oauth_flows().pop(flow.flow_id, None)
-
-
-async def _discover_oauth_mcp_tools_for_flow(
-    flow: PendingMcpOAuthFlow,
-) -> tuple[str, list[Any]]:
-    first_error: Exception | None = None
-    original_url = flow.server_url
-    for candidate_url in _mcp_server_url_candidates(original_url):
-        flow.server_url = candidate_url
-        try:
-            auth = mcp_oauth_provider_for_flow(flow=flow, store=_store())
-            return candidate_url, await discover_http_mcp_tools(
-                server_url=candidate_url,
-                tool_prefix=flow.tool_prefix,
-                http_auth=auth,
-            )
-        except Exception as err:
-            if flow.auth_url is not None:
-                raise err
-            if first_error is None:
-                first_error = err
-
-    flow.server_url = original_url
-    if first_error is not None:
-        raise first_error
-    raise ValueError("MCP server URL is required.")
 
 
 async def _discover_mcp_tools_for_user_request(
@@ -853,10 +910,50 @@ def _mcp_server_id(server_id: str | None) -> str:
     return sanitized or f"mcp-{uuid4().hex[:12]}"
 
 
+async def _find_matching_mcp_server(
+    user: AuthenticatedUser,
+    *,
+    server_url: str,
+    tool_prefix: str,
+) -> HttpMcpServerConfig | None:
+    normalized_url = server_url.strip().rstrip("/")
+    candidate_urls = set(_mcp_server_url_candidates(normalized_url))
+    for server in await (await _ensure_user_chats_workflow(user.user_id)).query(
+        UserChatsWorkflow.list_mcp_servers
+    ):
+        if server.tool_prefix != tool_prefix:
+            continue
+        server_urls = set(_mcp_server_url_candidates(server.server_url))
+        if (
+            normalized_url in server_urls
+            or server.server_url.rstrip("/") in candidate_urls
+        ):
+            return server
+    return None
+
+
+def _mcp_server_connected(
+    user: AuthenticatedUser,
+    server: HttpMcpServerConfig,
+) -> bool:
+    if server.auth_mode == "none":
+        return True
+    if server.auth_ref is None:
+        return False
+
+    connection = _store().get_oauth_connection_by_id(server.auth_ref)
+    if connection is None:
+        connection = _store().get_oauth_connection(
+            user_id=user.user_id,
+            provider=mcp_oauth_provider(server.server_id),
+        )
+    return bool(connection and connection.access_token)
+
+
 def _mcp_discovery_error_message(err: BaseException) -> str:
     if _mcp_error_requires_auth(err):
         return (
-            "MCP server requires authentication. Select OAuth discovery if the "
+            "MCP server requires authentication. Select OAuth authorization if the "
             "server supports MCP OAuth, or use bearer auth if you already have "
             "an access token."
         )
@@ -1242,6 +1339,64 @@ def _conversation_title(message: str) -> str:
     return f"{normalized[:61]}..."
 
 
+def _default_model() -> str:
+    return os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL_OPTIONS[0])
+
+
+def _model_options() -> list[str]:
+    configured = [
+        model.strip()
+        for model in os.environ.get("ANTHROPIC_MODEL_OPTIONS", "").split(",")
+        if model.strip()
+    ]
+    options = configured or DEFAULT_MODEL_OPTIONS
+    return _dedupe([_default_model(), *options])
+
+
+def _thinking_config_from_request(
+    request: ThinkingSessionRequest,
+    *,
+    model: str,
+    max_tokens: int,
+) -> ClaudeThinkingConfig | None:
+    if not request.enabled:
+        return None
+    if _uses_adaptive_thinking(model):
+        return ClaudeThinkingConfig(
+            enabled=True,
+            mode="adaptive",
+            effort=request.effort,
+        )
+    if max_tokens <= MIN_THINKING_BUDGET_TOKENS:
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens must be greater than 1024 for extended thinking.",
+        )
+    budget_tokens = min(
+        max(request.budget_tokens, MIN_THINKING_BUDGET_TOKENS),
+        max_tokens - 1,
+    )
+    return ClaudeThinkingConfig(enabled=True, budget_tokens=budget_tokens)
+
+
+def _uses_adaptive_thinking(model: str) -> bool:
+    return any(
+        model.startswith(prefix)
+        for prefix in ADAPTIVE_THINKING_MODEL_PREFIXES
+    )
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
 INDEX_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -1485,6 +1640,54 @@ INDEX_HTML = r"""
       grid-template-columns: 1fr;
       gap: var(--space-sm);
       margin-top: var(--space-sm);
+    }
+    .agent-settings {
+      display: grid;
+      gap: var(--space-sm);
+      padding: var(--space-sm);
+      border: 1px solid var(--color-border-light);
+      border-radius: var(--radius-md);
+      background: rgba(110, 118, 129, 0.08);
+    }
+    .agent-field {
+      display: grid;
+      gap: 3px;
+    }
+    .agent-field label,
+    .agent-toggle {
+      color: var(--color-text-tertiary);
+      font-size: var(--font-size-xs);
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .agent-field select,
+    .agent-field input {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-sm);
+      padding: 0 var(--space-sm);
+      background: var(--color-bg-tertiary);
+      color: var(--color-text-primary);
+      font: inherit;
+      font-size: var(--font-size-sm);
+    }
+    .agent-field select:focus,
+    .agent-field input:focus {
+      outline: none;
+      border-color: var(--color-border-focus);
+      box-shadow: 0 0 0 3px rgba(56, 139, 253, 0.14);
+    }
+    .agent-toggle {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      min-height: 28px;
+    }
+    .agent-toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--color-primary);
     }
     .conversation-row {
       display: grid;
@@ -2184,6 +2387,18 @@ INDEX_HTML = r"""
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
+    .stream-thinking {
+      max-height: 160px;
+      overflow-y: auto;
+      padding: var(--space-sm);
+      border: 1px solid rgba(163, 113, 247, 0.16);
+      border-radius: var(--radius-sm);
+      background: rgba(163, 113, 247, 0.055);
+      color: #cdb8ff;
+      font-size: var(--font-size-xs);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
     .stream-finished-list {
       display: grid;
       gap: var(--space-sm);
@@ -2529,6 +2744,27 @@ INDEX_HTML = r"""
           </div>
         </section>
         <section class="side-section">
+          <p class="side-section-title">Agent</p>
+          <div class="agent-settings">
+            <div class="agent-field">
+              <label for="modelSelect">Model</label>
+              <select id="modelSelect"></select>
+            </div>
+            <label class="agent-toggle" for="thinkingEnabled">
+              <input id="thinkingEnabled" type="checkbox" />
+              Extended thinking
+            </label>
+            <div class="agent-field" id="thinkingBudgetField">
+              <label for="thinkingBudget">Budget tokens</label>
+              <input id="thinkingBudget" type="number" min="1024" step="1024" />
+            </div>
+            <div class="agent-field" id="thinkingEffortField">
+              <label for="thinkingEffort">Effort</label>
+              <select id="thinkingEffort"></select>
+            </div>
+          </div>
+        </section>
+        <section class="side-section">
           <p class="side-section-title">Chats</p>
           <div id="conversationList"></div>
         </section>
@@ -2566,6 +2802,13 @@ INDEX_HTML = r"""
   <script>
     const state = {
       user: null,
+      config: null,
+      agentSettings: {
+        model: "",
+        thinkingEnabled: false,
+        thinkingBudgetTokens: 4096,
+        thinkingEffort: "medium",
+      },
       conversations: [],
       tools: [],
       workflowId: null,
@@ -2589,6 +2832,7 @@ INDEX_HTML = r"""
         text: "",
         objectUrl: "",
       },
+      draftConversation: true,
       mcpFormOpen: false,
       mcpFormSubmitting: false,
       mcpFormError: "",
@@ -2616,6 +2860,12 @@ INDEX_HTML = r"""
     const temporalLinkEl = document.getElementById("temporalLink");
     const inputEl = document.getElementById("message");
     const formEl = document.getElementById("composer");
+    const modelSelectEl = document.getElementById("modelSelect");
+    const thinkingEnabledEl = document.getElementById("thinkingEnabled");
+    const thinkingBudgetEl = document.getElementById("thinkingBudget");
+    const thinkingBudgetFieldEl = document.getElementById("thinkingBudgetField");
+    const thinkingEffortEl = document.getElementById("thinkingEffort");
+    const thinkingEffortFieldEl = document.getElementById("thinkingEffortField");
 
     boot().catch((err) => {
       statusEl.textContent = `failed: ${err}`;
@@ -2629,7 +2879,7 @@ INDEX_HTML = r"""
       }
 
       showApp();
-      await Promise.all([loadTools(), loadConversations()]);
+      await Promise.all([loadConfig(), loadTools(), loadConversations()]);
 
       const savedWorkflowId = localStorage.getItem("simpleChatWorkflowId");
       const savedConversation = state.conversations.find((conversation) => conversation.workflow_id === savedWorkflowId);
@@ -2637,7 +2887,7 @@ INDEX_HTML = r"""
       if (conversation) {
         selectConversation(conversation.workflow_id);
       } else {
-        await createConversation();
+        startDraftConversation();
       }
       showOAuthCallbackStatus();
     }
@@ -2686,8 +2936,148 @@ INDEX_HTML = r"""
       renderToolsWindow();
     }
 
-    async function createConversation() {
-      const response = await fetch("/api/sessions", { method: "POST", headers: jsonHeaders(), body: JSON.stringify({}) });
+    async function loadConfig() {
+      const response = await fetch("/api/config");
+      if (response.status === 401) {
+        showLogin();
+        return;
+      }
+      if (!response.ok) throw new Error(await response.text());
+      state.config = await response.json();
+      const savedModel = localStorage.getItem("simpleChatModel");
+      const modelOptions = state.config.model_options || [];
+      state.agentSettings.model = (
+        savedModel && modelOptions.includes(savedModel)
+      ) ? savedModel : state.config.default_model;
+      state.agentSettings.thinkingEnabled =
+        localStorage.getItem("simpleChatThinkingEnabled") === "true";
+      state.agentSettings.thinkingBudgetTokens = Number(
+        localStorage.getItem("simpleChatThinkingBudgetTokens") ||
+        state.config.thinking?.budget_tokens ||
+        4096
+      );
+      const savedEffort = localStorage.getItem("simpleChatThinkingEffort");
+      const effortOptions = state.config.thinking?.effort_options || ["medium"];
+      state.agentSettings.thinkingEffort = (
+        savedEffort && effortOptions.includes(savedEffort)
+      ) ? savedEffort : state.config.thinking?.effort || "medium";
+      renderAgentSettings();
+    }
+
+    function renderAgentSettings() {
+      const config = state.config || {};
+      const modelOptions = config.model_options || [];
+      modelSelectEl.replaceChildren();
+      for (const model of modelOptions) {
+        const option = document.createElement("option");
+        option.value = model;
+        option.textContent = model;
+        modelSelectEl.append(option);
+      }
+      modelSelectEl.value = state.agentSettings.model || config.default_model || "";
+      thinkingEnabledEl.checked = state.agentSettings.thinkingEnabled;
+      const effortOptions = config.thinking?.effort_options || ["medium"];
+      thinkingEffortEl.replaceChildren();
+      for (const effort of effortOptions) {
+        const option = document.createElement("option");
+        option.value = effort;
+        option.textContent = effort;
+        thinkingEffortEl.append(option);
+      }
+      thinkingEffortEl.value = state.agentSettings.thinkingEffort || config.thinking?.effort || "medium";
+      const minBudget = config.thinking?.min_budget_tokens || 1024;
+      thinkingBudgetEl.min = String(minBudget);
+      thinkingBudgetEl.value = String(
+        Math.max(minBudget, state.agentSettings.thinkingBudgetTokens || minBudget)
+      );
+      const adaptive = selectedModelUsesAdaptiveThinking();
+      thinkingBudgetFieldEl.hidden = !state.agentSettings.thinkingEnabled || adaptive;
+      thinkingEffortFieldEl.hidden = !state.agentSettings.thinkingEnabled || !adaptive;
+    }
+
+    function newConversationRequest() {
+      const config = state.config || {};
+      const minBudget = config.thinking?.min_budget_tokens || 1024;
+      const budgetTokens = Math.max(
+        minBudget,
+        Number(
+          thinkingBudgetEl.value ||
+          state.agentSettings.thinkingBudgetTokens ||
+          config.thinking?.budget_tokens ||
+          4096
+        ),
+      );
+      state.agentSettings.model =
+        modelSelectEl.value || state.agentSettings.model || config.default_model;
+      state.agentSettings.thinkingEnabled = thinkingEnabledEl.checked;
+      state.agentSettings.thinkingBudgetTokens = budgetTokens;
+      state.agentSettings.thinkingEffort = thinkingEffortEl.value || state.agentSettings.thinkingEffort || "medium";
+      saveAgentSettings();
+      return {
+        model: state.agentSettings.model,
+        thinking: {
+          enabled: state.agentSettings.thinkingEnabled,
+          budget_tokens: budgetTokens,
+          effort: state.agentSettings.thinkingEffort,
+        },
+      };
+    }
+
+    function saveAgentSettings() {
+      localStorage.setItem("simpleChatModel", state.agentSettings.model);
+      localStorage.setItem(
+        "simpleChatThinkingEnabled",
+        String(state.agentSettings.thinkingEnabled),
+      );
+      localStorage.setItem(
+        "simpleChatThinkingBudgetTokens",
+        String(state.agentSettings.thinkingBudgetTokens),
+      );
+      localStorage.setItem(
+        "simpleChatThinkingEffort",
+        state.agentSettings.thinkingEffort,
+      );
+    }
+
+    function selectedModelUsesAdaptiveThinking() {
+      const model = modelSelectEl.value || state.agentSettings.model || "";
+      return (state.config?.thinking?.adaptive_model_prefixes || []).some((prefix) => (
+        model.startsWith(prefix)
+      ));
+    }
+
+    function startDraftConversation() {
+      if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
+      state.workflowId = null;
+      state.runId = null;
+      state.temporalUiUrl = null;
+      state.workflowState = null;
+      state.streamTurn = null;
+      state.streamPanelCollapsed = false;
+      state.currentClaudeSequence = null;
+      state.ignoreClaudeUntilStart = false;
+      state.localPending = [];
+      state.draftConversation = true;
+      closeArtifactViewer();
+      localStorage.removeItem("simpleChatWorkflowId");
+      temporalLinkEl.removeAttribute("href");
+      temporalLinkEl.style.display = "none";
+      renderSidebar();
+      render();
+    }
+
+    async function createConversation(initialMessage = null, options = {}) {
+      const response = await fetch("/api/sessions", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          ...newConversationRequest(),
+          initial_message: initialMessage,
+        }),
+      });
       if (response.status === 401) {
         showLogin();
         return;
@@ -2695,10 +3085,11 @@ INDEX_HTML = r"""
       if (!response.ok) throw new Error(await response.text());
       const body = await response.json();
       await loadConversations();
-      selectConversation(body.workflow_id);
+      selectConversation(body.workflow_id, options);
+      return body;
     }
 
-    function selectConversation(workflowId) {
+    function selectConversation(workflowId, options = {}) {
       const conversation = state.conversations.find((item) => item.workflow_id === workflowId);
       if (!conversation) return;
       if (state.eventSource) state.eventSource.close();
@@ -2710,7 +3101,10 @@ INDEX_HTML = r"""
       state.streamPanelCollapsed = false;
       state.currentClaudeSequence = null;
       state.ignoreClaudeUntilStart = false;
-      state.localPending = [];
+      state.draftConversation = false;
+      if (!options.preserveLocalPending) {
+        state.localPending = [];
+      }
       closeArtifactViewer();
       localStorage.setItem("simpleChatWorkflowId", state.workflowId);
       temporalLinkEl.href = state.temporalUiUrl;
@@ -2752,7 +3146,31 @@ INDEX_HTML = r"""
         loginErrorEl.textContent = String(err);
       }
     });
-    document.getElementById("newChat").addEventListener("click", () => createConversation());
+    document.getElementById("newChat").addEventListener("click", () => startDraftConversation());
+    modelSelectEl.addEventListener("change", () => {
+      state.agentSettings.model = modelSelectEl.value;
+      saveAgentSettings();
+      renderAgentSettings();
+    });
+    thinkingEnabledEl.addEventListener("change", () => {
+      state.agentSettings.thinkingEnabled = thinkingEnabledEl.checked;
+      saveAgentSettings();
+      renderAgentSettings();
+    });
+    function updateThinkingBudget() {
+      const minBudget = state.config?.thinking?.min_budget_tokens || 1024;
+      state.agentSettings.thinkingBudgetTokens = Math.max(
+        minBudget,
+        Number(thinkingBudgetEl.value || minBudget),
+      );
+      saveAgentSettings();
+      renderAgentSettings();
+    }
+    thinkingBudgetEl.addEventListener("change", updateThinkingBudget);
+    thinkingEffortEl.addEventListener("change", () => {
+      state.agentSettings.thinkingEffort = thinkingEffortEl.value;
+      saveAgentSettings();
+    });
     document.getElementById("toolsButton").addEventListener("click", () => {
       state.toolsWindowOpen = true;
       renderToolsWindow();
@@ -2781,6 +3199,7 @@ INDEX_HTML = r"""
       state.conversations = [];
       state.workflowId = null;
       state.workflowState = null;
+      state.draftConversation = true;
       closeArtifactViewer();
       state.toolsWindowOpen = false;
       state.mcpFormOpen = false;
@@ -2813,7 +3232,17 @@ INDEX_HTML = r"""
       if (!message) return;
       if (!state.workflowId) {
         if (action === "interrupt" || action === "steer" || action === "after-tool") return;
-        await createConversation();
+        inputEl.value = "";
+        const pending = { id: crypto.randomUUID(), label, content: message, phase };
+        state.localPending.push(pending);
+        render();
+        try {
+          await createConversation(message, { preserveLocalPending: true });
+        } catch (err) {
+          pending.phase = `failed: ${err}`;
+          render();
+        }
+        return;
       }
       inputEl.value = "";
       const pending = { id: crypto.randomUUID(), label, content: message, phase };
@@ -2887,7 +3316,7 @@ INDEX_HTML = r"""
         if (nextConversation) {
           selectConversation(nextConversation.workflow_id);
         } else {
-          await createConversation();
+          startDraftConversation();
         }
       } finally {
         state.recoveringMissingWorkflow = false;
@@ -2924,7 +3353,7 @@ INDEX_HTML = r"""
         if (nextConversation) {
           selectConversation(nextConversation.workflow_id);
         } else {
-          await createConversation();
+          startDraftConversation();
         }
       }
     }
@@ -2935,6 +3364,17 @@ INDEX_HTML = r"""
 
     function renderSidebar() {
       const conversationFragment = document.createDocumentFragment();
+      if (state.draftConversation) {
+        const row = document.createElement("div");
+        row.className = "conversation-row";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "conversation-item active";
+        button.textContent = "New chat";
+        button.addEventListener("click", () => startDraftConversation());
+        row.append(button);
+        conversationFragment.append(row);
+      }
       for (const conversation of state.conversations) {
         const row = document.createElement("div");
         row.className = "conversation-row";
@@ -2959,7 +3399,7 @@ INDEX_HTML = r"""
         row.append(button, deleteButton);
         conversationFragment.append(row);
       }
-      if (state.conversations.length === 0) {
+      if (state.conversations.length === 0 && !state.draftConversation) {
         const empty = document.createElement("div");
         empty.className = "tool-meta";
         empty.textContent = "No chats yet.";
@@ -3184,6 +3624,20 @@ INDEX_HTML = r"""
       toggle.addEventListener("click", async () => {
         await setMcpServerEnabled(tool, !enabled);
       });
+      if (tool.auth_mode === "oauth") {
+        const reconnect = document.createElement("button");
+        reconnect.type = "button";
+        reconnect.textContent = "Reconnect";
+        reconnect.addEventListener("click", () => {
+          window.location.href = mcpOAuthStartUrl({
+            label: tool.label,
+            serverUrl: tool.server_url || tool.login || "",
+            toolPrefix: tool.tool_prefix || "",
+            serverId: tool.server_id || tool.provider.slice("mcp:".length),
+          });
+        });
+        actions.append(reconnect);
+      }
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "danger";
@@ -3361,7 +3815,7 @@ INDEX_HTML = r"""
       none.textContent = "No auth";
       const oauth = document.createElement("option");
       oauth.value = "oauth";
-      oauth.textContent = "OAuth discovery";
+      oauth.textContent = "OAuth authorization";
       const bearer = document.createElement("option");
       bearer.value = "bearer";
       bearer.textContent = "Bearer token";
@@ -3501,6 +3955,17 @@ INDEX_HTML = r"""
         const turn = ensureStreamTurn(sequence);
         turn.status = "streaming";
         turn.text += event.payload.text;
+      } else if (event.kind === "claude_thinking_start") {
+        if (state.ignoreClaudeUntilStart) return;
+        if (sequence !== state.currentClaudeSequence) return;
+        const turn = ensureStreamTurn(sequence);
+        turn.status = "streaming";
+      } else if (event.kind === "claude_thinking_delta" && event.payload?.thinking) {
+        if (state.ignoreClaudeUntilStart) return;
+        if (sequence !== state.currentClaudeSequence) return;
+        const turn = ensureStreamTurn(sequence);
+        turn.status = "streaming";
+        turn.thinking += event.payload.thinking;
       } else if (event.kind === "claude_cancelled") {
         if (sequence === state.currentClaudeSequence) {
           markStreamInterrupted();
@@ -3566,6 +4031,7 @@ INDEX_HTML = r"""
         activeSequence: sequence,
         status: "streaming",
         text: "",
+        thinking: "",
         finishedTurns: [],
         currentEvents: [],
         startedAt: new Date().toISOString(),
@@ -3582,6 +4048,7 @@ INDEX_HTML = r"""
       turn.finishedTurns.push({
         sequence,
         text,
+        thinking: String(turn.thinking || "").trim(),
         stopReason,
         usage: payload.usage || null,
         events: turn.currentEvents,
@@ -3589,6 +4056,7 @@ INDEX_HTML = r"""
       });
       turn.finishedTurns = turn.finishedTurns.slice(-12);
       turn.text = "";
+      turn.thinking = "";
       turn.currentEvents = [];
     }
 
@@ -3687,8 +4155,12 @@ INDEX_HTML = r"""
 
     function render() {
       const workflowState = state.workflowState;
-      statusEl.textContent = workflowState
-        ? `${workflowState.status}${workflowState.pending_messages ? `, queued: ${workflowState.pending_messages}` : ""}`
+      const thinkingLabel = workflowState?.thinking?.enabled ? " | thinking" : "";
+      const modelLabel = workflowState?.model ? ` | ${workflowState.model}${thinkingLabel}` : "";
+      statusEl.textContent = state.draftConversation
+        ? "draft | workflow not started"
+        : workflowState
+        ? `${workflowState.status}${workflowState.pending_messages ? `, queued: ${workflowState.pending_messages}` : ""}${modelLabel}`
         : "starting...";
       renderSidebar();
       renderArtifactsPanel();
@@ -3698,7 +4170,9 @@ INDEX_HTML = r"""
       if (!workflowState && state.localPending.length === 0) {
         const empty = document.createElement("div");
         empty.className = "empty";
-        empty.textContent = "Starting a Temporal workflow...";
+        empty.textContent = state.draftConversation
+          ? "Type your first message to start a Temporal workflow."
+          : "Starting a Temporal workflow...";
         fragment.append(empty);
       }
 
@@ -3996,7 +4470,7 @@ INDEX_HTML = r"""
     function renderStreamPanel() {
       const turn = state.streamTurn;
       if (!turn) return null;
-      if (!turn.text && turn.currentEvents.length === 0 && turn.finishedTurns.length === 0) return null;
+      if (!turn.text && !turn.thinking && turn.currentEvents.length === 0 && turn.finishedTurns.length === 0) return null;
 
       const collapsed = state.streamPanelCollapsed;
       const node = document.createElement("section");
@@ -4055,6 +4529,13 @@ INDEX_HTML = r"""
         title.textContent = `Claude turn ${turn.activeSequence ?? ""} streaming`;
         currentTurn.append(title);
 
+        if (turn.thinking) {
+          const thinking = document.createElement("div");
+          thinking.className = "stream-thinking";
+          thinking.textContent = turn.thinking;
+          currentTurn.append(thinking);
+        }
+
         const text = document.createElement("div");
         text.className = "stream-text";
         text.textContent = turn.text;
@@ -4067,11 +4548,24 @@ INDEX_HTML = r"""
         body.append(currentTurn);
       }
 
+      if (!turn.text && turn.thinking) {
+        const currentThinking = document.createElement("div");
+        currentThinking.className = "stream-current-turn";
+        const title = document.createElement("div");
+        title.className = "stream-finished-title";
+        title.textContent = `Claude turn ${turn.activeSequence ?? ""} thinking`;
+        const text = document.createElement("div");
+        text.className = "stream-thinking";
+        text.textContent = turn.thinking;
+        currentThinking.append(title, text);
+        body.append(currentThinking);
+      }
+
       if (!turn.text && turn.currentEvents.length) {
         body.append(renderStreamToolList(turn.currentEvents));
       }
 
-      if (!turn.text && !turn.currentEvents.length && !turn.finishedTurns.length) {
+      if (!turn.text && !turn.thinking && !turn.currentEvents.length && !turn.finishedTurns.length) {
         const preview = document.createElement("div");
         preview.className = "stream-preview";
         preview.textContent = "Waiting for streamed tokens or tool activity...";
@@ -4088,9 +4582,17 @@ INDEX_HTML = r"""
       const title = document.createElement("div");
       title.className = "stream-finished-title";
       title.textContent = `Claude turn ${finishedTurn.sequence ?? ""} complete | ${finishedTurn.stopReason}`;
+      if (finishedTurn.thinking) {
+        const thinking = document.createElement("div");
+        thinking.className = "stream-thinking";
+        thinking.textContent = finishedTurn.thinking;
+        node.append(title, thinking);
+      } else {
+        node.append(title);
+      }
       const text = document.createElement("div");
       text.textContent = finishedTurn.text || `Completed without text (${finishedTurn.stopReason}).`;
-      node.append(title, text);
+      node.append(text);
       if (finishedTurn.events?.length) {
         node.append(renderStreamToolList(finishedTurn.events));
       }
@@ -4157,11 +4659,16 @@ INDEX_HTML = r"""
 
     function streamPanelPreview(turn) {
       const text = turn.text.trim();
+      const thinking = String(turn.thinking || "").trim();
       const latestEvent = turn.currentEvents[turn.currentEvents.length - 1];
       if (text) return text.replace(/\s+/g, " ").slice(-240);
+      if (thinking) return thinking.replace(/\s+/g, " ").slice(-240);
       const latestFinished = turn.finishedTurns[turn.finishedTurns.length - 1];
       if (latestFinished?.text) {
         return latestFinished.text.replace(/\s+/g, " ").slice(-240);
+      }
+      if (latestFinished?.thinking) {
+        return latestFinished.thinking.replace(/\s+/g, " ").slice(-240);
       }
       if (latestEvent) {
         return `${streamToolLabel(latestEvent)} | ${latestEvent.kind}`;
