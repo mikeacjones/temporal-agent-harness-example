@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -101,12 +102,21 @@ async def call_http_mcp_tool(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    result = await _call_http_mcp_tool(
-        server_url=server_url,
-        auth_ref=auth_ref,
-        tool_name=tool_name,
-        arguments=arguments,
-    )
+    try:
+        result = await _call_http_mcp_tool(
+            server_id=server_id,
+            server_url=server_url,
+            auth_ref=auth_ref,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+    except BaseExceptionGroup as err:
+        if _is_cancelled_exception_group(err):
+            raise
+        result = _mcp_error_payload(err)
+    except Exception as err:
+        result = _mcp_error_payload(err)
+
     result["server_id"] = server_id
     result["tool_name"] = tool_name
     return result
@@ -170,6 +180,7 @@ async def _list_http_mcp_tools(
 
 async def _call_http_mcp_tool(
     *,
+    server_id: str,
     server_url: str,
     auth_ref: str | None,
     tool_name: str,
@@ -181,8 +192,16 @@ async def _call_http_mcp_tool(
         streamable_http_client,
     )
 
-    http_auth = await _http_auth_for_mcp(auth_ref, server_url)
-    headers = {} if http_auth is not None else await _headers_for_mcp(auth_ref)
+    http_auth = await _http_auth_for_mcp(
+        auth_ref,
+        server_url,
+        server_id=server_id,
+    )
+    headers = (
+        {}
+        if http_auth is not None
+        else await _headers_for_mcp(auth_ref, server_id=server_id)
+    )
     async with create_mcp_http_client(
         headers=dict(headers),
         auth=http_auth,
@@ -206,6 +225,8 @@ async def _call_http_mcp_tool(
 async def _headers_for_mcp(
     auth_ref: str | None,
     explicit_headers: Mapping[str, str] | None = None,
+    *,
+    server_id: str | None = None,
 ) -> Mapping[str, str]:
     if explicit_headers is not None:
         return explicit_headers
@@ -214,20 +235,62 @@ async def _headers_for_mcp(
     if _mcp_auth_resolver is None:
         raise RuntimeError("No MCP auth resolver configured for HTTP MCP auth_ref")
 
-    headers = _mcp_auth_resolver(auth_ref)
-    if inspect.isawaitable(headers):
-        headers = await headers
-    return headers
+    last_error: Exception | None = None
+    for candidate in _auth_ref_candidates(auth_ref, server_id):
+        try:
+            headers = _mcp_auth_resolver(candidate)
+            if inspect.isawaitable(headers):
+                headers = await headers
+            return headers
+        except Exception as err:
+            if not _is_missing_auth_ref_error(err):
+                raise
+            last_error = err
+
+    if last_error is not None:
+        raise last_error
+    return {}
 
 
-async def _http_auth_for_mcp(auth_ref: str | None, server_url: str) -> Any | None:
+async def _http_auth_for_mcp(
+    auth_ref: str | None,
+    server_url: str,
+    *,
+    server_id: str | None = None,
+) -> Any | None:
     if auth_ref is None or _mcp_http_auth_resolver is None:
         return None
 
-    auth = _mcp_http_auth_resolver(auth_ref, server_url)
-    if inspect.isawaitable(auth):
-        auth = await auth
-    return auth
+    last_error: Exception | None = None
+    for candidate in _auth_ref_candidates(auth_ref, server_id):
+        try:
+            auth = _mcp_http_auth_resolver(candidate, server_url)
+            if inspect.isawaitable(auth):
+                auth = await auth
+            return auth
+        except Exception as err:
+            if not _is_missing_auth_ref_error(err):
+                raise
+            last_error = err
+
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def _auth_ref_candidates(
+    auth_ref: str | None,
+    server_id: str | None,
+) -> list[str]:
+    candidates: list[str] = []
+    for candidate in (auth_ref, server_id):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _is_missing_auth_ref_error(err: Exception) -> bool:
+    return "MCP auth connection was not found" in str(err)
 
 
 def _mcp_tool_description(
@@ -242,6 +305,69 @@ def _sanitize_tool_name(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
     sanitized = sanitized.strip("_-")
     return sanitized or "mcp"
+
+
+def _mcp_error_payload(err: BaseException) -> dict[str, Any]:
+    errors = _flatten_exception(err)
+    reauthorization_required = any(
+        "MCP OAuth token requires reauthorization" in str(error)
+        or "MCP auth connection was not found" in str(error)
+        for error in errors
+    )
+    message = (
+        "MCP OAuth token requires reauthorization."
+        if reauthorization_required
+        else _first_error_message(errors)
+    )
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ],
+        "structured_content": {
+            "error": message,
+            "reauthorization_required": reauthorization_required,
+        },
+        "is_error": True,
+        "meta": {
+            "error_type": type(err).__name__,
+            "errors": [
+                {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                }
+                for error in errors
+                if str(error)
+            ],
+        },
+    }
+
+
+def _flatten_exception(err: BaseException) -> list[BaseException]:
+    if isinstance(err, BaseExceptionGroup):
+        flattened: list[BaseException] = []
+        for nested in err.exceptions:
+            flattened.extend(_flatten_exception(nested))
+        return flattened
+    return [err]
+
+
+def _first_error_message(errors: list[BaseException]) -> str:
+    for error in errors:
+        message = str(error).strip()
+        if message:
+            return message
+    return "MCP tool call failed."
+
+
+def _is_cancelled_exception_group(err: BaseExceptionGroup) -> bool:
+    errors = _flatten_exception(err)
+    return bool(errors) and all(
+        isinstance(error, asyncio.CancelledError)
+        for error in errors
+    )
 
 
 _mcp_auth_resolver: McpAuthResolver | None = None

@@ -38,6 +38,9 @@ ClaudeStopReason = Literal[
 ]
 SteeringMode = Literal["immediate", "after_next_tool_result"]
 InterruptPartialResponsePolicy = Literal["discard"]
+ClaudeThinkingDisplay = Literal["summarized", "omitted"]
+ClaudeThinkingMode = Literal["enabled", "adaptive"]
+ClaudeThinkingEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
     start_to_close_timeout=timedelta(minutes=10),
@@ -45,11 +48,22 @@ DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
 )
 CLAUDE_HEARTBEAT_INTERVAL_SECONDS = 5
 FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
+DEFAULT_THINKING_BUDGET_TOKENS = 4_096
+MIN_THINKING_BUDGET_TOKENS = 1_024
 
 
 @dataclass(frozen=True)
 class ContinueAsNewPolicy:
     enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ClaudeThinkingConfig:
+    enabled: bool = False
+    mode: ClaudeThinkingMode = "enabled"
+    budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
+    effort: ClaudeThinkingEffort | None = None
+    display: ClaudeThinkingDisplay | None = None
 
 
 class ClaudeAgent:
@@ -60,6 +74,7 @@ class ClaudeAgent:
         *,
         model: str,
         max_tokens: int = 4096,
+        thinking: ClaudeThinkingConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
         activity_options: ActivityOptions | None = None,
@@ -77,6 +92,7 @@ class ClaudeAgent:
         self._tools = tools
         self._model = model
         self._max_tokens = max_tokens
+        self._thinking = thinking
         self._tool_names = tool_names
         self._stream_id = stream_id
         self._activity_options = activity_options
@@ -264,6 +280,7 @@ class ClaudeAgent:
             system_prompt=self._system_prompt,
             model=self._model,
             max_tokens=self._max_tokens,
+            **_thinking_request_params(self._thinking, max_tokens=self._max_tokens),
             tools=tool_params,
             chat_history=[
                 _message_param_to_dict(message)
@@ -486,6 +503,8 @@ class ClaudeRequest:
     max_tokens: int
     tools: list[dict[str, Any]]
     chat_history: list[dict[str, Any]]
+    thinking: dict[str, Any] | None = None
+    output_config: dict[str, Any] | None = None
     stream_id: str | None = None
     stream_sequence: int | None = None
 
@@ -516,10 +535,12 @@ def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
         "system_prompt": request.system_prompt,
         "model": request.model,
         "max_tokens": request.max_tokens,
+        "thinking": _copy_optional_mapping(request.thinking),
         "tools": [_copy_mapping(tool) for tool in request.tools],
         "chat_history": [_copy_mapping(message) for message in request.chat_history],
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
+        "output_config": _copy_optional_mapping(request.output_config),
     }
 
 
@@ -528,6 +549,8 @@ def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
         system_prompt=cast(str, request["system_prompt"]),
         model=cast(str, request["model"]),
         max_tokens=cast(int, request["max_tokens"]),
+        thinking=_copy_optional_mapping(request.get("thinking")),
+        output_config=_copy_optional_mapping(request.get("output_config")),
         tools=_mapping_list(request.get("tools", [])),
         chat_history=_mapping_list(request.get("chat_history", [])),
         stream_id=cast(str | None, request.get("stream_id")),
@@ -592,6 +615,10 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
     }
     if request.tools:
         create_params["tools"] = request.tools
+    if request.thinking is not None:
+        create_params["thinking"] = request.thinking
+    if request.output_config is not None:
+        create_params["output_config"] = request.output_config
 
     async with AsyncAnthropic(max_retries=0) as client:
         response = await _stream_claude_message(
@@ -746,6 +773,16 @@ async def _emit_claude_raw_stream_event(
         block_index = cast(int, getattr(event, "index"))
         block = _object_to_dict(getattr(event, "content_block", None))
         block_type = block.get("type")
+        if block_type == "thinking":
+            await stream.emit(
+                {
+                    "sequence": stream_sequence,
+                    "content_block_index": block_index,
+                },
+                kind="claude_thinking_start",
+            )
+            return
+
         if block_type in ("tool_use", "server_tool_use"):
             state = _ToolInputStreamState(
                 content_block_index=block_index,
@@ -775,6 +812,15 @@ async def _emit_claude_raw_stream_event(
                 await stream.emit(
                     {"sequence": stream_sequence, "text": text},
                     kind="claude_text_delta",
+                )
+            return
+
+        if delta_type == "thinking_delta":
+            thinking = delta.get("thinking")
+            if isinstance(thinking, str) and thinking:
+                await stream.emit(
+                    {"sequence": stream_sequence, "thinking": thinking},
+                    kind="claude_thinking_delta",
                 )
             return
 
@@ -855,12 +901,54 @@ def _mapping_list(value: Any) -> list[dict[str, Any]]:
     return [_copy_mapping(item) for item in cast(list[Any], value)]
 
 
+def _copy_optional_mapping(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return _copy_mapping(value)
+
+
 def _copy_mapping(value: Any) -> dict[str, Any]:
     return dict(cast(Mapping[str, Any], value))
 
 
 def _tool_param_to_dict(tool: dict[str, Any]) -> dict[str, Any]:
     return dict(cast(Mapping[str, Any], tool))
+
+
+def _thinking_request_params(
+    thinking: ClaudeThinkingConfig | None,
+    *,
+    max_tokens: int,
+) -> dict[str, Any]:
+    if thinking is None or not thinking.enabled:
+        return {"thinking": None, "output_config": None}
+    if thinking.mode == "adaptive":
+        param: dict[str, Any] = {"type": "adaptive"}
+        if thinking.display is not None:
+            param["display"] = thinking.display
+        output_config = (
+            {"effort": thinking.effort}
+            if thinking.effort is not None
+            else None
+        )
+        return {"thinking": param, "output_config": output_config}
+
+    if max_tokens <= MIN_THINKING_BUDGET_TOKENS:
+        raise ValueError(
+            "max_tokens must be greater than 1024 when extended thinking is enabled"
+        )
+
+    budget_tokens = min(
+        max(MIN_THINKING_BUDGET_TOKENS, thinking.budget_tokens),
+        max_tokens - 1,
+    )
+    param: dict[str, Any] = {
+        "type": "enabled",
+        "budget_tokens": budget_tokens,
+    }
+    if thinking.display is not None:
+        param["display"] = thinking.display
+    return {"thinking": param, "output_config": None}
 
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
