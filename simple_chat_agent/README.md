@@ -178,6 +178,38 @@ CLI commands:
 Plain text is sent as a normal chat message while the workflow is idle. If
 Claude is responding, plain text is sent as immediate steering.
 
+## Zed Replay Debugging
+
+The repo includes a Zed debugger profile at `.zed/debug.json` that launches the
+Temporal Python replayer through:
+
+```bash
+python -m simple_chat_agent.replay
+```
+
+Export a workflow history into the local scratch directory:
+
+```bash
+mkdir -p .replay
+temporal workflow show \
+  --workflow-id simple-chat-... \
+  --output json > .replay/history.json
+```
+
+If you are replaying against Temporal Cloud or a non-default namespace, include
+the same Temporal CLI address, namespace, TLS, and auth settings you normally use
+when fetching the history.
+
+Then edit `.zed/debug.json` and replace `simple-chat-REPLACE_ME` with the
+workflow ID you exported. In Zed, open the debugger panel, choose
+`Replay: Simple Chat Workflow History`, set breakpoints in workflow code, and
+start the session.
+
+The replay entrypoint uses the same workflow list and JSON-file external storage
+data converter as the worker. If the history contains claim-checked payloads,
+keep `.simple_chat_agent/external_payloads.json` from the original run available
+locally before replaying.
+
 ## Troubleshooting
 
 - `workflow not found`: your local Temporal dev server was probably reset while

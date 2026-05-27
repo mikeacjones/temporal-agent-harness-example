@@ -1,0 +1,16 @@
+[
+  {
+    "label": "Replay: Simple Chat Workflow History",
+    "adapter": "Debugpy",
+    "request": "launch",
+    "module": "simple_chat_agent.replay",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "args": [
+      "--workflow-id",
+      "simple-chat-REPLACE_ME",
+      "--history",
+      "$ZED_WORKTREE_ROOT/.replay/history.json"
+    ],
+    "justMyCode": false
+  }
+]

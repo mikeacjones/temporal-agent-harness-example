@@ -13,22 +13,27 @@ from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.service import RPCError, RPCStatusCode
 
 from claude_harness.claude_agent import (
-    ClaudeThinkingConfig,
-    ClaudeThinkingEffort,
     DEFAULT_THINKING_BUDGET_TOKENS,
     MIN_THINKING_BUDGET_TOKENS,
+    ClaudeThinkingConfig,
+    ClaudeThinkingEffort,
 )
 from claude_harness.mcp import (
-    discover_http_mcp_tools,
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
+    discover_http_mcp_tools,
     public_mcp_tool_name,
 )
 from claude_harness.mcp_types import HttpMcpServerConfig
@@ -36,8 +41,8 @@ from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.auth import (
     DEFAULT_SESSION_SECONDS,
     SESSION_COOKIE,
-    AuthError,
     AuthenticatedUser,
+    AuthError,
     authenticate_user,
     create_session_token,
     user_from_session_token,
@@ -62,8 +67,8 @@ from simple_chat_agent.mcp_oauth import (
     PendingMcpOAuthFlow,
     authorize_mcp_oauth_flow,
 )
-from simple_chat_agent.streaming import stream_path
 from simple_chat_agent.store import AppStore, ArtifactRecord
+from simple_chat_agent.streaming import stream_path
 from simple_chat_agent.tools import (
     CREATE_ARTIFACT_TOOL,
     CREATE_SUBAGENT_TOOL,
@@ -76,8 +81,8 @@ from simple_chat_agent.user_chats_workflow import (
     ChatRecord,
     CreateChatRequest,
     DeleteMcpServerRequest,
-    UpdateMcpServerRequest,
     TouchChatRequest,
+    UpdateMcpServerRequest,
     UserChatsInput,
     UserChatsWorkflow,
     user_chats_workflow_id,
@@ -150,10 +155,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     load_dotenv()
     configure_mcp_auth_resolver(resolve_mcp_auth_headers)
     configure_mcp_http_auth_resolver(resolve_mcp_http_auth)
+
+    client_config = {
+        "namespace": os.environ.get("TEMPORAL_NAMESPACE", "default"),
+        "data_converter": simple_chat_data_converter(),
+        "tls": os.environ.get("TEMPORAL_TLS", "false").lower() in ["true", "1"],
+    }
+    if os.environ.get("TEMPORAL_API_KEY"):
+        client_config["api_key"] = os.environ.get("TEMPORAL_API_KEY")
+
     app.state.temporal_client = await Client.connect(
-        "localhost:7233",
-        data_converter=simple_chat_data_converter(),
+        os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233"), **client_config
     )
+
     app.state.store = AppStore()
     app.state.mcp_oauth_flows = {}
     yield
@@ -1380,10 +1394,7 @@ def _thinking_config_from_request(
 
 
 def _uses_adaptive_thinking(model: str) -> bool:
-    return any(
-        model.startswith(prefix)
-        for prefix in ADAPTIVE_THINKING_MODEL_PREFIXES
-    )
+    return any(model.startswith(prefix) for prefix in ADAPTIVE_THINKING_MODEL_PREFIXES)
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -2226,6 +2237,9 @@ INDEX_HTML = r"""
     .artifact-viewer-body .bubble-content pre {
       min-height: 100%;
     }
+    .artifact-viewer-body .artifact-markdown pre {
+      min-height: 0;
+    }
     .artifact-viewer-image {
       display: block;
       max-width: 100%;
@@ -2473,6 +2487,13 @@ INDEX_HTML = r"""
     .bubble-content p {
       margin: 0;
     }
+    .bubble-content a {
+      color: var(--color-text-link);
+      text-decoration: none;
+    }
+    .bubble-content a:hover {
+      text-decoration: underline;
+    }
     .bubble-content ul,
     .bubble-content ol {
       margin: 0;
@@ -2526,6 +2547,50 @@ INDEX_HTML = r"""
       border: 0;
       background: transparent;
       white-space: pre;
+    }
+    .bubble-content blockquote {
+      margin: 0;
+      padding: var(--space-xs) var(--space-sm);
+      border-left: 3px solid var(--color-border-focus);
+      background: rgba(88, 166, 255, 0.06);
+      color: var(--color-text-secondary);
+    }
+    .bubble-content hr {
+      height: 1px;
+      border: 0;
+      background: var(--color-border);
+    }
+    .markdown-table-wrap {
+      max-width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--color-border-light);
+      border-radius: var(--radius-sm);
+    }
+    .bubble-content table {
+      width: 100%;
+      min-width: min(620px, 100%);
+      border-collapse: collapse;
+      background: rgba(13, 17, 23, 0.28);
+    }
+    .bubble-content th,
+    .bubble-content td {
+      padding: var(--space-xs) var(--space-sm);
+      border-bottom: 1px solid var(--color-border-light);
+      border-right: 1px solid var(--color-border-light);
+      text-align: left;
+      vertical-align: top;
+    }
+    .bubble-content th:last-child,
+    .bubble-content td:last-child {
+      border-right: 0;
+    }
+    .bubble-content tr:last-child td {
+      border-bottom: 0;
+    }
+    .bubble-content th {
+      color: var(--color-text-primary);
+      font-weight: 700;
+      background: rgba(88, 166, 255, 0.08);
     }
     .hl-comment { color: #8b949e; font-style: italic; }
     .hl-keyword { color: #ff7b72; }
@@ -4414,7 +4479,12 @@ INDEX_HTML = r"""
 
       const content = document.createElement("div");
       content.className = "bubble-content";
-      content.append(createCodeBlock(viewer.text, languageFromFileName(artifact.name)));
+      if (isMarkdownArtifact(artifact)) {
+        content.classList.add("artifact-markdown");
+        renderFormattedContent(content, viewer.text);
+      } else {
+        content.append(createCodeBlock(viewer.text, languageFromFileName(artifact.name)));
+      }
       body.append(content);
     }
 
@@ -4425,6 +4495,17 @@ INDEX_HTML = r"""
 
     function isPdfArtifact(artifact) {
       return artifact?.mime_type === "application/pdf";
+    }
+
+    function isMarkdownArtifact(artifact) {
+      const mimeType = String(artifact?.mime_type || "").toLowerCase();
+      const name = String(artifact?.name || artifact?.artifact_id || "").toLowerCase();
+      return (
+        mimeType === "text/markdown" ||
+        mimeType === "text/x-markdown" ||
+        name.endsWith(".md") ||
+        name.endsWith(".markdown")
+      );
     }
 
     function formatBytes(size) {
@@ -4443,6 +4524,7 @@ INDEX_HTML = r"""
         js: "javascript",
         json: "json",
         md: "markdown",
+        markdown: "markdown",
         py: "python",
         sh: "bash",
         sql: "sql",
@@ -4698,7 +4780,7 @@ INDEX_HTML = r"""
     }
 
     function renderFormattedContent(container, content) {
-      const lines = content.replace(/\r\n/g, "\n").split("\n");
+      const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
       let paragraphLines = [];
       let listNode = null;
       let listType = null;
@@ -4731,7 +4813,8 @@ INDEX_HTML = r"""
         codeLanguage = null;
       }
 
-      for (const line of lines) {
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex];
         const fence = line.trim().match(/^```(?:\s*([A-Za-z0-9_+.#-]+))?.*$/);
         if (fence) {
           if (codeLines === null) {
@@ -4750,9 +4833,23 @@ INDEX_HTML = r"""
           continue;
         }
 
+        if (isMarkdownTableAt(lines, lineIndex)) {
+          flushParagraph();
+          flushList();
+          lineIndex = renderMarkdownTable(container, lines, lineIndex) - 1;
+          continue;
+        }
+
         if (line.trim() === "") {
           flushParagraph();
           flushList();
+          continue;
+        }
+
+        if (/^\s*-{3,}\s*$/.test(line)) {
+          flushParagraph();
+          flushList();
+          container.append(document.createElement("hr"));
           continue;
         }
 
@@ -4764,6 +4861,22 @@ INDEX_HTML = r"""
           headingNode.className = "md-heading";
           renderInline(headingNode, heading[2]);
           container.append(headingNode);
+          continue;
+        }
+
+        if (/^\s*>\s?/.test(line)) {
+          flushParagraph();
+          flushList();
+          const quoteLines = [];
+          let quoteIndex = lineIndex;
+          while (quoteIndex < lines.length && /^\s*>\s?/.test(lines[quoteIndex])) {
+            quoteLines.push(lines[quoteIndex].replace(/^\s*>\s?/, ""));
+            quoteIndex += 1;
+          }
+          const quote = document.createElement("blockquote");
+          renderFormattedContent(quote, quoteLines.join("\n"));
+          container.append(quote);
+          lineIndex = quoteIndex - 1;
           continue;
         }
 
@@ -4792,6 +4905,60 @@ INDEX_HTML = r"""
       flushCode();
     }
 
+    function isMarkdownTableAt(lines, index) {
+      const header = lines[index] || "";
+      const separator = lines[index + 1] || "";
+      return header.includes("|") && isMarkdownTableSeparator(separator);
+    }
+
+    function isMarkdownTableSeparator(line) {
+      const cells = splitMarkdownTableRow(line);
+      return (
+        cells.length >= 2 &&
+        cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()))
+      );
+    }
+
+    function renderMarkdownTable(container, lines, startIndex) {
+      const tableWrap = document.createElement("div");
+      tableWrap.className = "markdown-table-wrap";
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const body = document.createElement("tbody");
+
+      const headerRow = document.createElement("tr");
+      for (const cell of splitMarkdownTableRow(lines[startIndex])) {
+        const th = document.createElement("th");
+        renderInline(th, cell.trim());
+        headerRow.append(th);
+      }
+      head.append(headerRow);
+
+      let index = startIndex + 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim() !== "") {
+        const row = document.createElement("tr");
+        for (const cell of splitMarkdownTableRow(lines[index])) {
+          const td = document.createElement("td");
+          renderInline(td, cell.trim());
+          row.append(td);
+        }
+        body.append(row);
+        index += 1;
+      }
+
+      table.append(head, body);
+      tableWrap.append(table);
+      container.append(tableWrap);
+      return index;
+    }
+
+    function splitMarkdownTableRow(line) {
+      let value = String(line || "").trim();
+      if (value.startsWith("|")) value = value.slice(1);
+      if (value.endsWith("|")) value = value.slice(0, -1);
+      return value.split("|").map((cell) => cell.trim());
+    }
+
     function createCodeBlock(source, languageHint = null) {
       const pre = document.createElement("pre");
       const code = document.createElement("code");
@@ -4808,14 +4975,26 @@ INDEX_HTML = r"""
     }
 
     function renderInline(parent, text) {
-      const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+      const pattern = /(\[[^\]]+\]\(https?:\/\/[^)\s]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
       let index = 0;
       for (const match of text.matchAll(pattern)) {
         if (match.index > index) {
           parent.append(document.createTextNode(text.slice(index, match.index)));
         }
         const token = match[0];
-        if (token.startsWith("`")) {
+        if (token.startsWith("[") && token.includes("](")) {
+          const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+          if (link) {
+            const anchor = document.createElement("a");
+            anchor.href = link[2];
+            anchor.target = "_blank";
+            anchor.rel = "noreferrer";
+            anchor.textContent = link[1];
+            parent.append(anchor);
+          } else {
+            parent.append(document.createTextNode(token));
+          }
+        } else if (token.startsWith("`")) {
           const code = document.createElement("code");
           code.textContent = token.slice(1, -1);
           parent.append(code);
@@ -4976,6 +5155,12 @@ INDEX_HTML = r"""
         ];
       }
 
+      if (language === "markdown") {
+        return [
+          [null, /^[\s\S]+/],
+        ];
+      }
+
       return [
         [null, /^\s+/],
         ["hl-comment", /^#[^\n]*/],
@@ -5006,6 +5191,8 @@ INDEX_HTML = r"""
         json: "json",
         jsonc: "json",
         jsx: "javascript",
+        markdown: "markdown",
+        md: "markdown",
         mjs: "javascript",
         py: "python",
         python: "python",

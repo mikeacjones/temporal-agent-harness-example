@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import suppress
 
 import uvicorn
@@ -38,9 +39,17 @@ async def main() -> None:
     configure_mcp_auth_resolver(resolve_mcp_auth_headers)
     configure_mcp_http_auth_resolver(resolve_mcp_http_auth)
     data_converter = simple_chat_data_converter()
+
+    client_config = {
+        "namespace": os.environ.get("TEMPORAL_NAMESPACE", "default"),
+        "data_converter": data_converter,
+        "tls": os.environ.get("TEMPORAL_TLS", "false").lower() in ["true", "1"],
+    }
+    if os.environ.get("TEMPORAL_API_KEY"):
+        client_config["api_key"] = os.environ.get("TEMPORAL_API_KEY")
+
     client = await Client.connect(
-        "localhost:7233",
-        data_converter=data_converter,
+        os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233"), **client_config
     )
 
     worker = Worker(
