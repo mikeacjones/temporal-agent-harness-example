@@ -37,6 +37,10 @@ class UserChatsInput:
     # name disables the search attribute (e.g. local dev without it registered).
     user_email: str = ""
     search_attr_name: str = ""
+    # Registry state carried across continue-as-new so the new run keeps tracking
+    # every chat and MCP server. Empty on a first start.
+    chats: list[ChatRecord] = field(default_factory=list)
+    mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
 
 
 def user_email_search_attributes(
@@ -117,7 +121,32 @@ class UserChatsWorkflow:
         self._user_id = request.user_id
         self._user_email = request.user_email
         self._search_attr_name = request.search_attr_name
-        await workflow.wait_condition(lambda: False)
+        # Restore registry state (carried across continue-as-new). Empty on a
+        # first start; the chat/MCP updates that follow repopulate it on replay.
+        self._chats = {chat.workflow_id: chat for chat in request.chats}
+        self._mcp_servers = {
+            server.server_id: server for server in request.mcp_servers
+        }
+
+        # This entity workflow receives an update on every chat create/touch/
+        # forget and MCP change, so its history grows unbounded. Continue-as-new
+        # when the server suggests it AND no update handler is mid-flight (so we
+        # never drop an in-flight update), carrying the full registry state
+        # forward. Child chat workflows are unaffected (ParentClosePolicy.ABANDON
+        # + external-handle lifecycle ops).
+        await workflow.wait_condition(
+            lambda: workflow.info().is_continue_as_new_suggested()
+            and workflow.all_handlers_finished()
+        )
+        workflow.continue_as_new(
+            UserChatsInput(
+                user_id=self._user_id,
+                user_email=self._user_email,
+                search_attr_name=self._search_attr_name,
+                chats=list(self._chats.values()),
+                mcp_servers=list(self._mcp_servers.values()),
+            )
+        )
 
     @workflow.update
     async def create_chat(self, request: CreateChatRequest) -> ChatRecord:
