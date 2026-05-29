@@ -1,0 +1,135 @@
+# Single pod with two containers (web + worker) for the simple_chat_agent.
+#
+# The web and worker share local on-disk state, so they MUST run in the same
+# pod sharing volumes:
+#   - /app/.simple_chat_agent  : sqlite DB, artifacts, and the claim-check
+#                                external-payload store (written by the worker +
+#                                codec, read by the web).
+#   - /app/.simple_chat_streams: JSONL stream files (written by the worker,
+#                                read by the web).
+#
+# Because that state is local (not shared storage), this Deployment stays at a
+# single replica with a Recreate strategy — do not scale it horizontally.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-harness
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-harness
+  template:
+    metadata:
+      labels:
+        app: agent-harness
+    spec:
+      serviceAccountName: agent-harness
+      containers:
+        - name: web
+          image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
+          imagePullPolicy: IfNotPresent
+          # The module's __main__ binds 127.0.0.1 with reload=True (dev only),
+          # so launch uvicorn directly bound to all interfaces.
+          command:
+            - uvicorn
+            - simple_chat_agent.web:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - "*"
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: agent-harness-secrets
+          env:
+            # Durable, shared claim-check storage (survives pod restarts).
+            # When unset, the app falls back to the local on-disk store.
+            - name: SIMPLE_CHAT_S3_BUCKET
+              value: michaelj-agent-harness-claimcheck-429214323166
+            # Registered (Keyword) custom search attribute tagged with the
+            # creator's email at workflow start. Empty disables it.
+            - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
+              value: UserEmail
+          volumeMounts:
+            - name: chat-data
+              mountPath: /app/.simple_chat_agent
+            - name: chat-streams
+              mountPath: /app/.simple_chat_streams
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        - name: worker
+          image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
+          imagePullPolicy: IfNotPresent
+          # Runs the Temporal worker and the in-process codec server (:8001).
+          command:
+            - python
+            - -m
+            - simple_chat_agent.worker
+          ports:
+            - name: codec
+              containerPort: 8001
+          envFrom:
+            - secretRef:
+                name: agent-harness-secrets
+          env:
+            # Durable, shared claim-check storage (survives pod restarts).
+            # When unset, the app falls back to the local on-disk store.
+            - name: SIMPLE_CHAT_S3_BUCKET
+              value: michaelj-agent-harness-claimcheck-429214323166
+            # Registered (Keyword) custom search attribute tagged with the
+            # creator's email at workflow start. Empty disables it.
+            - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
+              value: UserEmail
+          volumeMounts:
+            - name: chat-data
+              mountPath: /app/.simple_chat_agent
+            - name: chat-streams
+              mountPath: /app/.simple_chat_streams
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: chat-data
+          emptyDir: {}
+        - name: chat-streams
+          emptyDir: {}

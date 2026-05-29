@@ -1,0 +1,31 @@
+# Never bake secrets or local state into the image.
+.env
+.env.*
+!.env.example
+
+# Virtualenvs / caches
+.venv
+**/__pycache__/
+*.py[cod]
+
+# Local runtime data (sqlite, claim-check store, streams, replay)
+.simple_chat_agent/
+.simple_chat_streams/
+.replay/
+
+# VCS / IDE / OS
+.git
+.gitignore
+.zed/
+.vscode/
+.idea/
+.DS_Store
+**/.DS_Store
+
+# Deploy artifacts and docs not needed at runtime
+deploy/
+**/deploy/
+Dockerfile
+**/Dockerfile
+*.md
+!README.md
