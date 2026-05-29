@@ -4578,6 +4578,15 @@ INDEX_HTML = r"""
 
       messagesEl.replaceChildren(fragment);
       messagesEl.scrollTop = messagesEl.scrollHeight;
+      // The live streaming text/thinking boxes have their own max-height scroll
+      // region; keep them pinned to the latest output as text streams in.
+      messagesEl
+        .querySelectorAll(
+          ".stream-current-turn .stream-text, .stream-current-turn .stream-thinking",
+        )
+        .forEach((el) => {
+          el.scrollTop = el.scrollHeight;
+        });
       eventsEl.replaceChildren();
     }
 
