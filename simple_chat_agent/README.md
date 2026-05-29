@@ -32,9 +32,13 @@ Create a repo-root `.env` file:
 ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_MODEL=claude-sonnet-4-5
 
-SIMPLE_CHAT_USERNAME=demo
-SIMPLE_CHAT_PASSWORD=demo
 SIMPLE_CHAT_JWT_SECRET=replace-me-for-any-shared-demo
+
+# Sign in with Google (required to log in)
+GOOGLE_OAUTH_CLIENT_ID=...
+GOOGLE_OAUTH_CLIENT_SECRET=...
+GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/oauth/google/callback
+GOOGLE_OAUTH_ALLOWED_DOMAIN=temporal.io
 ```
 
 Start a local Temporal dev server:

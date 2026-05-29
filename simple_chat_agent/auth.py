@@ -24,18 +24,10 @@ class AuthError(Exception):
     pass
 
 
-def authenticate_user(username: str, password: str) -> AuthenticatedUser | None:
-    configured_username = os.environ.get("SIMPLE_CHAT_USERNAME", "demo")
-    configured_password = os.environ.get("SIMPLE_CHAT_PASSWORD", "demo")
-
-    if not hmac.compare_digest(username, configured_username):
-        return None
-    if not hmac.compare_digest(password, configured_password):
-        return None
-
+def user_from_google_subject(*, subject: str, email: str) -> AuthenticatedUser:
     return AuthenticatedUser(
-        user_id=_user_id_for_username(username),
-        username=username,
+        user_id=f"user_google_{_short_digest(subject)}",
+        username=email,
     )
 
 
@@ -65,9 +57,8 @@ def user_from_session_token(token: str) -> AuthenticatedUser:
     return AuthenticatedUser(user_id=user_id, username=username)
 
 
-def _user_id_for_username(username: str) -> str:
-    digest = hashlib.sha256(username.encode("utf-8")).hexdigest()[:24]
-    return f"user_{digest}"
+def _short_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def _session_secret() -> bytes:
