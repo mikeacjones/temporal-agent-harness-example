@@ -61,6 +61,16 @@ spec:
             # creator's email at workflow start. Empty disables it.
             - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
               value: UserEmail
+            # Durable, shared OAuth token store (GitHub/MCP) — survives
+            # redeploys. When unset, the app uses local SQLite.
+            - name: SIMPLE_CHAT_DYNAMODB_TABLE
+              value: temporal-michaelj-agent-harness-demo-oauth
+            # Stream transport: the worker POSTs stream events to the web's
+            # internal API (which buffers + serves SSE). When unset, the worker
+            # writes local JSONL files (local dev). Auth via SIMPLE_CHAT_STREAM_TOKEN
+            # (in the secret); the web serves from its buffer when that token is set.
+            - name: SIMPLE_CHAT_STREAM_SINK_URL
+              value: http://agent-harness-web
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
@@ -106,6 +116,16 @@ spec:
             # creator's email at workflow start. Empty disables it.
             - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
               value: UserEmail
+            # Durable, shared OAuth token store (GitHub/MCP) — survives
+            # redeploys. When unset, the app uses local SQLite.
+            - name: SIMPLE_CHAT_DYNAMODB_TABLE
+              value: temporal-michaelj-agent-harness-demo-oauth
+            # Stream transport: the worker POSTs stream events to the web's
+            # internal API (which buffers + serves SSE). When unset, the worker
+            # writes local JSONL files (local dev). Auth via SIMPLE_CHAT_STREAM_TOKEN
+            # (in the secret); the web serves from its buffer when that token is set.
+            - name: SIMPLE_CHAT_STREAM_SINK_URL
+              value: http://agent-harness-web
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent

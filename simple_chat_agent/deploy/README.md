@@ -41,7 +41,7 @@ GitHub callback URL, proxy trust, a real session secret, and codec settings):
 ```bash
 NS=temporal-michaelj-agent-harness-demo
 ENVFILE=$(mktemp)
-grep -vE '^(SIMPLE_CHAT_PUBLIC_URL|GITHUB_OAUTH_REDIRECT_URI|FORWARDED_ALLOW_IPS|SIMPLE_CHAT_JWT_SECRET|SIMPLE_CHAT_CODEC_SERVER_HOST|SIMPLE_CHAT_CODEC_AUTH_ENABLED)=' .env > "$ENVFILE"
+grep -vE '^(SIMPLE_CHAT_PUBLIC_URL|GITHUB_OAUTH_REDIRECT_URI|FORWARDED_ALLOW_IPS|SIMPLE_CHAT_JWT_SECRET|SIMPLE_CHAT_CODEC_SERVER_HOST|SIMPLE_CHAT_CODEC_AUTH_ENABLED|SIMPLE_CHAT_STREAM_TOKEN)=' .env > "$ENVFILE"
 cat >> "$ENVFILE" <<EOF
 SIMPLE_CHAT_PUBLIC_URL=https://agent-harness-demo.tmprl-demo.cloud
 GITHUB_OAUTH_REDIRECT_URI=https://agent-harness-demo.tmprl-demo.cloud/oauth/github/callback
@@ -49,6 +49,7 @@ FORWARDED_ALLOW_IPS=*
 SIMPLE_CHAT_JWT_SECRET=$(openssl rand -hex 32)
 SIMPLE_CHAT_CODEC_SERVER_HOST=0.0.0.0
 SIMPLE_CHAT_CODEC_AUTH_ENABLED=1
+SIMPLE_CHAT_STREAM_TOKEN=$(openssl rand -hex 32)
 EOF
 kubectl create secret generic agent-harness-secrets -n $NS \
   --from-env-file="$ENVFILE" --dry-run=client -o yaml | kubectl apply -f -
@@ -84,10 +85,20 @@ to a local on-disk store (used for local dev).
   on `v0/ns/<namespace>/wt/SimpleChatWorkflow/wi/<workflow-id>/`
   (`web.py` `_forget_conversation` → `purge_workflow_payloads`).
 
-Note: the SQLite DB (OAuth connections, artifacts) and stream files still live
-on the pod's `emptyDir` and are not yet durable across restarts — only the
-workflow-replay-critical claim-check payloads are. Reconnecting OAuth after a
-restart is the current expectation.
+## Durable state
+
+| State | Backend | Notes |
+|-------|---------|-------|
+| Claim-check payloads | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; purged on chat delete |
+| GitHub/MCP OAuth tokens | DynamoDB (`SIMPLE_CHAT_DYNAMODB_TABLE`, table `…-oauth`) | survives redeploys; SSE-encrypted; accessed via IRSA |
+| Transient OAuth handshake state, artifacts, stream files | local `emptyDir` | ephemeral; lost on restart |
+
+When the S3 / DynamoDB env vars are unset (local dev), the app falls back to
+on-disk file + SQLite storage with no AWS dependency.
+
+> Artifacts and live stream files still live on `emptyDir`; moving those to
+> S3/DynamoDB + a web-owned streaming API is the remaining work to split web and
+> worker into independent pods.
 
 ## Manual steps (cannot be done with kubectl)
 
