@@ -57,7 +57,6 @@
     const eventsEl = document.getElementById("events");
     const statusEl = document.getElementById("status");
     const temporalLinkEl = document.getElementById("temporalLink");
-    const chatFooterEl = document.getElementById("chatFooter");
     const chatWorkflowLinkEl = document.getElementById("chatWorkflowLink");
     const inputEl = document.getElementById("message");
     const formEl = document.getElementById("composer");
@@ -304,7 +303,7 @@
       state.draftConversation = true;
       closeArtifactViewer();
       localStorage.removeItem("simpleChatWorkflowId");
-      chatFooterEl.hidden = true;
+      chatWorkflowLinkEl.style.display = "none";
       chatWorkflowLinkEl.removeAttribute("href");
       renderSidebar();
       render();
@@ -350,9 +349,9 @@
       localStorage.setItem("simpleChatWorkflowId", state.workflowId);
       if (state.temporalUiUrl) {
         chatWorkflowLinkEl.href = state.temporalUiUrl;
-        chatFooterEl.hidden = false;
+        chatWorkflowLinkEl.style.display = "inline-flex";
       } else {
-        chatFooterEl.hidden = true;
+        chatWorkflowLinkEl.style.display = "none";
       }
       renderSidebar();
       render();
@@ -440,8 +439,6 @@
       event.preventDefault();
       sendDefault();
     });
-    document.getElementById("queue").addEventListener("click", () => sendAction("chat", "you", "sending"));
-    document.getElementById("afterTool").addEventListener("click", () => sendAction("after-tool", "you after tool", "sending"));
     document.getElementById("interrupt").addEventListener("click", () => sendAction("interrupt", "you interrupt", "sending"));
     inputEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
