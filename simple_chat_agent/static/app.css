@@ -37,7 +37,7 @@
       --details-width: 360px;
       --top-bar-height: 56px;
       --font-family: "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      --font-mono: "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
+      --font-mono: "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
       --font-size-xs: 11px;
       --font-size-sm: 12px;
       --font-size-md: 14px;
@@ -165,6 +165,9 @@
       grid-template-rows: minmax(0, 1fr) auto;
       height: 100vh;
       min-height: 0;
+      /* The logged-in UI uses JetBrains Mono for a clean terminal feel; the
+         login screen keeps Inter (body default). */
+      font-family: var(--font-mono);
     }
     header {
       display: flex;
