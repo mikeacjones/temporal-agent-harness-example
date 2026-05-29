@@ -8,7 +8,7 @@ The interesting part is not "how to call an LLM." It is how the agent loop, tool
 
 ## Opinionated Architecture
 
-![Agent harness architecture](docs/agent-harness-simplified.svg)
+![Agent harness architecture](docs/agent-harness-simplified.png)
 
 The main design choice is to separate reusable harness behavior from application ownership. The harness should encode the agent platform rules a company wants every Claude agent to follow. The application still owns the workflow shape, product UX, authentication, tool availability, and business-specific policies.
 
