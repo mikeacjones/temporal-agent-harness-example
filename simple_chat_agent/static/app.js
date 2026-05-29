@@ -440,6 +440,16 @@
       sendDefault();
     });
     document.getElementById("interrupt").addEventListener("click", () => sendAction("interrupt", "you interrupt", "sending"));
+    loginGoogleEl.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (loginGoogleEl.getAttribute("aria-disabled") === "true") return;
+      const href = loginGoogleEl.getAttribute("href");
+      // Hide the button and play the Ziggy "flying in" animation, then redirect.
+      loginGoogleEl.closest(".login-card").classList.add("logging-in");
+      setTimeout(() => {
+        window.location.href = href;
+      }, 1100);
+    });
     inputEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
