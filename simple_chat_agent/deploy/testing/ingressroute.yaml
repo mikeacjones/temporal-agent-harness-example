@@ -1,0 +1,37 @@
+# Routes the test host to the test web Service.
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: agent-harness-testing
+  namespace: temporal-michaelj-agent-harness-demo
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`)
+      services:
+        - name: agent-harness-web-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
+  tls:
+    secretName: agent-harness-testing-tls
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: agent-harness-testing-http
+  namespace: temporal-michaelj-agent-harness-demo
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`)
+      services:
+        - name: agent-harness-web-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80

@@ -103,8 +103,14 @@ class DeleteMcpServerRequest:
 
 
 def user_chats_workflow_id(user_id: str) -> str:
+    # Called only from the web layer (never inside workflow code), so reading the
+    # environment here is safe. The prefix isolates a test stack's registries
+    # from prod in the shared namespace (empty in prod).
+    import os
+
     digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
-    return f"{CHAT_REGISTRY_PREFIX}{digest}"
+    prefix = os.environ.get("SIMPLE_CHAT_WORKFLOW_PREFIX", "")
+    return f"{prefix}{CHAT_REGISTRY_PREFIX}{digest}"
 
 
 @workflow.defn

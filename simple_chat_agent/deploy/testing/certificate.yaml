@@ -1,0 +1,16 @@
+# Let's Encrypt cert for the test host (cert-manager, letsencrypt ClusterIssuer).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agent-harness-testing-tls
+  namespace: temporal-michaelj-agent-harness-demo
+spec:
+  dnsNames:
+    - agent-harness-demo.testing.tmprl-demo.cloud
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: letsencrypt
+  privateKey:
+    rotationPolicy: Always
+  secretName: agent-harness-testing-tls
