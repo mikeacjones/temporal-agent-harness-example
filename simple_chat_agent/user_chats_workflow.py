@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from temporalio import workflow
+from temporalio.common import (
+    SearchAttributeKey,
+    SearchAttributePair,
+    TypedSearchAttributes,
+)
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -26,6 +31,28 @@ ChatStatus = Literal["active", "deleting"]
 @dataclass
 class UserChatsInput:
     user_id: str
+    # Creator's email and the (registered) search-attribute name to tag both this
+    # workflow and its child chat workflows with. Resolved by the web layer (the
+    # deterministic boundary) so the workflow never reads the environment. Empty
+    # name disables the search attribute (e.g. local dev without it registered).
+    user_email: str = ""
+    search_attr_name: str = ""
+
+
+def user_email_search_attributes(
+    *,
+    search_attr_name: str,
+    user_email: str,
+) -> TypedSearchAttributes | None:
+    """Typed search attributes carrying the creator email, or None when disabled.
+
+    Applied via start options (start_workflow / start_child_workflow) so there is
+    no extra workflow action/history cost.
+    """
+    if not search_attr_name or not user_email:
+        return None
+    key = SearchAttributeKey.for_keyword(search_attr_name)
+    return TypedSearchAttributes([SearchAttributePair(key, user_email)])
 
 
 @dataclass
@@ -80,12 +107,16 @@ def user_chats_workflow_id(user_id: str) -> str:
 class UserChatsWorkflow:
     def __init__(self) -> None:
         self._user_id = ""
+        self._user_email = ""
+        self._search_attr_name = ""
         self._chats: dict[str, ChatRecord] = {}
         self._mcp_servers: dict[str, HttpMcpServerConfig] = {}
 
     @workflow.run
     async def run(self, request: UserChatsInput) -> None:
         self._user_id = request.user_id
+        self._user_email = request.user_email
+        self._search_attr_name = request.search_attr_name
         await workflow.wait_condition(lambda: False)
 
     @workflow.update
@@ -127,6 +158,10 @@ class UserChatsWorkflow:
             task_queue=TASK_QUEUE,
             parent_close_policy=ParentClosePolicy.ABANDON,
             static_summary="simple chat session",
+            search_attributes=user_email_search_attributes(
+                search_attr_name=self._search_attr_name,
+                user_email=self._user_email,
+            ),
         )
         now = workflow.now().isoformat()
         record = ChatRecord(
