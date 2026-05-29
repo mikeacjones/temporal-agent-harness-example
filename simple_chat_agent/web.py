@@ -1601,7 +1601,11 @@ def _temporal_ui_user_workflows_url(email: str) -> str | None:
         return None
     base_url = _temporal_ui_base_url().rstrip("/")
     namespace_path = quote(namespace, safe="")
-    query = quote(f'{search_attr_name} = "{email}"', safe="")
+    # UserEmail is a Text (tokenized) search attribute, so including the email
+    # domain would match the "temporal"/"io" tokens shared by every user and
+    # return everyone. Filter on the local part only for a per-user result.
+    local_part = email.split("@", 1)[0]
+    query = quote(f'{search_attr_name} = "{local_part}"', safe="")
     return f"{base_url}/namespaces/{namespace_path}/workflows?query={query}"
 
 
