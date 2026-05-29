@@ -97,8 +97,8 @@
       justify-content: center;
     }
     .login-card h1::before {
-      width: 72px;
-      height: 72px;
+      width: 128px;
+      height: 128px;
     }
     .login-form {
       display: grid;
@@ -139,18 +139,21 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      height: 40px;
-      border-radius: var(--radius-pill);
+      height: 48px;
+      border-radius: var(--radius-lg);
       text-decoration: none;
       font-weight: 600;
-      background: var(--color-primary);
-      color: var(--color-on-primary);
-      border: 1px solid var(--color-primary);
-      transition: background-color var(--transition-fast), border-color var(--transition-fast);
+      color: var(--color-text-primary);
+      /* Outline button with a UV -> bubble-gum gradient border (transparent
+         fill), matching Temporal's "Log In" button. */
+      border: 2px solid transparent;
+      background:
+        linear-gradient(var(--color-bg-secondary), var(--color-bg-secondary)) padding-box,
+        linear-gradient(90deg, #444ce7, #ff61fa) border-box;
+      transition: filter var(--transition-fast);
     }
     .login-google:hover {
-      background: var(--color-primary-hover);
-      border-color: var(--color-primary-hover);
+      filter: brightness(1.2);
     }
     .login-google[aria-disabled="true"] {
       opacity: 0.6;
@@ -208,7 +211,7 @@
       align-items: center;
       justify-content: center;
       border: 1px solid var(--color-border);
-      border-radius: var(--radius-pill);
+      border-radius: var(--radius-lg);
       padding: var(--space-sm) var(--space-md);
       color: var(--color-text-primary);
       text-decoration: none;
@@ -223,6 +226,12 @@
       background: var(--color-bg-hover);
       color: var(--color-text-primary);
       text-decoration: none;
+    }
+    /* In the composer row, the workflow-timeline link matches the buttons. */
+    .composer .temporal-link {
+      height: 44px;
+      min-height: 44px;
+      padding: 0 18px;
     }
     .status {
       margin-top: auto;
@@ -1253,7 +1262,7 @@
       height: 44px;
       min-width: 44px;
       border: 1px solid var(--color-border);
-      border-radius: var(--radius-pill);
+      border-radius: var(--radius-lg);
       padding: 0 18px;
       background: var(--color-bg-tertiary);
       color: var(--color-text-primary);
