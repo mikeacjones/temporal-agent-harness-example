@@ -71,6 +71,10 @@ spec:
             # (in the secret); the web serves from its buffer when that token is set.
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-web
+            # Artifact metadata table (bytes go to the S3 bucket above under an
+            # artifacts/ prefix). When unset, artifacts use local disk + SQLite.
+            - name: SIMPLE_CHAT_ARTIFACTS_TABLE
+              value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
@@ -126,6 +130,10 @@ spec:
             # (in the secret); the web serves from its buffer when that token is set.
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-web
+            # Artifact metadata table (bytes go to the S3 bucket above under an
+            # artifacts/ prefix). When unset, artifacts use local disk + SQLite.
+            - name: SIMPLE_CHAT_ARTIFACTS_TABLE
+              value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent

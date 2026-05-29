@@ -1531,12 +1531,15 @@ def _artifact_response(
     *,
     disposition: Literal["inline", "attachment"],
 ) -> Response:
-    path = Path(artifact.path)
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Artifact file not found")
+    try:
+        content = _store().read_artifact_bytes(artifact)
+    except Exception as err:
+        raise HTTPException(
+            status_code=404, detail="Artifact file not found"
+        ) from err
 
     return Response(
-        path.read_bytes(),
+        content,
         media_type=(
             artifact.mime_type
             if disposition == "attachment"

@@ -82,6 +82,18 @@ class AppStore:
         self._oauth_dynamo: DynamoOAuthStore | None = (
             DynamoOAuthStore(table_name) if table_name else None
         )
+        # Artifacts: bytes in S3, metadata in DynamoDB when configured (durable,
+        # shared across pods); otherwise local disk + SQLite.
+        artifacts_table = dynamo_artifacts_table_name()
+        artifacts_bucket = _artifact_s3_bucket()
+        self._artifact_store: S3DynamoArtifactStore | None = (
+            S3DynamoArtifactStore(table_name=artifacts_table, bucket=artifacts_bucket)
+            if artifacts_table and artifacts_bucket
+            else None
+        )
+
+    def read_artifact_bytes(self, artifact: ArtifactRecord) -> bytes:
+        return read_artifact_bytes(artifact)
 
     def record_conversation(
         self,
@@ -384,6 +396,16 @@ class AppStore:
         content: bytes,
         metadata: dict[str, Any] | None = None,
     ) -> ArtifactRecord:
+        if self._artifact_store is not None:
+            return self._artifact_store.create_artifact(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                workflow_id=workflow_id,
+                name=name,
+                mime_type=mime_type,
+                content=content,
+                metadata=metadata,
+            )
         artifact_id = f"artifact_{uuid4().hex}"
         safe_name = _safe_artifact_name(name)
         artifact_path = self._artifact_dir / f"{artifact_id}-{safe_name}"
@@ -433,6 +455,10 @@ class AppStore:
         user_id: str,
         artifact_id: str,
     ) -> ArtifactRecord | None:
+        if self._artifact_store is not None:
+            return self._artifact_store.get_artifact(
+                user_id=user_id, artifact_id=artifact_id
+            )
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -450,6 +476,10 @@ class AppStore:
         user_id: str,
         workflow_id: str,
     ) -> list[ArtifactRecord]:
+        if self._artifact_store is not None:
+            return self._artifact_store.list_artifacts(
+                user_id=user_id, workflow_id=workflow_id
+            )
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -473,6 +503,11 @@ class AppStore:
         user_id: str,
         workflow_id: str,
     ) -> None:
+        if self._artifact_store is not None:
+            self._artifact_store.delete_artifacts_for_conversation(
+                user_id=user_id, workflow_id=workflow_id
+            )
+            return
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -699,6 +734,178 @@ def _oauth_connection_from_item(
         created_at=item["created_at"],
         updated_at=item["updated_at"],
     )
+
+
+def dynamo_artifacts_table_name() -> str | None:
+    name = os.environ.get("SIMPLE_CHAT_ARTIFACTS_TABLE", "").strip()
+    return name or None
+
+
+def _artifact_s3_bucket() -> str | None:
+    name = os.environ.get("SIMPLE_CHAT_S3_BUCKET", "").strip()
+    return name or None
+
+
+_S3_CLIENT_CACHE: dict[str, Any] = {}
+
+
+def _s3_client() -> Any:
+    client = _S3_CLIENT_CACHE.get("client")
+    if client is None:
+        import boto3
+
+        client = boto3.client("s3")
+        _S3_CLIENT_CACHE["client"] = client
+    return client
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    bucket, _, key = uri[len("s3://") :].partition("/")
+    return bucket, key
+
+
+class S3DynamoArtifactStore:
+    """Durable artifact storage: bytes in S3, metadata in DynamoDB.
+
+    All access happens in activities (worker) or the web layer — never in
+    workflow code — so there is no workflow determinism risk. Used when
+    SIMPLE_CHAT_ARTIFACTS_TABLE + SIMPLE_CHAT_S3_BUCKET are set; otherwise the
+    app uses local disk + SQLite.
+    """
+
+    WORKFLOW_INDEX = "workflow-index"
+
+    def __init__(self, *, table_name: str, bucket: str) -> None:
+        self._table_name = table_name
+        self._bucket = bucket
+
+    @property
+    def _table(self) -> Any:
+        return _dynamo_table(self._table_name)
+
+    def create_artifact(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        workflow_id: str,
+        name: str,
+        mime_type: str,
+        content: bytes,
+        metadata: dict[str, Any] | None = None,
+    ) -> ArtifactRecord:
+        artifact_id = f"artifact_{uuid4().hex}"
+        safe_name = _safe_artifact_name(name)
+        key = f"artifacts/{user_id}/{workflow_id}/{artifact_id}-{safe_name}"
+        _s3_client().put_object(
+            Bucket=self._bucket, Key=key, Body=content, ContentType=mime_type
+        )
+        now = _now()
+        path = f"s3://{self._bucket}/{key}"
+        metadata_json = json.dumps(metadata if metadata is not None else {})
+        self._table.put_item(
+            Item={
+                "user_id": user_id,
+                "artifact_id": artifact_id,
+                "workflow_id": workflow_id,
+                "conversation_id": conversation_id,
+                "name": safe_name,
+                "mime_type": mime_type,
+                "size_bytes": len(content),
+                "path": path,
+                "metadata_json": metadata_json,
+                "created_at": now,
+            }
+        )
+        return ArtifactRecord(
+            artifact_id=artifact_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            workflow_id=workflow_id,
+            name=safe_name,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            path=path,
+            metadata=json.loads(metadata_json),
+            created_at=now,
+        )
+
+    def get_artifact(
+        self, *, user_id: str, artifact_id: str
+    ) -> ArtifactRecord | None:
+        response = self._table.get_item(
+            Key={"user_id": user_id, "artifact_id": artifact_id},
+            ConsistentRead=True,
+        )
+        return _artifact_from_item(response.get("Item"))
+
+    def list_artifacts(
+        self, *, user_id: str, workflow_id: str
+    ) -> list[ArtifactRecord]:
+        from boto3.dynamodb.conditions import Key
+
+        response = self._table.query(
+            IndexName=self.WORKFLOW_INDEX,
+            KeyConditionExpression=Key("workflow_id").eq(workflow_id),
+        )
+        records = [
+            record
+            for record in (
+                _artifact_from_item(item) for item in response.get("Items", [])
+            )
+            if record is not None and record.user_id == user_id
+        ]
+        records.sort(key=lambda record: record.created_at)
+        return records
+
+    def delete_artifacts_for_conversation(
+        self, *, user_id: str, workflow_id: str
+    ) -> None:
+        from boto3.dynamodb.conditions import Key
+
+        response = self._table.query(
+            IndexName=self.WORKFLOW_INDEX,
+            KeyConditionExpression=Key("workflow_id").eq(workflow_id),
+        )
+        for item in response.get("Items", []):
+            if item.get("user_id") != user_id:
+                continue
+            with suppress(Exception):
+                bucket, key = _parse_s3_uri(str(item.get("path", "")))
+                if bucket and key:
+                    _s3_client().delete_object(Bucket=bucket, Key=key)
+            self._table.delete_item(
+                Key={"user_id": item["user_id"], "artifact_id": item["artifact_id"]}
+            )
+
+
+def _artifact_from_item(item: dict[str, Any] | None) -> ArtifactRecord | None:
+    if not item:
+        return None
+    return ArtifactRecord(
+        artifact_id=item["artifact_id"],
+        user_id=item["user_id"],
+        conversation_id=item.get("conversation_id", ""),
+        workflow_id=item["workflow_id"],
+        name=item["name"],
+        mime_type=item["mime_type"],
+        size_bytes=int(item.get("size_bytes", 0)),
+        path=item["path"],
+        metadata=json.loads(item.get("metadata_json") or "{}"),
+        created_at=item["created_at"],
+    )
+
+
+def read_artifact_bytes(artifact: ArtifactRecord) -> bytes:
+    """Read an artifact's bytes from S3 (s3:// path) or local disk."""
+    if artifact.path.startswith("s3://"):
+        bucket, key = _parse_s3_uri(artifact.path)
+        response = _s3_client().get_object(Bucket=bucket, Key=key)
+        return response["Body"].read()
+    path = Path(artifact.path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(artifact.path)
+    return path.read_bytes()
 
 
 def app_store() -> AppStore:
