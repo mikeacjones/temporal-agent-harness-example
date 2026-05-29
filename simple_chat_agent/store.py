@@ -74,6 +74,14 @@ class AppStore:
         )
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
+        # When configured, OAuth connections (GitHub/MCP tokens) live in DynamoDB
+        # so they survive redeploys and are shared across pods. Transient
+        # oauth_states and other tables stay in SQLite. Unset => all SQLite
+        # (local dev / file storage).
+        table_name = dynamo_oauth_table_name()
+        self._oauth_dynamo: DynamoOAuthStore | None = (
+            DynamoOAuthStore(table_name) if table_name else None
+        )
 
     def record_conversation(
         self,
@@ -241,6 +249,17 @@ class AppStore:
         provider_user_login: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        if self._oauth_dynamo is not None:
+            return self._oauth_dynamo.upsert_oauth_connection(
+                user_id=user_id,
+                provider=provider,
+                access_token=access_token,
+                token_type=token_type,
+                scope=scope,
+                provider_user_id=provider_user_id,
+                provider_user_login=provider_user_login,
+                metadata=metadata,
+            )
         existing = self.get_oauth_connection(user_id=user_id, provider=provider)
         connection_id = (
             existing.connection_id
@@ -290,6 +309,10 @@ class AppStore:
     def get_oauth_connection(
         self, *, user_id: str, provider: str
     ) -> OAuthConnectionRecord | None:
+        if self._oauth_dynamo is not None:
+            return self._oauth_dynamo.get_oauth_connection(
+                user_id=user_id, provider=provider
+            )
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -304,6 +327,8 @@ class AppStore:
     def get_oauth_connection_by_id(
         self, connection_id: str
     ) -> OAuthConnectionRecord | None:
+        if self._oauth_dynamo is not None:
+            return self._oauth_dynamo.get_oauth_connection_by_id(connection_id)
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -318,6 +343,8 @@ class AppStore:
     def get_oauth_connection_by_provider(
         self, provider: str
     ) -> OAuthConnectionRecord | None:
+        if self._oauth_dynamo is not None:
+            return self._oauth_dynamo.get_oauth_connection_by_provider(provider)
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -335,6 +362,11 @@ class AppStore:
         return _oauth_connection_from_row(rows[0] if rows else None)
 
     def delete_oauth_connection(self, *, user_id: str, provider: str) -> None:
+        if self._oauth_dynamo is not None:
+            self._oauth_dynamo.delete_oauth_connection(
+                user_id=user_id, provider=provider
+            )
+            return
         with self._connect() as conn:
             conn.execute(
                 "delete from oauth_connections where user_id = ? and provider = ?",
@@ -530,6 +562,143 @@ class AppStore:
                 "alter table oauth_connections "
                 "add column metadata_json text not null default '{}'"
             )
+
+
+_DYNAMO_TABLE_CACHE: dict[str, Any] = {}
+
+
+def dynamo_oauth_table_name() -> str | None:
+    name = os.environ.get("SIMPLE_CHAT_DYNAMODB_TABLE", "").strip()
+    return name or None
+
+
+def _dynamo_table(name: str) -> Any:
+    table = _DYNAMO_TABLE_CACHE.get(name)
+    if table is None:
+        import boto3
+
+        table = boto3.resource("dynamodb").Table(name)
+        _DYNAMO_TABLE_CACHE[name] = table
+    return table
+
+
+class DynamoOAuthStore:
+    """DynamoDB-backed OAuth connection store: durable and shared across pods.
+
+    Key schema: partition key ``user_id``, sort key ``provider``. Plus GSIs
+    ``connection-id-index`` (``connection_id``) and ``provider-index``
+    (``provider``) for the MCP resolver's by-id / by-provider lookups. Used when
+    SIMPLE_CHAT_DYNAMODB_TABLE is set; otherwise the app uses local SQLite.
+    """
+
+    CONNECTION_ID_INDEX = "connection-id-index"
+    PROVIDER_INDEX = "provider-index"
+
+    def __init__(self, table_name: str) -> None:
+        self._table_name = table_name
+
+    @property
+    def _table(self) -> Any:
+        return _dynamo_table(self._table_name)
+
+    def upsert_oauth_connection(
+        self,
+        *,
+        user_id: str,
+        provider: str,
+        access_token: str,
+        token_type: str,
+        scope: str,
+        provider_user_id: str | None,
+        provider_user_login: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        existing = self.get_oauth_connection(user_id=user_id, provider=provider)
+        connection_id = (
+            existing.connection_id
+            if existing is not None
+            else f"{provider}_{uuid4().hex}"
+        )
+        now = _now()
+        item = {
+            "user_id": user_id,
+            "provider": provider,
+            "connection_id": connection_id,
+            "access_token": access_token,
+            "token_type": token_type,
+            "scope": scope,
+            "metadata_json": json.dumps(metadata if metadata is not None else {}),
+            "created_at": existing.created_at if existing is not None else now,
+            "updated_at": now,
+        }
+        if provider_user_id is not None:
+            item["provider_user_id"] = provider_user_id
+        if provider_user_login is not None:
+            item["provider_user_login"] = provider_user_login
+        self._table.put_item(Item=item)
+        return connection_id
+
+    def get_oauth_connection(
+        self, *, user_id: str, provider: str
+    ) -> OAuthConnectionRecord | None:
+        response = self._table.get_item(
+            Key={"user_id": user_id, "provider": provider},
+            ConsistentRead=True,
+        )
+        return _oauth_connection_from_item(response.get("Item"))
+
+    def get_oauth_connection_by_id(
+        self, connection_id: str
+    ) -> OAuthConnectionRecord | None:
+        from boto3.dynamodb.conditions import Key
+
+        response = self._table.query(
+            IndexName=self.CONNECTION_ID_INDEX,
+            KeyConditionExpression=Key("connection_id").eq(connection_id),
+            Limit=1,
+        )
+        items = response.get("Items", [])
+        return _oauth_connection_from_item(items[0] if items else None)
+
+    def get_oauth_connection_by_provider(
+        self, provider: str
+    ) -> OAuthConnectionRecord | None:
+        from boto3.dynamodb.conditions import Key
+
+        response = self._table.query(
+            IndexName=self.PROVIDER_INDEX,
+            KeyConditionExpression=Key("provider").eq(provider),
+            Limit=2,
+        )
+        items = response.get("Items", [])
+        if len(items) > 1:
+            raise ValueError(
+                f"Multiple OAuth connections found for provider: {provider}"
+            )
+        return _oauth_connection_from_item(items[0] if items else None)
+
+    def delete_oauth_connection(self, *, user_id: str, provider: str) -> None:
+        self._table.delete_item(Key={"user_id": user_id, "provider": provider})
+
+
+def _oauth_connection_from_item(
+    item: dict[str, Any] | None,
+) -> OAuthConnectionRecord | None:
+    if not item:
+        return None
+    return OAuthConnectionRecord(
+        connection_id=item["connection_id"],
+        user_id=item["user_id"],
+        provider=item["provider"],
+        access_token=item["access_token"],
+        token_type=item["token_type"],
+        scope=item.get("scope", ""),
+        provider_user_id=item.get("provider_user_id"),
+        provider_user_login=item.get("provider_user_login"),
+        metadata=json.loads(item.get("metadata_json") or "{}"),
+        created_at=item["created_at"],
+        updated_at=item["updated_at"],
+    )
 
 
 def app_store() -> AppStore:
