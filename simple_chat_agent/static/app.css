@@ -346,15 +346,22 @@
       white-space: nowrap;
     }
     .conversation-delete {
-      width: 44px;
-      min-height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      min-width: 36px;
+      height: 36px;
+      min-height: 36px;
       padding: 0;
+      border-color: transparent;
+      background: transparent;
       color: var(--color-text-tertiary);
-      font-size: var(--font-size-xs);
     }
     .conversation-delete:hover {
-      border-color: rgba(218, 54, 51, 0.68);
-      color: #ffb4af;
+      border-color: transparent;
+      background: var(--color-bg-hover);
+      color: var(--color-danger);
     }
     .conversation-item:hover,
     .tool-card:hover {
