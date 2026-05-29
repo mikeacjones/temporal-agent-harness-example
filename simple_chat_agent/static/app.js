@@ -444,11 +444,12 @@
       event.preventDefault();
       if (loginGoogleEl.getAttribute("aria-disabled") === "true") return;
       const href = loginGoogleEl.getAttribute("href");
-      // Hide the button and play the Ziggy "flying in" animation, then redirect.
+      // Hide the button and play the Ziggy "flying in" animation once, then
+      // redirect (6 frames x 90ms = 540ms + a brief hold on the last frame).
       loginGoogleEl.closest(".login-card").classList.add("logging-in");
       setTimeout(() => {
         window.location.href = href;
-      }, 1100);
+      }, 750);
     });
     inputEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
