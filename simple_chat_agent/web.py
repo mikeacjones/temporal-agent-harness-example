@@ -247,7 +247,9 @@ async def google_oauth_start(request: Request) -> RedirectResponse:
         provider=GOOGLE_PROVIDER,
     )
     redirect_uri = google_redirect_uri_from_base(str(request.base_url))
-    return RedirectResponse(google_authorize_url(state=state, redirect_uri=redirect_uri))
+    return RedirectResponse(
+        google_authorize_url(state=state, redirect_uri=redirect_uri)
+    )
 
 
 @app.get("/oauth/google/callback")
@@ -539,7 +541,9 @@ async def internal_stream(request: Request) -> dict[str, str]:
 @app.delete("/api/sessions/{workflow_id}")
 async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
     user = await _require_conversation_owner(request, workflow_id)
-    await (await _ensure_user_chats_workflow(user.user_id, user.username)).execute_update(
+    await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).execute_update(
         UserChatsWorkflow.delete_chat,
         workflow_id,
     )
@@ -558,9 +562,9 @@ async def tools(request: Request) -> dict[str, Any]:
         user_id=user.user_id,
         provider=GITHUB_PROVIDER,
     )
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.list_mcp_servers
-    )
+    mcp_servers = await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).query(UserChatsWorkflow.list_mcp_servers)
     return {
         "tools": [
             {
@@ -635,9 +639,9 @@ async def disconnect_github(request: Request) -> dict[str, str]:
 @app.get("/api/mcp-servers")
 async def list_mcp_servers(request: Request) -> dict[str, Any]:
     user = _current_user(request)
-    servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.list_mcp_servers
-    )
+    servers = await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).query(UserChatsWorkflow.list_mcp_servers)
     return {"servers": [asdict(server) for server in servers]}
 
 
@@ -1019,9 +1023,9 @@ async def _find_matching_mcp_server(
 ) -> HttpMcpServerConfig | None:
     normalized_url = server_url.strip().rstrip("/")
     candidate_urls = set(_mcp_server_url_candidates(normalized_url))
-    for server in await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.list_mcp_servers
-    ):
+    for server in await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).query(UserChatsWorkflow.list_mcp_servers):
         if server.tool_prefix != tool_prefix:
             continue
         server_urls = set(_mcp_server_url_candidates(server.server_url))
@@ -1195,9 +1199,7 @@ async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str
         yield chunk
 
 
-async def _file_event_stream(
-    workflow_id: str, request: Request
-) -> AsyncIterator[str]:
+async def _file_event_stream(workflow_id: str, request: Request) -> AsyncIterator[str]:
     path = stream_path(workflow_id)
     # Resume from where this EventSource left off (the browser replays its last
     # received id on auto-reconnect, e.g. after a backgrounded tab). Without
@@ -1427,9 +1429,9 @@ async def _update_user_workflows_tool_connections(
     user: AuthenticatedUser,
 ) -> None:
     github_connection_id = _github_connection_id_for_user(user)
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.list_mcp_servers
-    )
+    mcp_servers = await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).query(UserChatsWorkflow.list_mcp_servers)
     available_tool_names = tool_names_for_connections(
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
@@ -1471,9 +1473,9 @@ async def _upsert_user_mcp_server(
 
 
 async def _available_tool_names_for_user(user: AuthenticatedUser) -> list[str]:
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.list_mcp_servers
-    )
+    mcp_servers = await (
+        await _ensure_user_chats_workflow(user.user_id, user.username)
+    ).query(UserChatsWorkflow.list_mcp_servers)
     return tool_names_for_connections(
         github_connection_id=_github_connection_id_for_user(user),
         mcp_servers=mcp_servers,
@@ -1540,9 +1542,7 @@ def _artifact_response(
     try:
         content = _store().read_artifact_bytes(artifact)
     except Exception as err:
-        raise HTTPException(
-            status_code=404, detail="Artifact file not found"
-        ) from err
+        raise HTTPException(status_code=404, detail="Artifact file not found") from err
 
     return Response(
         content,
@@ -1623,7 +1623,7 @@ def _temporal_ui_url(*, namespace: str, workflow_id: str, run_id: str) -> str:
     if run_path:
         return (
             f"{base_url}/namespaces/{namespace_path}/workflows/"
-            f"{workflow_path}/{run_path}/history"
+            f"{workflow_path}/{run_path}/timeline"
         )
     return f"{base_url}/namespaces/{namespace_path}/workflows/{workflow_path}"
 
@@ -1690,8 +1690,6 @@ def _dedupe(values: list[str]) -> list[str]:
         seen.add(value)
         result.append(value)
     return result
-
-
 
 
 if __name__ == "__main__":
