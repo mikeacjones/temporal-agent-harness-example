@@ -1,6 +1,6 @@
-# Both Services select the same pod; the web Service targets the web
-# container's port (8000) and the codec Service targets the worker container's
-# in-process codec port (8001).
+# Each Service targets its own Deployment by the `component` label: the web
+# Service hits the web pods (8000), the codec Service hits the worker pods
+# (8001, the in-process codec server).
 apiVersion: v1
 kind: Service
 metadata:
@@ -12,6 +12,7 @@ spec:
   type: ClusterIP
   selector:
     app: agent-harness
+    component: web
   ports:
     - name: http
       port: 80
@@ -28,6 +29,7 @@ spec:
   type: ClusterIP
   selector:
     app: agent-harness
+    component: worker
   ports:
     - name: codec
       port: 80

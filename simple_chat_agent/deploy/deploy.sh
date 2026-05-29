@@ -19,7 +19,8 @@ REGION="us-west-1"
 ACCOUNT="429214323166"
 REPO="temporal-michaelj-agent-harness-demo"
 NAMESPACE="temporal-michaelj-agent-harness-demo"
-DEPLOYMENT="agent-harness"
+WEB_DEPLOYMENT="agent-harness-web"
+WORKER_DEPLOYMENT="agent-harness-worker"
 
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 IMAGE="${REGISTRY}/${REPO}"
@@ -41,11 +42,10 @@ docker buildx build --platform linux/amd64 \
   -t "${IMAGE}:latest" \
   --push .
 
-echo ">> Rolling out ${DEPLOYMENT} in ${NAMESPACE} to ${TAG}"
-kubectl set image "deployment/${DEPLOYMENT}" \
-  "web=${IMAGE}:${TAG}" \
-  "worker=${IMAGE}:${TAG}" \
-  -n "${NAMESPACE}"
-kubectl rollout status "deployment/${DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+echo ">> Rolling out web + worker in ${NAMESPACE} to ${TAG}"
+kubectl set image "deployment/${WEB_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl set image "deployment/${WORKER_DEPLOYMENT}" "worker=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl rollout status "deployment/${WEB_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+kubectl rollout status "deployment/${WORKER_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 
 echo ">> Done. Deployed ${IMAGE}:${TAG}"

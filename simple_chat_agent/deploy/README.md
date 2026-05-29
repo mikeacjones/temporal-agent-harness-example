@@ -1,19 +1,23 @@
 # Deploying simple_chat_agent
 
-Deploys the web app + Temporal worker (and in-process codec server) as a single
-pod into the `temporal-michaelj-agent-harness-demo` namespace on the `sa-demo`
-EKS cluster (`us-west-1`, account `429214323166`), fronted by Traefik on
-`*.tmprl-demo.cloud`.
+Deploys the web app and the Temporal worker (with its in-process codec server)
+as **two independent Deployments** into the `temporal-michaelj-agent-harness-demo`
+namespace on the `sa-demo` EKS cluster (`us-west-1`, account `429214323166`),
+fronted by Traefik on `*.tmprl-demo.cloud`.
 
 | Component | URL |
 |-----------|-----|
 | Web UI    | https://agent-harness-demo.tmprl-demo.cloud |
 | Codec     | https://codec.agent-harness-demo.tmprl-demo.cloud |
 
-The web, worker, and codec share local on-disk state (sqlite, the claim-check
-external-payload store, and stream files), so they run as two containers in one
-pod sharing `emptyDir` volumes. This is intentionally **single-replica** — do
-not scale it horizontally.
+All shared state is external (S3 claim-checks + artifacts, DynamoDB OAuth and
+artifact metadata, and a web-owned HTTP streaming API), so the web and worker
+no longer share a pod or any local volume:
+
+- `agent-harness-web` — UI + internal stream API. Single replica (owns the
+  in-memory stream buffer; scaling needs a shared backplane such as Redis).
+- `agent-harness-worker` — Temporal worker + codec. Horizontally scalable (bump
+  `replicas`); the codec reads claim-checks from S3, so any worker pod decodes.
 
 ## Build & push the image
 

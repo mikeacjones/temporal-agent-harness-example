@@ -1,22 +1,24 @@
-# Single pod with two containers (web + worker) for the simple_chat_agent.
+# Independent web and worker Deployments for the simple_chat_agent.
 #
-# The web and worker share local on-disk state, so they MUST run in the same
-# pod sharing volumes:
-#   - /app/.simple_chat_agent  : sqlite DB, artifacts, and the claim-check
-#                                external-payload store (written by the worker +
-#                                codec, read by the web).
-#   - /app/.simple_chat_streams: JSONL stream files (written by the worker,
-#                                read by the web).
+# All shared state is now external (S3 claim-checks + artifacts, DynamoDB
+# OAuth/artifact metadata, web-owned HTTP streaming), so the two no longer share
+# a pod or any local volume. Each container keeps a small emptyDir for SQLite
+# scratch (transient OAuth handshake state, etc.).
 #
-# Because that state is local (not shared storage), this Deployment stays at a
-# single replica with a Recreate strategy — do not scale it horizontally.
+# - web: serves the UI + the internal stream API; owns the in-memory stream
+#        buffer, so it stays at a single replica (scaling needs a shared
+#        backplane, e.g. Redis).
+# - worker: Temporal worker + in-process codec; horizontally scalable (the codec
+#           reads claim-checks from S3, so any worker pod can decode).
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: agent-harness
+  name: agent-harness-web
   namespace: temporal-michaelj-agent-harness-demo
   labels:
     app: agent-harness
+    component: web
 spec:
   replicas: 1
   strategy:
@@ -24,10 +26,12 @@ spec:
   selector:
     matchLabels:
       app: agent-harness
+      component: web
   template:
     metadata:
       labels:
         app: agent-harness
+        component: web
     spec:
       serviceAccountName: agent-harness
       containers:
@@ -53,33 +57,19 @@ spec:
             - secretRef:
                 name: agent-harness-secrets
           env:
-            # Durable, shared claim-check storage (survives pod restarts).
-            # When unset, the app falls back to the local on-disk store.
             - name: SIMPLE_CHAT_S3_BUCKET
               value: michaelj-agent-harness-claimcheck-429214323166
-            # Registered (Keyword) custom search attribute tagged with the
-            # creator's email at workflow start. Empty disables it.
             - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
               value: UserEmail
-            # Durable, shared OAuth token store (GitHub/MCP) — survives
-            # redeploys. When unset, the app uses local SQLite.
             - name: SIMPLE_CHAT_DYNAMODB_TABLE
               value: temporal-michaelj-agent-harness-demo-oauth
-            # Stream transport: the worker POSTs stream events to the web's
-            # internal API (which buffers + serves SSE). When unset, the worker
-            # writes local JSONL files (local dev). Auth via SIMPLE_CHAT_STREAM_TOKEN
-            # (in the secret); the web serves from its buffer when that token is set.
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-web
-            # Artifact metadata table (bytes go to the S3 bucket above under an
-            # artifacts/ prefix). When unset, artifacts use local disk + SQLite.
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
-            - name: chat-streams
-              mountPath: /app/.simple_chat_streams
           readinessProbe:
             tcpSocket:
               port: 8000
@@ -97,6 +87,32 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: chat-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-harness-worker
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness
+    component: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-harness
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: agent-harness
+        component: worker
+    spec:
+      serviceAccountName: agent-harness
+      containers:
         - name: worker
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
           imagePullPolicy: IfNotPresent
@@ -112,33 +128,19 @@ spec:
             - secretRef:
                 name: agent-harness-secrets
           env:
-            # Durable, shared claim-check storage (survives pod restarts).
-            # When unset, the app falls back to the local on-disk store.
             - name: SIMPLE_CHAT_S3_BUCKET
               value: michaelj-agent-harness-claimcheck-429214323166
-            # Registered (Keyword) custom search attribute tagged with the
-            # creator's email at workflow start. Empty disables it.
             - name: SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR
               value: UserEmail
-            # Durable, shared OAuth token store (GitHub/MCP) — survives
-            # redeploys. When unset, the app uses local SQLite.
             - name: SIMPLE_CHAT_DYNAMODB_TABLE
               value: temporal-michaelj-agent-harness-demo-oauth
-            # Stream transport: the worker POSTs stream events to the web's
-            # internal API (which buffers + serves SSE). When unset, the worker
-            # writes local JSONL files (local dev). Auth via SIMPLE_CHAT_STREAM_TOKEN
-            # (in the secret); the web serves from its buffer when that token is set.
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-web
-            # Artifact metadata table (bytes go to the S3 bucket above under an
-            # artifacts/ prefix). When unset, artifacts use local disk + SQLite.
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
-            - name: chat-streams
-              mountPath: /app/.simple_chat_streams
           readinessProbe:
             tcpSocket:
               port: 8001
@@ -158,6 +160,4 @@ spec:
               memory: 1Gi
       volumes:
         - name: chat-data
-          emptyDir: {}
-        - name: chat-streams
           emptyDir: {}
