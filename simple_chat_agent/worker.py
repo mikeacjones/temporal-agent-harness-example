@@ -27,7 +27,7 @@ from simple_chat_agent.codec_server import (
 from simple_chat_agent.env import load_dotenv
 from simple_chat_agent.external_storage import simple_chat_data_converter
 from simple_chat_agent.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
-from simple_chat_agent.streaming import JsonlStreamSink
+from simple_chat_agent.streaming import configured_stream_sink
 from simple_chat_agent.tools.subagent import SubagentWorkflow
 from simple_chat_agent.user_chats_workflow import UserChatsWorkflow
 from simple_chat_agent.workflow import SimpleChatWorkflow
@@ -35,7 +35,7 @@ from simple_chat_agent.workflow import SimpleChatWorkflow
 
 async def main() -> None:
     load_dotenv()
-    configure_stream_sink(JsonlStreamSink())
+    configure_stream_sink(configured_stream_sink())
     configure_mcp_auth_resolver(resolve_mcp_auth_headers)
     configure_mcp_http_auth_resolver(resolve_mcp_http_auth)
     data_converter = simple_chat_data_converter()

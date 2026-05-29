@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
@@ -179,6 +180,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.store = AppStore()
     app.state.mcp_oauth_flows = {}
+    # In-memory per-stream event buffers, used when streaming arrives over the
+    # web-owned HTTP API (deployment) instead of local files (local dev).
+    app.state.stream_buffers = {}
     yield
 
 
@@ -353,7 +357,7 @@ async def create_session(
             mcp_servers=mcp_servers,
         ),
     )
-    stream_path(conversation.workflow_id).unlink(missing_ok=True)
+    _clear_stream(conversation.workflow_id)
     return {
         "workflow_id": conversation.workflow_id,
         "run_id": conversation.run_id,
@@ -512,6 +516,20 @@ async def events(workflow_id: str, request: Request) -> StreamingResponse:
     )
 
 
+@app.post("/internal/stream")
+async def internal_stream(request: Request) -> dict[str, str]:
+    # Worker -> web: append a stream event to the in-memory per-stream buffer.
+    # Authenticated with a shared token (cluster-internal); not user-facing.
+    token = os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip()
+    if not token or request.headers.get("x-stream-token") != token:
+        raise HTTPException(status_code=401, detail="Invalid stream token.")
+    event = await request.json()
+    stream_id = event.get("stream_id")
+    if stream_id:
+        _append_stream_event(stream_id, event)
+    return {"status": "ok"}
+
+
 @app.delete("/api/sessions/{workflow_id}")
 async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
     user = await _require_conversation_owner(request, workflow_id)
@@ -523,7 +541,7 @@ async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
         user_id=user.user_id,
         workflow_id=workflow_id,
     )
-    stream_path(workflow_id).unlink(missing_ok=True)
+    _clear_stream(workflow_id)
     return {"status": "ok"}
 
 
@@ -1070,7 +1088,110 @@ def _walk_exception_tree(err: BaseException) -> list[BaseException]:
     return [err]
 
 
+def _stream_http_enabled() -> bool:
+    # When a shared stream token is configured, streaming arrives over the
+    # web-owned HTTP API and is served from the in-memory buffer. Otherwise
+    # (local dev) it is tailed from per-stream files on disk.
+    return bool(os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip())
+
+
+STREAM_BUFFER_TTL_SECONDS = 1800.0
+
+
+def _stream_buffers() -> dict[str, dict[str, Any]]:
+    buffers = getattr(app.state, "stream_buffers", None)
+    if buffers is None:
+        buffers = {}
+        app.state.stream_buffers = buffers
+    return buffers
+
+
+def _stream_buffer_events(stream_id: str) -> list[dict[str, Any]]:
+    entry = _stream_buffers().get(stream_id)
+    return entry["events"] if entry else []
+
+
+def _append_stream_event(stream_id: str, event: dict[str, Any]) -> None:
+    buffers = _stream_buffers()
+    entry = buffers.get(stream_id)
+    if entry is None:
+        entry = {"events": [], "updated": 0.0}
+        buffers[stream_id] = entry
+    entry["events"].append(event)
+    now = time.monotonic()
+    entry["updated"] = now
+    # Lazily evict whole streams that have gone idle, to bound memory.
+    for stale in [
+        sid
+        for sid, value in buffers.items()
+        if now - value["updated"] > STREAM_BUFFER_TTL_SECONDS
+    ]:
+        buffers.pop(stale, None)
+
+
+def _clear_stream(stream_id: str) -> None:
+    if _stream_http_enabled():
+        _stream_buffers().pop(stream_id, None)
+    else:
+        stream_path(stream_id).unlink(missing_ok=True)
+
+
+async def _poll_state(
+    workflow_id: str,
+    request: Request,
+    user: AuthenticatedUser,
+    last_state_json: str | None,
+) -> tuple[list[str], str | None, bool]:
+    """Query workflow state; return (sse chunks to emit, new last_state_json, stop)."""
+    try:
+        state = _state_to_dict(
+            await _query_state(workflow_id),
+            artifacts=_store().list_artifacts(
+                user_id=user.user_id,
+                workflow_id=workflow_id,
+            ),
+        )
+    except Exception as err:
+        if _is_temporal_not_found(err):
+            await _forget_conversation(user.user_id, workflow_id, user.username)
+            return (
+                [
+                    _sse(
+                        "missing",
+                        {
+                            "workflow_id": workflow_id,
+                            "message": "Workflow execution was not found.",
+                        },
+                    )
+                ],
+                last_state_json,
+                True,
+            )
+        return (
+            [_sse("error", {"message": f"{type(err).__name__}: {err}"})],
+            last_state_json,
+            False,
+        )
+
+    state_json = json.dumps(state, separators=(",", ":"))
+    if state_json != last_state_json:
+        return ([_sse("state", state)], state_json, False)
+    return ([], last_state_json, False)
+
+
 async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str]:
+    source = (
+        _buffer_event_stream(workflow_id, request)
+        if _stream_http_enabled()
+        else _file_event_stream(workflow_id, request)
+    )
+    async for chunk in source:
+        yield chunk
+
+
+async def _file_event_stream(
+    workflow_id: str, request: Request
+) -> AsyncIterator[str]:
     path = stream_path(workflow_id)
     # Resume from where this EventSource left off (the browser replays its last
     # received id on auto-reconnect, e.g. after a backgrounded tab). Without
@@ -1107,36 +1228,48 @@ async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str
         state_elapsed += STREAM_POLL_INTERVAL_SECONDS
         if state_elapsed >= STATE_POLL_INTERVAL_SECONDS:
             state_elapsed = 0
-            try:
-                state = _state_to_dict(
-                    await _query_state(workflow_id),
-                    artifacts=_store().list_artifacts(
-                        user_id=user.user_id,
-                        workflow_id=workflow_id,
-                    ),
-                )
-            except Exception as err:
-                if _is_temporal_not_found(err):
-                    user = _current_user(request)
-                    await _forget_conversation(user.user_id, workflow_id, user.username)
-                    yield _sse(
-                        "missing",
-                        {
-                            "workflow_id": workflow_id,
-                            "message": "Workflow execution was not found.",
-                        },
-                    )
-                    break
+            chunks, last_state_json, stop = await _poll_state(
+                workflow_id, request, user, last_state_json
+            )
+            for chunk in chunks:
+                yield chunk
+            if stop:
+                break
 
-                yield _sse(
-                    "error",
-                    {"message": f"{type(err).__name__}: {err}"},
-                )
-            else:
-                state_json = json.dumps(state, separators=(",", ":"))
-                if state_json != last_state_json:
-                    last_state_json = state_json
-                    yield _sse("state", state)
+        await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
+
+
+async def _buffer_event_stream(
+    workflow_id: str, request: Request
+) -> AsyncIterator[str]:
+    # Resume by buffer index (the browser replays its last received id).
+    resume = 0
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        with suppress(ValueError):
+            resume = max(0, int(last_event_id))
+    last_state_json: str | None = None
+    state_elapsed = STATE_POLL_INTERVAL_SECONDS
+    user = _current_user(request)
+
+    while not await request.is_disconnected():
+        events = _stream_buffer_events(workflow_id)
+        if resume > len(events):
+            resume = 0
+        for index in range(resume, len(events)):
+            yield _sse("stream", events[index], event_id=str(index + 1))
+        resume = len(events)
+
+        state_elapsed += STREAM_POLL_INTERVAL_SECONDS
+        if state_elapsed >= STATE_POLL_INTERVAL_SECONDS:
+            state_elapsed = 0
+            chunks, last_state_json, stop = await _poll_state(
+                workflow_id, request, user, last_state_json
+            )
+            for chunk in chunks:
+                yield chunk
+            if stop:
+                break
 
         await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
 
@@ -1200,7 +1333,7 @@ async def _forget_conversation(
         user_id=user_id,
         workflow_id=workflow_id,
     )
-    stream_path(workflow_id).unlink(missing_ok=True)
+    _clear_stream(workflow_id)
     # Purge the chat's offloaded payloads from external storage. Best-effort:
     # a purge failure must not block forgetting the conversation. No-op when
     # S3 storage is not configured (local dev).
