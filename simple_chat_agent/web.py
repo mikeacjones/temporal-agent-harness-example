@@ -43,12 +43,15 @@ from simple_chat_agent.auth import (
     SESSION_COOKIE,
     AuthenticatedUser,
     AuthError,
-    authenticate_user,
     create_session_token,
+    user_from_google_subject,
     user_from_session_token,
 )
 from simple_chat_agent.env import load_dotenv
-from simple_chat_agent.external_storage import simple_chat_data_converter
+from simple_chat_agent.external_storage import (
+    purge_workflow_payloads,
+    simple_chat_data_converter,
+)
 from simple_chat_agent.github_oauth import (
     GITHUB_PROVIDER,
     GitHubOAuthError,
@@ -57,6 +60,16 @@ from simple_chat_agent.github_oauth import (
     github_authorize_url,
     github_oauth_configured,
     github_scopes,
+)
+from simple_chat_agent.google_oauth import (
+    GOOGLE_PROVIDER,
+    GoogleOAuthError,
+    exchange_google_code,
+    google_allowed_domain,
+    google_authorize_url,
+    google_oauth_configured,
+    google_redirect_uri_from_base,
+    identity_from_id_token,
 )
 from simple_chat_agent.mcp_auth import (
     mcp_oauth_provider,
@@ -86,6 +99,7 @@ from simple_chat_agent.user_chats_workflow import (
     UserChatsInput,
     UserChatsWorkflow,
     user_chats_workflow_id,
+    user_email_search_attributes,
 )
 from simple_chat_agent.workflow import (
     DEFAULT_MAX_TOKENS,
@@ -119,11 +133,6 @@ class CreateSessionRequest(BaseModel):
     max_turns: int = 20
     thinking: ThinkingSessionRequest = Field(default_factory=ThinkingSessionRequest)
     initial_message: str | None = None
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
 
 
 class MessageRequest(BaseModel):
@@ -182,9 +191,15 @@ async def index() -> str:
 
 
 @app.get("/api/me")
-async def me(request: Request) -> dict[str, str]:
+async def me(request: Request) -> dict[str, Any]:
     user = _current_user(request)
-    return {"user_id": user.user_id, "username": user.username}
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        # Link to all of this user's workflows in the Temporal UI, filtered by
+        # the UserEmail search attribute. None when the attribute is disabled.
+        "temporal_ui_workflows_url": _temporal_ui_user_workflows_url(user.username),
+    }
 
 
 @app.get("/api/config")
@@ -204,16 +219,63 @@ async def config(request: Request) -> dict[str, Any]:
     }
 
 
-@app.post("/api/login")
-async def login(request: LoginRequest) -> Response:
-    user = authenticate_user(request.username, request.password)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+@app.get("/api/auth/google/configured")
+async def google_auth_configured() -> dict[str, Any]:
+    return {
+        "configured": google_oauth_configured(),
+        "allowed_domain": google_allowed_domain(),
+    }
 
-    response = Response(
-        content=json.dumps({"status": "ok", "username": user.username}),
-        media_type="application/json",
+
+@app.get("/oauth/google/start")
+async def google_oauth_start(request: Request) -> RedirectResponse:
+    if not google_oauth_configured():
+        raise HTTPException(status_code=400, detail="Google OAuth is not configured")
+
+    state = _store().create_oauth_state(
+        user_id="",
+        provider=GOOGLE_PROVIDER,
     )
+    redirect_uri = google_redirect_uri_from_base(str(request.base_url))
+    return RedirectResponse(google_authorize_url(state=state, redirect_uri=redirect_uri))
+
+
+@app.get("/oauth/google/callback")
+async def google_oauth_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+) -> RedirectResponse:
+    if error is not None:
+        return RedirectResponse(
+            f"/?oauth_error={quote(error_description or error, safe='')}"
+        )
+    if not code or not state:
+        return RedirectResponse("/?oauth_error=Missing%20Google%20OAuth%20callback")
+
+    consumed = _store().consume_oauth_state(
+        state=state,
+        provider=GOOGLE_PROVIDER,
+    )
+    if consumed is None:
+        return RedirectResponse("/?oauth_error=Invalid%20or%20expired%20OAuth%20state")
+
+    redirect_uri = google_redirect_uri_from_base(str(request.base_url))
+    try:
+        token_payload = await asyncio.to_thread(
+            exchange_google_code, code, redirect_uri=redirect_uri
+        )
+        id_token = token_payload.get("id_token")
+        if not isinstance(id_token, str):
+            raise GoogleOAuthError("Google did not return an ID token.")
+        identity = identity_from_id_token(id_token)
+    except GoogleOAuthError as err:
+        return RedirectResponse(f"/?oauth_error={quote(str(err), safe='')}")
+
+    user = user_from_google_subject(subject=identity.subject, email=identity.email)
+    response = RedirectResponse("/")
     response.set_cookie(
         SESSION_COOKIE,
         create_session_token(user),
@@ -237,7 +299,7 @@ async def logout() -> Response:
 @app.get("/api/conversations")
 async def conversations(request: Request) -> dict[str, Any]:
     user = _current_user(request)
-    conversations = await _list_user_chats(user.user_id)
+    conversations = await _list_user_chats(user.user_id, user.username)
     return {
         "conversations": [
             {
@@ -267,7 +329,7 @@ async def create_session(
     github_connection_id = (
         github_connection.connection_id if github_connection is not None else None
     )
-    registry = await _ensure_user_chats_workflow(user.user_id)
+    registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
     model = session_request.model or _default_model()
     conversation = await registry.execute_update(
@@ -311,7 +373,7 @@ async def get_state(request: Request, workflow_id: str) -> dict[str, Any]:
     except Exception as err:
         if not _is_temporal_not_found(err):
             raise
-        await _forget_conversation(user.user_id, workflow_id)
+        await _forget_conversation(user.user_id, workflow_id, user.username)
         raise HTTPException(
             status_code=404,
             detail="Workflow execution not found. Start a new chat.",
@@ -342,6 +404,7 @@ async def chat(
         user.user_id,
         workflow_id,
         title=_conversation_title(request.message),
+        user_email=user.username,
     )
     return {"status": "ok"}
 
@@ -359,7 +422,7 @@ async def steer(
         SimpleChatWorkflow.steer,
         args=[request.message, request.mode],
     )
-    await _touch_conversation(user.user_id, workflow_id)
+    await _touch_conversation(user.user_id, workflow_id, user_email=user.username)
     return {"status": "ok"}
 
 
@@ -376,7 +439,7 @@ async def interrupt(
         SimpleChatWorkflow.interrupt,
         request.message,
     )
-    await _touch_conversation(user.user_id, workflow_id)
+    await _touch_conversation(user.user_id, workflow_id, user_email=user.username)
     return {"status": "ok"}
 
 
@@ -394,7 +457,7 @@ async def resolve_approval(
         SimpleChatWorkflow.resolve_approval,
         args=[approval_id, request.decision],
     )
-    await _touch_conversation(user.user_id, workflow_id)
+    await _touch_conversation(user.user_id, workflow_id, user_email=user.username)
     return {"status": "ok"}
 
 
@@ -452,7 +515,7 @@ async def events(workflow_id: str, request: Request) -> StreamingResponse:
 @app.delete("/api/sessions/{workflow_id}")
 async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
     user = await _require_conversation_owner(request, workflow_id)
-    await (await _ensure_user_chats_workflow(user.user_id)).execute_update(
+    await (await _ensure_user_chats_workflow(user.user_id, user.username)).execute_update(
         UserChatsWorkflow.delete_chat,
         workflow_id,
     )
@@ -471,7 +534,7 @@ async def tools(request: Request) -> dict[str, Any]:
         user_id=user.user_id,
         provider=GITHUB_PROVIDER,
     )
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id)).query(
+    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.list_mcp_servers
     )
     return {
@@ -548,7 +611,7 @@ async def disconnect_github(request: Request) -> dict[str, str]:
 @app.get("/api/mcp-servers")
 async def list_mcp_servers(request: Request) -> dict[str, Any]:
     user = _current_user(request)
-    servers = await (await _ensure_user_chats_workflow(user.user_id)).query(
+    servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.list_mcp_servers
     )
     return {"servers": [asdict(server) for server in servers]}
@@ -632,7 +695,7 @@ async def set_mcp_server_enabled(
     update: McpServerEnabledRequest,
 ) -> dict[str, Any]:
     user = _current_user(request)
-    registry = await _ensure_user_chats_workflow(user.user_id)
+    registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
     existing = next(
         (server for server in servers if server.server_id == server_id),
@@ -649,7 +712,7 @@ async def set_mcp_server_enabled(
 @app.delete("/api/mcp-servers/{server_id}")
 async def delete_mcp_server(request: Request, server_id: str) -> dict[str, str]:
     user = _current_user(request)
-    registry = await _ensure_user_chats_workflow(user.user_id)
+    registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     remaining_servers = [
         server
         for server in await registry.query(UserChatsWorkflow.list_mcp_servers)
@@ -932,7 +995,7 @@ async def _find_matching_mcp_server(
 ) -> HttpMcpServerConfig | None:
     normalized_url = server_url.strip().rstrip("/")
     candidate_urls = set(_mcp_server_url_candidates(normalized_url))
-    for server in await (await _ensure_user_chats_workflow(user.user_id)).query(
+    for server in await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.list_mcp_servers
     ):
         if server.tool_prefix != tool_prefix:
@@ -1009,21 +1072,37 @@ def _walk_exception_tree(err: BaseException) -> list[BaseException]:
 
 async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str]:
     path = stream_path(workflow_id)
+    # Resume from where this EventSource left off (the browser replays its last
+    # received id on auto-reconnect, e.g. after a backgrounded tab). Without
+    # this the whole stream file is re-sent on every reconnect, which duplicates
+    # already-finalized turns in the UI.
     offset = 0
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        with suppress(ValueError):
+            offset = max(0, int(last_event_id))
+    # Guard against a stale/oversized cursor (e.g. the stream file was reset).
+    if path.exists() and offset > path.stat().st_size:
+        offset = 0
     last_state_json: str | None = None
     state_elapsed = STATE_POLL_INTERVAL_SECONDS
     user = _current_user(request)
 
     while not await request.is_disconnected():
         if path.exists():
+            new_lines: list[tuple[str, int]] = []
             with path.open("r", encoding="utf-8") as stream:
                 stream.seek(offset)
-                lines = stream.readlines()
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        break
+                    new_lines.append((line, stream.tell()))
                 offset = stream.tell()
 
-            for line in lines:
+            for line, position in new_lines:
                 with suppress(json.JSONDecodeError):
-                    yield _sse("stream", json.loads(line))
+                    yield _sse("stream", json.loads(line), event_id=str(position))
 
         state_elapsed += STREAM_POLL_INTERVAL_SECONDS
         if state_elapsed >= STATE_POLL_INTERVAL_SECONDS:
@@ -1039,7 +1118,7 @@ async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str
             except Exception as err:
                 if _is_temporal_not_found(err):
                     user = _current_user(request)
-                    await _forget_conversation(user.user_id, workflow_id)
+                    await _forget_conversation(user.user_id, workflow_id, user.username)
                     yield _sse(
                         "missing",
                         {
@@ -1085,15 +1164,15 @@ async def _signal_workflow(
             raise
 
         user = _current_user(request)
-        await _forget_conversation(user.user_id, workflow_id)
+        await _forget_conversation(user.user_id, workflow_id, user.username)
         raise HTTPException(
             status_code=404,
             detail="Workflow execution not found. Start a new chat.",
         ) from err
 
 
-async def _list_user_chats(user_id: str) -> list[ChatRecord]:
-    handle = await _ensure_user_chats_workflow(user_id)
+async def _list_user_chats(user_id: str, user_email: str = "") -> list[ChatRecord]:
+    handle = await _ensure_user_chats_workflow(user_id, user_email)
     return await handle.query(UserChatsWorkflow.list_chats)
 
 
@@ -1102,15 +1181,18 @@ async def _touch_conversation(
     workflow_id: str,
     *,
     title: str | None = None,
+    user_email: str = "",
 ) -> None:
-    await (await _ensure_user_chats_workflow(user_id)).execute_update(
+    await (await _ensure_user_chats_workflow(user_id, user_email)).execute_update(
         UserChatsWorkflow.touch_chat,
         TouchChatRequest(workflow_id=workflow_id, title=title),
     )
 
 
-async def _forget_conversation(user_id: str, workflow_id: str) -> None:
-    await (await _ensure_user_chats_workflow(user_id)).execute_update(
+async def _forget_conversation(
+    user_id: str, workflow_id: str, user_email: str = ""
+) -> None:
+    await (await _ensure_user_chats_workflow(user_id, user_email)).execute_update(
         UserChatsWorkflow.forget_chat,
         workflow_id,
     )
@@ -1119,6 +1201,17 @@ async def _forget_conversation(user_id: str, workflow_id: str) -> None:
         workflow_id=workflow_id,
     )
     stream_path(workflow_id).unlink(missing_ok=True)
+    # Purge the chat's offloaded payloads from external storage. Best-effort:
+    # a purge failure must not block forgetting the conversation. No-op when
+    # S3 storage is not configured (local dev).
+    try:
+        await asyncio.to_thread(
+            purge_workflow_payloads,
+            namespace=_client().namespace,
+            workflow_id=workflow_id,
+        )
+    except Exception as err:  # noqa: BLE001 - cleanup is best-effort
+        print(f"Failed to purge external payloads for {workflow_id}: {err!r}")
 
 
 def _is_temporal_not_found(err: BaseException) -> bool:
@@ -1129,15 +1222,28 @@ def _handle(workflow_id: str) -> Any:
     return _client().get_workflow_handle(workflow_id)
 
 
-async def _ensure_user_chats_workflow(user_id: str) -> Any:
+def _user_email_sa_name() -> str:
+    return os.environ.get("SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR", "").strip()
+
+
+async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any:
     workflow_id = user_chats_workflow_id(user_id)
+    search_attr_name = _user_email_sa_name()
     return await _client().start_workflow(
         UserChatsWorkflow.run,
-        UserChatsInput(user_id=user_id),
+        UserChatsInput(
+            user_id=user_id,
+            user_email=user_email,
+            search_attr_name=search_attr_name,
+        ),
         id=workflow_id,
         task_queue=TASK_QUEUE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         static_summary="simple chat user registry",
+        search_attributes=user_email_search_attributes(
+            search_attr_name=search_attr_name,
+            user_email=user_email,
+        ),
     )
 
 
@@ -1170,7 +1276,7 @@ async def _require_conversation_owner(
     workflow_id: str,
 ) -> AuthenticatedUser:
     user = _current_user(request)
-    if not await (await _ensure_user_chats_workflow(user.user_id)).query(
+    if not await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.has_chat,
         workflow_id,
     ):
@@ -1182,7 +1288,7 @@ async def _update_user_workflows_tool_connections(
     user: AuthenticatedUser,
 ) -> None:
     github_connection_id = _github_connection_id_for_user(user)
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id)).query(
+    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.list_mcp_servers
     )
     available_tool_names = tool_names_for_connections(
@@ -1190,7 +1296,7 @@ async def _update_user_workflows_tool_connections(
         mcp_servers=mcp_servers,
     )
 
-    for conversation in await _list_user_chats(user.user_id):
+    for conversation in await _list_user_chats(user.user_id, user.username):
         with suppress(Exception):
             await _handle(conversation.workflow_id).signal(
                 SimpleChatWorkflow.update_tool_connections,
@@ -1202,7 +1308,7 @@ async def _upsert_user_mcp_server(
     user: AuthenticatedUser,
     server: HttpMcpServerConfig,
 ) -> None:
-    registry = await _ensure_user_chats_workflow(user.user_id)
+    registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     await registry.execute_update(
         UserChatsWorkflow.upsert_mcp_server,
         UpdateMcpServerRequest(
@@ -1226,7 +1332,7 @@ async def _upsert_user_mcp_server(
 
 
 async def _available_tool_names_for_user(user: AuthenticatedUser) -> list[str]:
-    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id)).query(
+    mcp_servers = await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
         UserChatsWorkflow.list_mcp_servers
     )
     return tool_names_for_connections(
@@ -1327,12 +1433,44 @@ def _safe_inline_media_type(mime_type: str) -> str:
     return "text/plain; charset=utf-8"
 
 
-def _sse(event: str, data: Any) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+def _sse(event: str, data: Any, *, event_id: str | None = None) -> str:
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{prefix}event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _temporal_ui_base_url() -> str:
+    # Explicit override always wins.
+    explicit = os.environ.get("TEMPORAL_UI_URL")
+    if explicit:
+        return explicit
+    # Otherwise derive from the environment: a Temporal Cloud endpoint maps to
+    # the Cloud Web UI; anything else falls back to the local dev server.
+    endpoint = os.environ.get("TEMPORAL_ENDPOINT", "")
+    if "tmprl.cloud" in endpoint:
+        return "https://cloud.temporal.io"
+    return "http://localhost:8233"
+
+
+def _temporal_ui_user_workflows_url(email: str) -> str | None:
+    """Temporal UI workflow-list URL filtered by the UserEmail search attribute.
+
+    Returns None when the search attribute is not configured.
+    """
+    search_attr_name = _user_email_sa_name()
+    if not search_attr_name or not email:
+        return None
+    try:
+        namespace = _client().namespace
+    except HTTPException:
+        return None
+    base_url = _temporal_ui_base_url().rstrip("/")
+    namespace_path = quote(namespace, safe="")
+    query = quote(f'{search_attr_name} = "{email}"', safe="")
+    return f"{base_url}/namespaces/{namespace_path}/workflows?query={query}"
 
 
 def _temporal_ui_url(*, namespace: str, workflow_id: str, run_id: str) -> str:
-    base_url = os.environ.get("TEMPORAL_UI_URL", "http://localhost:8233").rstrip("/")
+    base_url = _temporal_ui_base_url().rstrip("/")
     namespace_path = quote(namespace, safe="")
     workflow_path = quote(workflow_id, safe="")
     run_path = quote(run_id, safe="")
@@ -1534,6 +1672,27 @@ INDEX_HTML = r"""
       color: var(--color-danger-hover);
       font-size: var(--font-size-sm);
     }
+    .login-subtitle {
+      margin-bottom: var(--space-md);
+      color: var(--color-text-secondary);
+      font-size: var(--font-size-sm);
+    }
+    .login-subtitle:empty {
+      display: none;
+    }
+    .login-google {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 40px;
+      border-radius: var(--radius-md);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .login-google[aria-disabled="true"] {
+      opacity: 0.6;
+      pointer-events: none;
+    }
     .app {
       display: grid;
       grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--details-width);
@@ -1559,19 +1718,6 @@ INDEX_HTML = r"""
       padding: var(--space-md);
       border-bottom: 1px solid var(--color-border);
     }
-    .header-left::after {
-      content: "Harness";
-      display: flex;
-      align-items: center;
-      min-height: 36px;
-      margin-top: var(--space-xs);
-      padding: var(--space-sm) var(--space-md);
-      border-radius: var(--radius-md);
-      background: var(--color-bg-active);
-      color: var(--color-text-link);
-      font-size: var(--font-size-sm);
-      font-weight: 500;
-    }
     h1 {
       display: flex;
       align-items: center;
@@ -1585,10 +1731,8 @@ INDEX_HTML = r"""
       content: "";
       width: 32px;
       height: 32px;
-      border-radius: var(--radius-md);
-      background:
-        linear-gradient(135deg, rgba(35, 134, 54, 0.95), rgba(63, 185, 80, 0.72));
-      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+      /* Official Temporal symbol mark (temporal.io brand assets). */
+      background: url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDI0LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPgo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkxheWVyXzMiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4IgoJIHZpZXdCb3g9IjAgMCAxMjAwIDEyMDAiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDEyMDAgMTIwMDsiIHhtbDpzcGFjZT0icHJlc2VydmUiPgo8c3R5bGUgdHlwZT0idGV4dC9jc3MiPgoJLnN0MHtmaWxsOiNGMkYyRjI7fQo8L3N0eWxlPgo8cGF0aCBjbGFzcz0ic3QwIiBkPSJNNjUxLjE0LDUxNy4zNUM2NDIuMDIsNDQ5LjAzLDYxOC45NCwzOTIsNTgzLjQ5LDM5MnMtNTguNTMsNTcuMDMtNjcuNjUsMTI1LjM1CgljLTY4LjMyLDkuMTItMTI1LjM1LDMyLjItMTI1LjM1LDY3LjY1czU3LjA0LDU4LjUzLDEyNS4zNSw2Ny42NWM5LjEyLDY4LjMxLDMyLjIsMTI1LjM1LDY3LjY1LDEyNS4zNXM1OC41My01Ny4wNCw2Ny42NS0xMjUuMzUKCWM2OC4zMi05LjEyLDEyNS4zNS0zMi4yLDEyNS4zNS02Ny42NVM3MTkuNDUsNTI2LjQ3LDY1MS4xNCw1MTcuMzV6IE01MTMuNjEsNjMyLjc1Yy02NS40My05LjQ1LTEwMy41OS0zMS4wOC0xMDMuNTktNDcuNzUKCXMzOC4xNi0zOC4zLDEwMy41OS00Ny43NWMtMS40NCwxNS43NS0yLjE5LDMxLjgzLTIuMTksNDcuNzVDNTExLjQyLDYwMC45Miw1MTIuMTcsNjE3LjAxLDUxMy42MSw2MzIuNzV6IE01ODMuNDksNDExLjUzCgljMTYuNjcsMCwzOC4zLDM4LjE2LDQ3Ljc1LDEwMy41OWMtMTUuNzQtMS40NC0zMS44My0yLjE5LTQ3Ljc1LTIuMTlzLTMyLjAxLDAuNzUtNDcuNzUsMi4xOQoJQzU0NS4xOSw0NDkuNjksNTY2LjgyLDQxMS41Myw1ODMuNDksNDExLjUzeiBNNjUzLjM3LDYzMi43NWMtMy4yMiwwLjQ3LTE2LjQzLDIuMDItMTkuNzcsMi4zNWMtMC4zMywzLjM1LTEuODksMTYuNTUtMi4zNSwxOS43NwoJYy05LjQ1LDY1LjQzLTMxLjA4LDEwMy41OS00Ny43NSwxMDMuNTlzLTM4LjMtMzguMTYtNDcuNzUtMTAzLjU5Yy0wLjQ2LTMuMjItMi4wMi0xNi40My0yLjM1LTE5Ljc3CgljLTEuNTItMTUuNTEtMi40NC0zMi4xNy0yLjQ0LTUwLjFzMC45Mi0zNC41OSwyLjQ0LTUwLjExYzE1LjUxLTEuNTIsMzIuMTctMi40NCw1MC4xLTIuNDRzMzQuNTksMC45Miw1MC4xLDIuNDQKCWMzLjM1LDAuMzMsMTYuNTUsMS44OSwxOS43NywyLjM1YzY1LjQzLDkuNDUsMTAzLjYsMzEuMDksMTAzLjYsNDcuNzVTNzE4LjgsNjIzLjMsNjUzLjM3LDYzMi43NXoiLz4KPC9zdmc+Cg==") center / contain no-repeat;
       flex: 0 0 auto;
     }
     .temporal-link {
@@ -1606,6 +1750,18 @@ INDEX_HTML = r"""
       white-space: nowrap;
       background: var(--color-bg-tertiary);
       transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+    }
+    .chat-footer {
+      display: flex;
+      justify-content: flex-end;
+      padding: var(--space-xs) var(--space-md) 0;
+    }
+    .chat-footer .temporal-link {
+      display: inline-flex;
+      min-height: 28px;
+      padding: var(--space-xs) var(--space-sm);
+      font-size: var(--font-size-xs);
+      color: var(--color-text-secondary);
     }
     .temporal-link:hover {
       border-color: var(--color-text-tertiary);
@@ -2723,7 +2879,6 @@ INDEX_HTML = r"""
         padding: 0;
         border-bottom: 0;
       }
-      .header-left::after { display: none; }
       .side-panel { display: none; }
       h1 { font-size: var(--font-size-md); }
       h1::before {
@@ -2780,18 +2935,11 @@ INDEX_HTML = r"""
   <section class="login-screen" id="loginScreen" hidden>
     <div class="login-card">
       <h1>Simple Chat Agent</h1>
-      <form class="login-form" id="loginForm">
-        <div class="login-field">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" required value="demo" />
-        </div>
-        <div class="login-field">
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required />
-        </div>
-        <button class="primary" type="submit">Login</button>
+      <p class="login-subtitle" id="loginSubtitle"></p>
+      <div class="login-form">
+        <a class="primary login-google" id="loginGoogle" href="/oauth/google/start">Sign in with Google</a>
         <p class="login-error" id="loginError"></p>
-      </form>
+      </div>
     </div>
   </section>
   <div class="app" id="appRoot" hidden>
@@ -2846,6 +2994,9 @@ INDEX_HTML = r"""
       </aside>
     </main>
     <aside class="artifacts-sidebar" id="artifactsSidebar"></aside>
+    <div class="chat-footer" id="chatFooter" hidden>
+      <a class="temporal-link" id="chatWorkflowLink" href="#" target="_blank" rel="noreferrer">Workflow timeline ↗</a>
+    </div>
     <form class="composer" id="composer">
       <textarea id="message" placeholder="Type to chat. While responding, Send becomes steering."></textarea>
       <button class="primary" type="submit">Send</button>
@@ -2912,7 +3063,8 @@ INDEX_HTML = r"""
 
     const appRootEl = document.getElementById("appRoot");
     const loginScreenEl = document.getElementById("loginScreen");
-    const loginFormEl = document.getElementById("loginForm");
+    const loginGoogleEl = document.getElementById("loginGoogle");
+    const loginSubtitleEl = document.getElementById("loginSubtitle");
     const loginErrorEl = document.getElementById("loginError");
     const conversationListEl = document.getElementById("conversationList");
     const toolsOverlayEl = document.getElementById("toolsOverlay");
@@ -2923,6 +3075,8 @@ INDEX_HTML = r"""
     const eventsEl = document.getElementById("events");
     const statusEl = document.getElementById("status");
     const temporalLinkEl = document.getElementById("temporalLink");
+    const chatFooterEl = document.getElementById("chatFooter");
+    const chatWorkflowLinkEl = document.getElementById("chatWorkflowLink");
     const inputEl = document.getElementById("message");
     const formEl = document.getElementById("composer");
     const modelSelectEl = document.getElementById("modelSelect");
@@ -2962,13 +3116,53 @@ INDEX_HTML = r"""
       if (response.status === 401) return false;
       if (!response.ok) throw new Error(await response.text());
       state.user = await response.json();
+      applyUserTemporalLink();
       return true;
+    }
+
+    // The header "Temporal UI" link points at all of the signed-in user's
+    // workflows (filtered by the UserEmail search attribute). The per-chat link
+    // (bottom of the chat pane) points at the specific chat workflow.
+    function applyUserTemporalLink() {
+      const url = state.user?.temporal_ui_workflows_url;
+      if (url) {
+        temporalLinkEl.href = url;
+        temporalLinkEl.style.display = "inline-flex";
+      } else {
+        temporalLinkEl.removeAttribute("href");
+        temporalLinkEl.style.display = "none";
+      }
     }
 
     function showLogin() {
       appRootEl.hidden = true;
       loginScreenEl.hidden = false;
       if (state.eventSource) state.eventSource.close();
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("oauth_error")) {
+        loginErrorEl.textContent = params.get("oauth_error");
+        history.replaceState({}, "", "/");
+      } else {
+        loginErrorEl.textContent = "";
+      }
+      configureLoginButton();
+    }
+
+    async function configureLoginButton() {
+      try {
+        const response = await fetch("/api/auth/google/configured");
+        if (!response.ok) throw new Error(await response.text());
+        const body = await response.json();
+        if (!body.configured) {
+          loginGoogleEl.setAttribute("aria-disabled", "true");
+          loginSubtitleEl.textContent = "Google OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET.";
+          return;
+        }
+        loginGoogleEl.removeAttribute("aria-disabled");
+        loginSubtitleEl.textContent = "";
+      } catch (err) {
+        loginSubtitleEl.textContent = `Could not check auth config: ${err}`;
+      }
     }
 
     function showApp() {
@@ -3128,8 +3322,8 @@ INDEX_HTML = r"""
       state.draftConversation = true;
       closeArtifactViewer();
       localStorage.removeItem("simpleChatWorkflowId");
-      temporalLinkEl.removeAttribute("href");
-      temporalLinkEl.style.display = "none";
+      chatFooterEl.hidden = true;
+      chatWorkflowLinkEl.removeAttribute("href");
       renderSidebar();
       render();
     }
@@ -3172,8 +3366,12 @@ INDEX_HTML = r"""
       }
       closeArtifactViewer();
       localStorage.setItem("simpleChatWorkflowId", state.workflowId);
-      temporalLinkEl.href = state.temporalUiUrl;
-      temporalLinkEl.style.display = "inline-flex";
+      if (state.temporalUiUrl) {
+        chatWorkflowLinkEl.href = state.temporalUiUrl;
+        chatFooterEl.hidden = false;
+      } else {
+        chatFooterEl.hidden = true;
+      }
       renderSidebar();
       render();
       connectEvents();
@@ -3197,20 +3395,6 @@ INDEX_HTML = r"""
       });
     }
 
-    loginFormEl.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      loginErrorEl.textContent = "";
-      const form = new FormData(loginFormEl);
-      try {
-        await post("/api/login", {
-          username: String(form.get("username") || ""),
-          password: String(form.get("password") || ""),
-        });
-        await boot();
-      } catch (err) {
-        loginErrorEl.textContent = String(err);
-      }
-    });
     document.getElementById("newChat").addEventListener("click", () => startDraftConversation());
     modelSelectEl.addEventListener("change", () => {
       state.agentSettings.model = modelSelectEl.value;
@@ -5244,4 +5428,11 @@ INDEX_HTML = r"""
 
 
 if __name__ == "__main__":
-    uvicorn.run("simple_chat_agent.web:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(
+        "simple_chat_agent.web:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"),
+    )
