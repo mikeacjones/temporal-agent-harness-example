@@ -117,6 +117,7 @@ from simple_chat_agent.worker.workflow import (
     SimpleChatSnapshot,
     SimpleChatState,
     SimpleChatWorkflow,
+    TranscriptDeltaResult,
     TranscriptPage,
 )
 
@@ -493,6 +494,42 @@ async def get_messages(
     response.headers["X-Transcript-Start"] = str(body["start"])
     response.headers["X-Transcript-End"] = str(body["end"])
     response.headers["X-Transcript-Total"] = str(body["total"])
+    return body
+
+
+@app.get("/api/sessions/{workflow_id}/messages/deltas")
+async def get_message_deltas(
+    request: Request,
+    workflow_id: str,
+    response: Response,
+    after_revision: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    timings: list[tuple[str, float]] = []
+    started = time.perf_counter()
+    user = await _require_conversation_owner(request, workflow_id)
+    _record_timing(timings, "owner", started)
+    response.headers["Cache-Control"] = "no-store"
+
+    query_started = time.perf_counter()
+    try:
+        result = await _query_transcript_deltas_since(
+            workflow_id,
+            after_revision=after_revision,
+        )
+    except Exception as err:
+        if not _is_temporal_not_found(err):
+            raise
+        await _forget_conversation(user.user_id, workflow_id, user.username)
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow execution not found. Start a new chat.",
+        ) from err
+    _record_timing(timings, "temporal", query_started)
+
+    body = _transcript_delta_result_to_dict(result)
+    response.headers["Server-Timing"] = _server_timing(timings)
+    response.headers["X-Transcript-Revision"] = str(body["to_revision"])
+    response.headers["X-Transcript-Total"] = str(body["transcript_length"])
     return body
 
 
@@ -1454,6 +1491,17 @@ async def _query_transcript_page(
     )
 
 
+async def _query_transcript_deltas_since(
+    workflow_id: str,
+    *,
+    after_revision: int,
+) -> TranscriptDeltaResult:
+    return await _handle(workflow_id).query(
+        SimpleChatWorkflow.transcript_deltas_since,
+        after_revision,
+    )
+
+
 async def _signal_workflow(
     request: Request,
     workflow_id: str,
@@ -1713,6 +1761,31 @@ def _transcript_page_to_dict(page: TranscriptPage) -> dict[str, Any]:
         "total": page.total,
         "revision": page.transcript_revision,
         "has_more_before": page.start > 0,
+    }
+
+
+def _transcript_delta_result_to_dict(result: TranscriptDeltaResult) -> dict[str, Any]:
+    return {
+        "from_revision": result.from_revision,
+        "to_revision": result.to_revision,
+        "needs_snapshot": result.needs_snapshot,
+        "transcript_length": result.transcript_length,
+        "status": result.status,
+        "pending_messages": result.pending_messages,
+        "active_message_index": result.active_message_index,
+        "state_revision": result.state_revision,
+        "deltas": [
+            {
+                "revision": delta.revision,
+                "index": delta.index,
+                "message": (
+                    asdict(delta.message)
+                    if is_dataclass(delta.message)
+                    else dict(delta.message)
+                ),
+            }
+            for delta in result.deltas
+        ],
     }
 
 

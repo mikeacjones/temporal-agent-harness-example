@@ -27,12 +27,33 @@ with workflow.unsafe.imports_passed_through():
 
 ChatRole = Literal["user", "assistant", "system"]
 DEFAULT_MAX_TOKENS = 64_000
+TRANSCRIPT_DELTA_BUFFER_LIMIT = 80
 
 
 @dataclass
 class ChatMessage:
     role: ChatRole
     content: str
+
+
+@dataclass
+class TranscriptDelta:
+    revision: int
+    index: int
+    message: ChatMessage
+
+
+@dataclass
+class TranscriptDeltaResult:
+    from_revision: int
+    to_revision: int
+    deltas: list[TranscriptDelta]
+    needs_snapshot: bool = False
+    transcript_length: int = 0
+    status: str = "idle"
+    pending_messages: int = 0
+    active_message_index: int | None = None
+    state_revision: int = 0
 
 
 @dataclass
@@ -74,6 +95,7 @@ class SimpleChatInput:
     good_place_censor: bool = False
     state_revision: int = 0
     transcript_revision: int = 0
+    transcript_deltas: list[TranscriptDelta] = field(default_factory=list)
 
 
 @dataclass
@@ -134,11 +156,12 @@ class SimpleChatWorkflow:
         self._stream_id: str | None = None
         self._state_revision = 0
         self._transcript_revision = 0
+        self._transcript_deltas: list[TranscriptDelta] = []
 
     @workflow.signal
     async def chat(self, message: str) -> None:
-        self._enqueue_chat(message)
-        self._record_transcript_change()
+        transcript_index = self._enqueue_chat(message)
+        self._record_transcript_change(transcript_index)
         self._record_state_change()
 
     @workflow.signal
@@ -151,7 +174,7 @@ class SimpleChatWorkflow:
             self._transcript.append(
                 ChatMessage(role="system", content=f"Unknown steering mode: {mode}")
             )
-            self._record_transcript_change()
+            self._record_transcript_change(len(self._transcript) - 1)
             return
 
         if self._agent is None:
@@ -161,7 +184,7 @@ class SimpleChatWorkflow:
                     content="Agent is not ready yet; steering was ignored.",
                 )
             )
-            self._record_transcript_change()
+            self._record_transcript_change(len(self._transcript) - 1)
             return
 
         self._agent.steer(message, mode=cast(SteeringMode, mode))
@@ -176,13 +199,13 @@ class SimpleChatWorkflow:
                 content=f"Steering queued {label}: {message}",
             )
         )
-        self._record_transcript_change()
+        self._record_transcript_change(len(self._transcript) - 1)
 
     @workflow.signal
     async def interrupt(self, message: str) -> None:
         if self._agent is None or self._status != "responding":
-            self._enqueue_chat(message)
-            self._record_transcript_change()
+            transcript_index = self._enqueue_chat(message)
+            self._record_transcript_change(transcript_index)
             self._record_state_change()
             return
 
@@ -193,7 +216,7 @@ class SimpleChatWorkflow:
                 content=f"Interrupt sent; Claude will continue with: {message}",
             )
         )
-        self._record_transcript_change()
+        self._record_transcript_change(len(self._transcript) - 1)
 
     @workflow.signal
     async def update_tool_connections(
@@ -218,7 +241,7 @@ class SimpleChatWorkflow:
             )
         )
         self._record_state_change()
-        self._record_transcript_change()
+        self._record_transcript_change(len(self._transcript) - 1)
 
     @workflow.signal
     async def resolve_approval(
@@ -233,7 +256,7 @@ class SimpleChatWorkflow:
                     content=f"Unknown approval decision: {decision}",
                 )
             )
-            self._record_transcript_change()
+            self._record_transcript_change(len(self._transcript) - 1)
             return
         approval = self._pending_approvals.get(approval_id)
         if approval is None:
@@ -243,7 +266,7 @@ class SimpleChatWorkflow:
                     content=f"Approval is no longer pending: {approval_id}",
                 )
             )
-            self._record_transcript_change()
+            self._record_transcript_change(len(self._transcript) - 1)
             return
 
         if (
@@ -317,6 +340,41 @@ class SimpleChatWorkflow:
     ) -> TranscriptPage:
         return self._transcript_page(before=before, limit=limit)
 
+    @workflow.query
+    def transcript_deltas_since(self, after_revision: int = 0) -> TranscriptDeltaResult:
+        after_revision = max(0, int(after_revision or 0))
+        if after_revision >= self._transcript_revision:
+            return self._transcript_delta_result(
+                after_revision=after_revision,
+                deltas=[],
+                needs_snapshot=False,
+            )
+
+        if not self._transcript_deltas:
+            return self._transcript_delta_result(
+                after_revision=after_revision,
+                deltas=[],
+                needs_snapshot=True,
+            )
+
+        oldest_revision = self._transcript_deltas[0].revision
+        if after_revision < oldest_revision - 1:
+            return self._transcript_delta_result(
+                after_revision=after_revision,
+                deltas=[],
+                needs_snapshot=True,
+            )
+
+        return self._transcript_delta_result(
+            after_revision=after_revision,
+            deltas=[
+                delta
+                for delta in self._transcript_deltas
+                if delta.revision > after_revision
+            ],
+            needs_snapshot=False,
+        )
+
     def _state(self, *, include_transcript: bool) -> SimpleChatState:
         return SimpleChatState(
             status=self._status,
@@ -361,6 +419,25 @@ class SimpleChatWorkflow:
             transcript_revision=self._transcript_revision,
         )
 
+    def _transcript_delta_result(
+        self,
+        *,
+        after_revision: int,
+        deltas: list[TranscriptDelta],
+        needs_snapshot: bool,
+    ) -> TranscriptDeltaResult:
+        return TranscriptDeltaResult(
+            from_revision=after_revision,
+            to_revision=self._transcript_revision,
+            deltas=deltas,
+            needs_snapshot=needs_snapshot,
+            transcript_length=len(self._transcript),
+            status=self._status,
+            pending_messages=len(self._pending_messages),
+            active_message_index=self._active_message_index,
+            state_revision=self._state_revision,
+        )
+
     @workflow.run
     async def run(self, chat_input: SimpleChatInput) -> None:
         self._transcript = list(chat_input.transcript)
@@ -370,6 +447,7 @@ class SimpleChatWorkflow:
         self._approval_counter = chat_input.approval_counter
         self._state_revision = chat_input.state_revision
         self._transcript_revision = chat_input.transcript_revision
+        self._transcript_deltas = list(chat_input.transcript_deltas)
         self._user_ref = chat_input.user_ref
         self._conversation_id = chat_input.conversation_id
         self._model = chat_input.model
@@ -447,14 +525,14 @@ class SimpleChatWorkflow:
                             role=original.role,
                             content=effective,
                         )
-                        self._record_transcript_change()
+                        self._record_transcript_change(self._active_message_index)
                 self._transcript.append(
                     ChatMessage(
                         role="assistant",
                         content=_assistant_text(result.message),
                     )
                 )
-                self._record_transcript_change()
+                self._record_transcript_change(len(self._transcript) - 1)
             except Exception as err:
                 self._transcript.append(
                     ChatMessage(
@@ -462,13 +540,13 @@ class SimpleChatWorkflow:
                         content=f"{type(err).__name__}: {err}",
                     )
                 )
-                self._record_transcript_change()
+                self._record_transcript_change(len(self._transcript) - 1)
             finally:
                 self._active_message_index = None
                 self._status = "idle"
                 self._record_state_change()
 
-    def _enqueue_chat(self, message: str) -> None:
+    def _enqueue_chat(self, message: str) -> int:
         transcript_index = len(self._transcript)
         self._transcript.append(ChatMessage(role="user", content=message))
         self._pending_messages.append(
@@ -477,6 +555,7 @@ class SimpleChatWorkflow:
                 transcript_index=transcript_index,
             )
         )
+        return transcript_index
 
     async def _run_agent_turn(
         self,
@@ -545,13 +624,26 @@ class SimpleChatWorkflow:
                     ),
                 )
             )
-            self._record_transcript_change()
+            self._record_transcript_change(len(self._transcript) - 1)
 
     def _record_state_change(self) -> None:
         self._state_revision += 1
 
-    def _record_transcript_change(self) -> None:
+    def _record_transcript_change(self, index: int | None = None) -> None:
         self._transcript_revision += 1
+        if index is None or index < 0 or index >= len(self._transcript):
+            return
+        self._transcript_deltas.append(
+            TranscriptDelta(
+                revision=self._transcript_revision,
+                index=index,
+                message=self._transcript[index],
+            )
+        )
+        if len(self._transcript_deltas) > TRANSCRIPT_DELTA_BUFFER_LIMIT:
+            self._transcript_deltas = self._transcript_deltas[
+                -TRANSCRIPT_DELTA_BUFFER_LIMIT:
+            ]
 
     def _continue_as_new_input(
         self,
@@ -579,6 +671,7 @@ class SimpleChatWorkflow:
             good_place_censor=chat_input.good_place_censor,
             state_revision=self._state_revision,
             transcript_revision=self._transcript_revision,
+            transcript_deltas=list(self._transcript_deltas),
         )
 
 

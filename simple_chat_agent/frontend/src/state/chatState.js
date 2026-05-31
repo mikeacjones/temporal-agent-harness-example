@@ -118,6 +118,68 @@ export function prependTranscriptPageInState(previous, page) {
   };
 }
 
+export function applyTranscriptDeltasInState(previous, result) {
+  if (!previous.workflowState || result?.needs_snapshot) return previous;
+
+  const workflowState = previous.workflowState;
+  const transcript = [...(workflowState.transcript || [])];
+  const transcriptOffset = Number(workflowState.transcript_offset || 0);
+  let transcriptEnd = transcriptOffset + transcript.length;
+  let transcriptTotal = Math.max(
+    Number(result.transcript_length || 0),
+    Number(workflowState.transcript_total || workflowState.transcript_length || 0),
+    transcriptEnd,
+  );
+  const settledIndexes = new Set();
+
+  for (const delta of result.deltas || []) {
+    const index = Number(delta.index);
+    const message = delta.message;
+    if (!Number.isFinite(index) || !message) continue;
+    if (index < transcriptOffset) continue;
+    if (index > transcriptEnd) {
+      return previous;
+    }
+    if (index === transcriptEnd) {
+      transcript.push(message);
+      transcriptEnd += 1;
+    } else {
+      transcript[index - transcriptOffset] = message;
+    }
+    settledIndexes.add(index);
+    transcriptTotal = Math.max(transcriptTotal, index + 1);
+  }
+
+  const toRevision = Number(result.to_revision || workflowState.transcript_revision || 0);
+  if (toRevision <= Number(workflowState.transcript_revision || 0)) {
+    return previous;
+  }
+
+  const stateWithSettledPending = {
+    ...previous,
+    localPending: previous.localPending.filter((pending) => {
+      const index = Number(pending.transcriptIndex);
+      return !Number.isFinite(index) || !settledIndexes.has(index);
+    }),
+  };
+
+  return updateWorkflowStateInState(stateWithSettledPending, {
+    ...workflowState,
+    status: result.status || workflowState.status,
+    pending_messages: Number(result.pending_messages ?? workflowState.pending_messages ?? 0),
+    active_message_index: result.active_message_index ?? null,
+    transcript,
+    transcript_offset: transcriptOffset,
+    transcript_total: transcriptTotal,
+    transcript_length: transcriptTotal,
+    transcript_revision: toRevision,
+    state_revision: Math.max(
+      Number(workflowState.state_revision || 0),
+      Number(result.state_revision || 0),
+    ),
+  });
+}
+
 function mergeWorkflowTranscriptPage(workflowState, page) {
   const messages = page.messages || page.transcript || [];
   const pageStart = Number(page.start ?? 0);
@@ -182,11 +244,6 @@ function pendingTranscriptIndex(pending, transcriptLength) {
   return Math.max(0, Math.min(transcriptLength, index));
 }
 
-function rawPendingTranscriptIndex(pending) {
-  const index = Number(pending.transcriptIndex);
-  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
-}
-
 export function handleStreamEventInState(previous, event) {
   const projectionResult = applyWorkflowProjectionEventInState(previous, event);
   if (projectionResult.handled) return projectionResult.state;
@@ -243,9 +300,6 @@ export function handleStreamEventInState(previous, event) {
       turn.status = terminal ? "complete" : turn.currentEvents.length ? "tooling" : "waiting";
       turn.lastClaudeCompletedAt = new Date().toISOString();
     }
-    if (terminal) {
-      return settleCompletedClaudeTurnInState(next, event.payload || {});
-    }
   } else if (isClaudeToolEvent(event)) {
     const turn = ensureStreamTurn(next, next.currentClaudeSequence);
     appendStreamToolEvent(turn, event);
@@ -264,6 +318,10 @@ export function handleStreamEventInState(previous, event) {
 
 export function streamEventNeedsDeferredWorkflowReconcile(event) {
   return event.kind === "claude_complete" && event.payload?.stop_reason === "tool_use";
+}
+
+export function streamEventNeedsSettledTranscriptDelta(event) {
+  return event.kind === "claude_complete" && isTerminalClaudeStop(event.payload || {});
 }
 
 function applyWorkflowProjectionEventInState(previous, event) {
@@ -596,69 +654,11 @@ function markStreamCommittedInState(state) {
   };
 }
 
-function settleCompletedClaudeTurnInState(state, payload) {
-  const workflowState = state.workflowState;
-  if (!workflowState) return markStreamCommittedInState(state);
-
-  const transcript = [...(workflowState.transcript || [])];
-  const consumedPendingIds = new Set();
-  const pendingMessages = [...state.localPending].sort(
-    (left, right) => rawPendingTranscriptIndex(left) - rawPendingTranscriptIndex(right),
-  );
-  const pendingToCommit = pendingMessages.find(transcriptMessageForPending);
-
-  if (pendingToCommit) {
-    const message = transcriptMessageForPending(pendingToCommit);
-    if (message && !isPendingAcknowledgedByTranscript(pendingToCommit, transcript)) {
-      transcript.push(message);
-    }
-    consumedPendingIds.add(pendingToCommit.id);
-  }
-
-  const assistantText = String(payload.text || "").trim();
-  if (assistantText && !lastTranscriptMessageMatches(transcript, "assistant", assistantText)) {
-    transcript.push({ role: "assistant", content: assistantText });
-  }
-
-  const transcriptOffset = Number(workflowState.transcript_offset || 0);
-  const transcriptEnd = transcriptOffset + transcript.length;
-  const transcriptTotal = Math.max(
-    transcriptEnd,
-    Number(workflowState.transcript_total || 0),
-  );
-  const localPending = state.localPending.filter(
-    (pending) => !consumedPendingIds.has(pending.id),
-  );
-  const pendingMessagesCount = localPending.filter(transcriptMessageForPending).length;
-
-  return markStreamCommittedInState({
-    ...state,
-    workflowState: {
-      ...workflowState,
-      status: pendingMessagesCount ? "responding" : "idle",
-      pending_messages: pendingMessagesCount,
-      active_message_index: null,
-      queued_message_indices: [],
-      transcript,
-      transcript_total: transcriptTotal,
-      transcript_length: transcriptTotal,
-      state_revision: Number(workflowState.state_revision || 0) + 1,
-      transcript_revision: Number(workflowState.transcript_revision || 0) + 1,
-    },
-    localPending,
-  });
-}
-
 function transcriptMessageForPending(pending) {
   const phase = String(pending.phase || "");
   if (phase.startsWith("failed")) return null;
   if (!String(pending.label || "").startsWith("you")) return null;
   return { role: "user", content: pending.content };
-}
-
-function lastTranscriptMessageMatches(transcript, role, content) {
-  const last = transcript[transcript.length - 1];
-  return last?.role === role && last?.content === content;
 }
 
 export function markStreamInterruptedInState(state) {

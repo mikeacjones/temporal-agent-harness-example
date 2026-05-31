@@ -11,6 +11,7 @@ import { jsonHeaders, responseErrorText } from "./utils/http.js";
 import { mcpOAuthStartUrl } from "./utils/tools.js";
 import {
   agentSettingsFromConfig,
+  applyTranscriptDeltasInState,
   createPendingMessage,
   displayStatus,
   handleStreamEventInState,
@@ -19,6 +20,7 @@ import {
   prependTranscriptPageInState,
   saveAgentSettings,
   streamEventNeedsDeferredWorkflowReconcile,
+  streamEventNeedsSettledTranscriptDelta,
   temporalUiUrl,
   updateWorkflowStateInState,
 } from "./state/chatState.js";
@@ -40,6 +42,8 @@ export default function App() {
   const restoreScrollAfterPrependRef = useRef(null);
   const olderMessagesRequestRef = useRef(false);
   const deferredWorkflowReconcileTimerRef = useRef(null);
+  const settledTranscriptTimerRef = useRef(null);
+  const settledTranscriptRequestRef = useRef(0);
 
   useEffect(() => {
     stateRef.current = state;
@@ -51,6 +55,7 @@ export default function App() {
     return () => {
       run.cancelled = true;
       clearDeferredWorkflowReconcile();
+      clearSettledTranscriptRefresh();
       closeEventSource();
     };
   }, []);
@@ -145,6 +150,7 @@ export default function App() {
 
   function closeEventSource() {
     clearDeferredWorkflowReconcile();
+    clearSettledTranscriptRefresh();
     if (!eventSourceRef.current) return;
     eventSourceRef.current.close();
     eventSourceRef.current = null;
@@ -163,6 +169,26 @@ export default function App() {
       if (document.hidden || stateRef.current.workflowId !== workflowId) return;
       reconcileWorkflow(workflowId);
     }, 900);
+  }
+
+  function clearSettledTranscriptRefresh() {
+    if (!settledTranscriptTimerRef.current) return;
+    clearTimeout(settledTranscriptTimerRef.current);
+    settledTranscriptTimerRef.current = null;
+  }
+
+  function scheduleSettledTranscriptRefresh(workflowId, options = {}) {
+    clearSettledTranscriptRefresh();
+    const attempt = options.attempt || 0;
+    const delay = options.delay ?? 300;
+    settledTranscriptTimerRef.current = setTimeout(() => {
+      settledTranscriptTimerRef.current = null;
+      if (document.hidden || stateRef.current.workflowId !== workflowId) return;
+      refreshSettledTranscriptDeltas(workflowId, { attempt }).catch((error) => {
+        if (stateRef.current.workflowId !== workflowId) return;
+        setStatusNotice(`settled transcript failed: ${error}`);
+      });
+    }, delay);
   }
 
   function nextStateLoadRequest() {
@@ -456,6 +482,53 @@ export default function App() {
     }
   }
 
+  async function refreshSettledTranscriptDeltas(workflowId, options = {}) {
+    const current = stateRef.current;
+    const afterRevision = Number(current.workflowState?.transcript_revision || 0);
+    const requestId = ++settledTranscriptRequestRef.current;
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(workflowId)}/messages/deltas?after_revision=${afterRevision}`,
+      {
+        headers: { "Cache-Control": "no-cache" },
+      },
+    );
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    if (response.status === 404) {
+      await handleMissingWorkflow();
+      return;
+    }
+    if (!response.ok) throw new Error(await responseErrorText(response));
+
+    const body = await response.json();
+    if (
+      stateRef.current.workflowId !== workflowId ||
+      requestId !== settledTranscriptRequestRef.current
+    ) {
+      return;
+    }
+    if (body.needs_snapshot) {
+      reconcileWorkflow(workflowId);
+      return;
+    }
+
+    setState((previous) =>
+      previous.workflowId === workflowId
+        ? applyTranscriptDeltasInState(previous, body)
+        : previous,
+    );
+
+    const advanced = Number(body.to_revision || 0) > afterRevision;
+    if (!advanced && (options.attempt || 0) < 2) {
+      scheduleSettledTranscriptRefresh(workflowId, {
+        attempt: (options.attempt || 0) + 1,
+        delay: 450,
+      });
+    }
+  }
+
   function connectEvents(workflowId, options = {}) {
     if (!workflowId) return;
     closeEventSource();
@@ -474,6 +547,9 @@ export default function App() {
       const streamEvent = JSON.parse(event.data);
       clearDeferredWorkflowReconcile();
       setState((previous) => handleStreamEventInState(previous, streamEvent));
+      if (streamEventNeedsSettledTranscriptDelta(streamEvent)) {
+        scheduleSettledTranscriptRefresh(workflowId);
+      }
       if (streamEventNeedsDeferredWorkflowReconcile(streamEvent)) {
         scheduleDeferredWorkflowReconcile(workflowId);
       }
