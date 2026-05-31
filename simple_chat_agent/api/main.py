@@ -1657,6 +1657,8 @@ def _safe_inline_media_type(mime_type: str) -> str:
         return mime_type
     if mime_type.startswith("image/") and mime_type != "image/svg+xml":
         return mime_type
+    if mime_type.startswith("audio/") or mime_type.startswith("video/"):
+        return mime_type
     return "text/plain; charset=utf-8"
 
 

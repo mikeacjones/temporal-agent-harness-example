@@ -804,10 +804,42 @@ h1::before {
     border-radius: var(--radius-sm);
     background: rgba(13, 17, 23, 0.44);
 }
+.artifact-card-title {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-xs);
+    align-items: start;
+}
 .artifact-name {
     color: var(--color-text-primary);
     font-weight: 700;
     overflow-wrap: anywhere;
+}
+.artifact-kind {
+    min-width: 34px;
+    padding: 2px 6px;
+    border: 1px solid rgba(126, 231, 135, 0.34);
+    border-radius: var(--radius-sm);
+    background: rgba(126, 231, 135, 0.08);
+    color: #aff5b4;
+    font-size: 0.68rem;
+    font-weight: 800;
+    text-align: center;
+    text-transform: uppercase;
+}
+.artifact-kind.binary {
+    border-color: rgba(139, 148, 158, 0.38);
+    background: rgba(139, 148, 158, 0.08);
+    color: var(--color-text-secondary);
+}
+.artifact-kind.image,
+.artifact-kind.pdf,
+.artifact-kind.audio,
+.artifact-kind.video {
+    border-color: rgba(68, 76, 231, 0.52);
+    background: rgba(68, 76, 231, 0.12);
+    color: #cdb7ff;
 }
 .artifact-meta {
     color: var(--color-text-secondary);
@@ -816,7 +848,7 @@ h1::before {
 }
 .artifact-actions {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--space-xs);
     margin-top: var(--space-xs);
 }
@@ -942,6 +974,32 @@ h1::before {
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
     background: white;
+}
+.artifact-viewer-media {
+    width: 100%;
+    max-height: 100%;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: black;
+}
+.artifact-code-preview {
+    min-height: 100%;
+}
+.artifact-code-preview .code-block {
+    min-height: 100%;
+}
+.artifact-unsupported {
+    display: grid;
+    gap: var(--space-xs);
+    padding: var(--space-md);
+    border: 1px solid var(--color-border-light);
+    border-radius: var(--radius-sm);
+    background: rgba(13, 17, 23, 0.48);
+    color: var(--color-text-secondary);
+}
+.artifact-unsupported-title {
+    color: var(--color-text-primary);
+    font-weight: 800;
 }
 .artifact-viewer-error {
     color: #ffb4af;
@@ -1167,6 +1225,11 @@ main {
     color: var(--color-text-primary);
     font-weight: 600;
 }
+.stream-tool-status {
+    margin-left: var(--space-xs);
+    color: var(--color-text-tertiary);
+    font-weight: 500;
+}
 .stream-tool-payload {
     color: var(--color-text-tertiary);
     overflow-wrap: anywhere;
@@ -1250,6 +1313,74 @@ main {
     border: 0;
     background: transparent;
     white-space: pre;
+}
+.code-block {
+    max-width: 100%;
+    overflow: hidden;
+    border: 1px solid var(--color-border-light);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg-primary);
+}
+.code-block-header {
+    min-height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    padding: 0 var(--space-sm);
+    border-bottom: 1px solid var(--color-border-light);
+    background: rgba(48, 54, 61, 0.55);
+    color: var(--color-text-tertiary);
+    font-size: var(--font-size-xs);
+    font-weight: 800;
+    text-transform: uppercase;
+}
+.code-block-header button {
+    min-height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg-tertiary);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+}
+.code-block-header button:hover {
+    border-color: var(--color-border-focus);
+    color: var(--color-text-primary);
+}
+.code-block pre {
+    margin: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+}
+.code-block .plain-code {
+    padding: 12px;
+    overflow-x: auto;
+    color: var(--color-text-primary);
+    font-size: 0.88rem;
+    line-height: 1.5;
+}
+.code-block code {
+    display: block;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font-family:
+        ui-monospace,
+        SFMono-Regular,
+        Menlo,
+        Monaco,
+        Consolas,
+        "Liberation Mono",
+        "Courier New",
+        monospace !important;
+}
+.code-block.compact .code-block-header {
+    min-height: 26px;
+}
+.code-block.compact .code-block-header button {
+    min-height: 22px;
 }
 .bubble-content blockquote {
     margin: 0;
