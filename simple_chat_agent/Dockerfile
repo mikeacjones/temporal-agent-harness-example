@@ -6,6 +6,17 @@
 #   docker build -f simple_chat_agent/Dockerfile .
 #
 # Built for linux/amd64 to match the EKS node architecture.
+FROM node:22-bookworm-slim AS frontend-build
+
+WORKDIR /app/simple_chat_agent/frontend
+
+# Install frontend dependencies in their own layer.
+COPY simple_chat_agent/frontend/package*.json ./
+RUN npm ci
+
+COPY simple_chat_agent/frontend ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS build
 
 WORKDIR /app
@@ -25,9 +36,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # Bring in the resolved virtualenv, then the application source.
 COPY --from=build /app/.venv /app/.venv
 COPY . .
+COPY --from=frontend-build /app/simple_chat_agent/frontend/static/dist /app/simple_chat_agent/frontend/static/dist
 
 # Web: 8000 (FastAPI). Worker: 8001 (in-process codec server).
 EXPOSE 8000 8001
 
 # Default to the worker; the web container overrides this command.
-CMD ["python", "-m", "simple_chat_agent.worker"]
+CMD ["python", "-m", "simple_chat_agent.worker.main"]
