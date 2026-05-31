@@ -11,8 +11,8 @@ The app includes:
   instance for one conversation.
 - A `UserChatsWorkflow` entity workflow that tracks active chats and configured
   HTTP MCP servers for one user.
-- A FastAPI web app with login, chat history, streaming visibility, tool
-  approvals, tool configuration, and artifact viewing/downloading.
+- A React/Vite frontend and FastAPI API with login, chat history, streaming
+  visibility, tool approvals, tool configuration, and artifact viewing/downloading.
 - A Temporal worker that hosts the chat workflows, subagent workflow, Claude
   activity, generic tool activity, and generic guard activity.
 - Example tools for URL fetches, Python sandbox execution, artifact creation,
@@ -25,7 +25,8 @@ The Python code is split by runtime boundary:
   replay tooling, and sandbox Lambda code.
 - `simple_chat_agent/common/`: shared storage, payload conversion, streaming,
   MCP auth, and environment helpers.
-- `simple_chat_agent/frontend/`: React/Vite SPA.
+- `simple_chat_agent/frontend/`: React/Vite SPA and the production static
+  frontend server.
 
 ## Quick Start
 
@@ -77,7 +78,7 @@ Package `simple_chat_agent.worker.sandbox.lambda_handler.lambda_handler` as the
 Lambda handler. The executor Lambda does not need Temporal credentials or app
 environment variables. The worker passes a narrow stream endpoint/token in the
 Lambda invoke payload so long-running code can post stdout/stderr/progress
-events back to the web UI; the sandbox child process still receives only its
+events back to the API; the sandbox child process still receives only its
 minimal runner environment. Do not pass agent model keys, OAuth credentials,
 artifact storage config, database config, app session secrets, or Temporal config
 into the Lambda environment. The Lambda execution role should not have app IAM
@@ -89,13 +90,15 @@ unsetting them so same-UID child code cannot recover those values through
 `/proc/<pid>/environ`.
 
 The worker that hosts the Temporal Activity needs permission to invoke only that
-sandbox Lambda. Set `PYTHON_SANDBOX_STREAM_SINK_URL` on that worker to a web URL
-reachable from Lambda, and set `PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
+sandbox Lambda. Set `PYTHON_SANDBOX_STREAM_SINK_URL` on that worker to an app URL
+reachable from Lambda; `/internal/stream` must route to the API. Set
+`PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
 published version or alias. The activity retries Lambda invoke/control-plane
 failures, but completed sandbox execution failures are returned to the LLM
 instead of retried.
 
-Start the web UI in a third terminal:
+For local development, build the frontend once and let the API serve the static
+files:
 
 ```bash
 cd simple_chat_agent/frontend
@@ -195,9 +198,10 @@ The FastAPI app sends two kinds of events:
 - `state`: durable workflow state, read by polling the `SimpleChatWorkflow.state`
   query. This includes transcript, status, pending approvals, tool availability,
   and artifacts.
-- `stream`: non-durable sideband stream events, read by tailing the JSONL stream
-  file written by `JsonlStreamSink`. This is used for Claude token deltas,
-  streamed tool input construction, and tool activity visibility.
+- `stream`: non-durable sideband stream events. Local dev reads the JSONL stream
+  file written by `JsonlStreamSink`; deployment receives the same events through
+  the API-owned `/internal/stream` endpoint. This is used for Claude token
+  deltas, streamed tool input construction, and tool activity visibility.
 
 The workflow does not push directly to the browser.
 

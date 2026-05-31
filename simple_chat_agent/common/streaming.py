@@ -35,9 +35,9 @@ class JsonlStreamSink:
 
 
 class HttpStreamSink:
-    """Deployment sink: POST each event to the web-owned internal stream API.
+    """Deployment sink: POST each event to the API-owned internal stream API.
 
-    Lets the worker run in a separate pod from the web — the web owns stream
+    Lets the worker run in a separate pod from the API — the API owns stream
     state and serves SSE to browsers. Best-effort: emit() must never break the
     activity, so POST failures are swallowed (the durable truth is the workflow
     state; streaming is visibility only).
@@ -66,7 +66,7 @@ class HttpStreamSink:
 def configured_stream_sink() -> StreamSink:
     """Select the stream sink from the environment.
 
-    Uses the web-owned HTTP API when SIMPLE_CHAT_STREAM_SINK_URL is set
+    Uses the API-owned HTTP endpoint when SIMPLE_CHAT_STREAM_SINK_URL is set
     (deployment); otherwise the local JSONL file sink (local dev).
     """
     base_url = os.environ.get("SIMPLE_CHAT_STREAM_SINK_URL", "").strip()

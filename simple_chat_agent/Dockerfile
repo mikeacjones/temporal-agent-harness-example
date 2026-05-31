@@ -1,5 +1,5 @@
-# Image for the simple_chat_agent. Used for both the web and worker containers;
-# they differ only by the command they run (see deploy/ manifests).
+# Image for the simple_chat_agent. Used for the frontend, API, and worker
+# containers; they differ only by the command they run (see deploy/ manifests).
 #
 # IMPORTANT: build with the *repo root* as the context (the image needs
 # pyproject.toml, uv.lock, and claude_harness/ from there), e.g.:
@@ -38,8 +38,8 @@ COPY --from=build /app/.venv /app/.venv
 COPY . .
 COPY --from=frontend-build /app/simple_chat_agent/frontend/static/dist /app/simple_chat_agent/frontend/static/dist
 
-# Web: 8000 (FastAPI). Worker: 8001 (in-process codec server).
-EXPOSE 8000 8001
+# Frontend: 8080 (static SPA). API: 8000 (FastAPI). Worker: 8001 (codec).
+EXPOSE 8080 8000 8001
 
 # Default to the worker; the web container overrides this command.
 CMD ["python", "-m", "simple_chat_agent.worker.main"]

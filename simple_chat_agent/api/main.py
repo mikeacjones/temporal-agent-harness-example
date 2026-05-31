@@ -181,14 +181,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.store = AppStore()
     app.state.mcp_oauth_flows = {}
     # In-memory per-stream event buffers, used when streaming arrives over the
-    # web-owned HTTP API (deployment) instead of local files (local dev).
+    # API-owned HTTP endpoint (deployment) instead of local files (local dev).
     app.state.stream_buffers = {}
     yield
 
 
 app = FastAPI(lifespan=lifespan)
 
-# The React frontend owns static assets; FastAPI exposes them at /static.
+# Local-dev fallback: the dedicated frontend server owns static assets in
+# deployment, but FastAPI can still serve them when run directly.
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend" / "static"
 _FRONTEND_INDEX = _STATIC_DIR / "dist" / "index.html"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -1100,7 +1101,7 @@ def _walk_exception_tree(err: BaseException) -> list[BaseException]:
 
 def _stream_http_enabled() -> bool:
     # When a shared stream token is configured, streaming arrives over the
-    # web-owned HTTP API and is served from the in-memory buffer. Otherwise
+    # API-owned HTTP endpoint and is served from the in-memory buffer. Otherwise
     # (local dev) it is tailed from per-stream files on disk.
     return bool(os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip())
 
