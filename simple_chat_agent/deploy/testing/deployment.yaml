@@ -35,7 +35,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command:
             - uvicorn
-            - simple_chat_agent.web:app
+            - simple_chat_agent.api.main:app
             - --host
             - 0.0.0.0
             - --port
@@ -104,7 +104,7 @@ spec:
         app: agent-harness-testing
         component: worker
     spec:
-      serviceAccountName: agent-harness
+      serviceAccountName: agent-harness-worker-testing
       containers:
         - name: worker
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:testing
@@ -112,7 +112,7 @@ spec:
           command:
             - python
             - -m
-            - simple_chat_agent.worker
+            - simple_chat_agent.worker.main
           ports:
             - name: codec
               containerPort: 8001
@@ -135,6 +135,10 @@ spec:
               value: testing-
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-web-testing
+            - name: PYTHON_SANDBOX_LAMBDA_FUNCTION
+              value: temporal-michaelj-agent-harness-demo-python-sandbox-testing
+            - name: PYTHON_SANDBOX_STREAM_SINK_URL
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent

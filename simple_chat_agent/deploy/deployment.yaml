@@ -42,7 +42,7 @@ spec:
           # so launch uvicorn directly bound to all interfaces.
           command:
             - uvicorn
-            - simple_chat_agent.web:app
+            - simple_chat_agent.api.main:app
             - --host
             - 0.0.0.0
             - --port
@@ -120,7 +120,7 @@ spec:
           command:
             - python
             - -m
-            - simple_chat_agent.worker
+            - simple_chat_agent.worker.main
           ports:
             - name: codec
               containerPort: 8001

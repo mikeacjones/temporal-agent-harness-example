@@ -18,6 +18,15 @@ The app includes:
 - Example tools for URL fetches, Python sandbox execution, artifact creation,
   GitHub operations, HTTP MCP servers, and subagents.
 
+The Python code is split by runtime boundary:
+
+- `simple_chat_agent/api/`: FastAPI app, OAuth flows, SSE, and HTTP API routes.
+- `simple_chat_agent/worker/`: Temporal worker, workflows, tools, codec server,
+  replay tooling, and sandbox Lambda code.
+- `simple_chat_agent/common/`: shared storage, payload conversion, streaming,
+  MCP auth, and environment helpers.
+- `simple_chat_agent/frontend/`: React/Vite SPA.
+
 ## Quick Start
 
 Install dependencies from the repository root:
@@ -50,7 +59,7 @@ temporal server start-dev
 Start the worker in another terminal:
 
 ```bash
-uv run python -m simple_chat_agent.worker
+uv run python -m simple_chat_agent.worker.main
 ```
 
 The worker also starts a Temporal Web codec server at
@@ -58,10 +67,42 @@ The worker also starts a Temporal Web codec server at
 that URL to decode claim-checked payloads from the local JSON-file external
 storage.
 
+Locally, the `python_sandbox` tool runs inside a subprocess owned by the worker.
+For deployment, set `PYTHON_SANDBOX_LAMBDA_FUNCTION` on the worker to invoke a
+dedicated executor Lambda instead. The Temporal Activity remains on the normal
+worker so workflow history still shows sandbox schedule/start/close timing and
+failures, but arbitrary Python executes outside the agent worker.
+
+Package `simple_chat_agent.worker.sandbox.lambda_handler.lambda_handler` as the
+Lambda handler. The executor Lambda does not need Temporal credentials or app
+environment variables. The worker passes a narrow stream endpoint/token in the
+Lambda invoke payload so long-running code can post stdout/stderr/progress
+events back to the web UI; the sandbox child process still receives only its
+minimal runner environment. Do not pass agent model keys, OAuth credentials,
+artifact storage config, database config, app session secrets, or Temporal config
+into the Lambda environment. The Lambda execution role should not have app IAM
+permissions and the deploy script should force its configured environment to an
+empty map. Before spawning sandbox code on Linux, the host process marks itself
+non-dumpable where permitted; Lambda runtimes that deny that call fall back to
+overwriting sensitive AWS/Lambda entries in the C process environment before
+unsetting them so same-UID child code cannot recover those values through
+`/proc/<pid>/environ`.
+
+The worker that hosts the Temporal Activity needs permission to invoke only that
+sandbox Lambda. Set `PYTHON_SANDBOX_STREAM_SINK_URL` on that worker to a web URL
+reachable from Lambda, and set `PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
+published version or alias. The activity retries Lambda invoke/control-plane
+failures, but completed sandbox execution failures are returned to the LLM
+instead of retried.
+
 Start the web UI in a third terminal:
 
 ```bash
-uv run python -m simple_chat_agent.web
+cd simple_chat_agent/frontend
+npm ci
+npm run build
+cd ../..
+uv run python -m simple_chat_agent.api.main
 ```
 
 Open `http://127.0.0.1:8000` and log in. The default credentials are
@@ -160,35 +201,13 @@ The FastAPI app sends two kinds of events:
 
 The workflow does not push directly to the browser.
 
-## Terminal Client
-
-The older terminal client is still useful for quick signal and interrupt tests:
-
-```bash
-uv run python -m simple_chat_agent.chat
-```
-
-CLI commands:
-
-```text
-/steer <message>       Add steering before the next Claude call.
-/after-tool <message>  Add steering after the next tool result.
-/interrupt <message>   Cancel the in-flight Claude call and continue with context.
-/queue <message>       Queue a normal chat message even while busy.
-/status                Show workflow status.
-/quit                  Exit.
-```
-
-Plain text is sent as a normal chat message while the workflow is idle. If
-Claude is responding, plain text is sent as immediate steering.
-
 ## Zed Replay Debugging
 
 The repo includes a Zed debugger profile at `.zed/debug.json` that launches the
 Temporal Python replayer through:
 
 ```bash
-python -m simple_chat_agent.replay
+python -m simple_chat_agent.worker.replay
 ```
 
 Export a workflow history into the local scratch directory:
