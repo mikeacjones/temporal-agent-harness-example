@@ -230,11 +230,11 @@ class ClaudeAgent:
                     guard_reason=response.guard_reason,
                 )
 
-            tool_results = await self._execute_requested_tools(tool_use_blocks)
-            await self._context.record_tool_results(tool_results)
+            tool_execution = await self._execute_requested_tools(tool_use_blocks)
+            await self._context.record_tool_results(tool_execution.tool_results)
             await self._flush_after_tool_context()
 
-            if self._interrupt_requested:
+            if self._interrupt_requested or tool_execution.interrupted:
                 await self._flush_interrupt_context()
                 continue
 
@@ -415,9 +415,9 @@ class ClaudeAgent:
             self._pending_interrupts,
             tag="interrupt",
             description=(
-                "The in-progress assistant response was interrupted by the user. "
-                "Discard any uncommitted partial assistant output and use this "
-                "new context before continuing."
+                "The in-progress assistant response or tool execution was "
+                "interrupted by the user. Discard any uncommitted partial "
+                "assistant output and use this new context before continuing."
             ),
         )
         self._interrupt_requested = False
@@ -459,13 +459,45 @@ class ClaudeAgent:
 
     async def _execute_requested_tools(
         self, tool_use_blocks: list[dict[str, Any]]
-    ) -> list[ToolResultBlockParam]:
-        return await asyncio.gather(
-            *[
-                self._execute_requested_tool(block)
-                for block in tool_use_blocks
-            ]
-        )
+    ) -> "ToolExecutionResult":
+        tool_tasks = [
+            asyncio.create_task(self._execute_requested_tool(block))
+            for block in tool_use_blocks
+        ]
+
+        try:
+            await workflow.wait_condition(
+                lambda: self._interrupt_requested
+                or all(task.done() for task in tool_tasks)
+            )
+
+            interrupted = self._interrupt_requested
+            if interrupted:
+                for task in tool_tasks:
+                    if not task.done():
+                        task.cancel()
+
+            # Preserve the Anthropic tool-use contract: every requested tool
+            # receives a result block, even when interruption cancels it.
+            tool_results: list[ToolResultBlockParam] = []
+            for block, task in zip(tool_use_blocks, tool_tasks):
+                try:
+                    tool_results.append(await task)
+                except BaseException as err:
+                    if interrupted and is_cancelled_exception(err):
+                        tool_results.append(self._interrupted_tool_result(block))
+                        continue
+                    raise
+
+            return ToolExecutionResult(
+                tool_results=tool_results,
+                interrupted=interrupted,
+            )
+        except BaseException:
+            for task in tool_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
 
     async def _execute_requested_tool(
         self, block: dict[str, Any]
@@ -489,6 +521,33 @@ class ClaudeAgent:
             is_error=result.error,
         )
 
+    def _interrupted_tool_result(
+        self,
+        block: dict[str, Any],
+    ) -> ToolResultBlockParam:
+        tool_name = cast(str, block["name"])
+        tool_use_id = cast(str, block["id"])
+        return ToolResultBlockParam(
+            type="tool_result",
+            tool_use_id=tool_use_id,
+            content=json.dumps(
+                {
+                    "error": (
+                        f"Tool '{tool_name}' was interrupted by the user before "
+                        "it completed."
+                    ),
+                    "type": "ToolInterrupted",
+                    "interrupted": True,
+                    "partial_result": (
+                        "Cancellation was requested. No final result was available "
+                        "from this tool; any progress or stdout/stderr emitted "
+                        "before cancellation should be treated as partial context."
+                    ),
+                }
+            ),
+            is_error=True,
+        )
+
     def _terminated_result(self, *, turns: int) -> ClaudeAgentResult:
         return ClaudeAgentResult(
             message={
@@ -500,6 +559,12 @@ class ClaudeAgent:
             guard_action=LlmGuardAction.TERMINATE.value,
             guard_reason=self._termination_reason,
         )
+
+
+@dataclass
+class ToolExecutionResult:
+    tool_results: list[ToolResultBlockParam]
+    interrupted: bool = False
 
 
 @dataclass
