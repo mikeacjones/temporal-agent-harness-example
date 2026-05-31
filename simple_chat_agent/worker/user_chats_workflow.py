@@ -16,7 +16,7 @@ with workflow.unsafe.imports_passed_through():
     from claude_harness.claude_agent import ClaudeThinkingConfig
     from claude_harness.mcp_types import HttpMcpServerConfig
     from simple_chat_agent import TASK_QUEUE
-    from simple_chat_agent.workflow import (
+    from simple_chat_agent.worker.workflow import (
         ChatMessage,
         QueuedChatMessage,
         SimpleChatInput,

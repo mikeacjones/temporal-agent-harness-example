@@ -14,23 +14,23 @@ from claude_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
-from claude_harness.streaming import configure_stream_sink
+from claude_harness.streaming import configure_stream_sink, emit_stream_event_activity
 from claude_harness.tools import run_tool_activity
 from simple_chat_agent import TASK_QUEUE
-from simple_chat_agent.codec_server import (
+from simple_chat_agent.worker.codec_server import (
     codec_server_enabled,
     codec_server_host,
     codec_server_port,
     codec_server_url,
     create_codec_app,
 )
-from simple_chat_agent.env import load_dotenv
-from simple_chat_agent.external_storage import simple_chat_data_converter
-from simple_chat_agent.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
-from simple_chat_agent.streaming import configured_stream_sink
-from simple_chat_agent.tools.subagent import SubagentWorkflow
-from simple_chat_agent.user_chats_workflow import UserChatsWorkflow
-from simple_chat_agent.workflow import SimpleChatWorkflow
+from simple_chat_agent.common.env import load_dotenv
+from simple_chat_agent.common.external_storage import simple_chat_data_converter
+from simple_chat_agent.common.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
+from simple_chat_agent.common.streaming import configured_stream_sink
+from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
+from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
+from simple_chat_agent.worker.workflow import SimpleChatWorkflow
 
 
 async def main() -> None:
@@ -56,7 +56,12 @@ async def main() -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[SimpleChatWorkflow, UserChatsWorkflow, SubagentWorkflow],
-        activities=[call_claude, run_tool_activity, run_guard_activity],
+        activities=[
+            call_claude,
+            run_tool_activity,
+            run_guard_activity,
+            emit_stream_event_activity,
+        ],
     )
     if not codec_server_enabled():
         await worker.run()

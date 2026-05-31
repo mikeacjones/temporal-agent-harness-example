@@ -100,7 +100,7 @@ async def _create_artifact_activity(
         await stream.emit(payload, kind="artifact_create_rejected")
         return payload
 
-    from simple_chat_agent.store import AppStore
+    from simple_chat_agent.common.store import AppStore
 
     artifact = AppStore().create_artifact(
         user_id=user_id,

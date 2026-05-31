@@ -13,15 +13,15 @@ with workflow.unsafe.imports_passed_through():
     from claude_harness.tool_types import ToolType
     from claude_harness.tools import ToolContext, ToolResult, ToolSet, tool
     from simple_chat_agent import TASK_QUEUE
-    from simple_chat_agent.tools.approval import (
+    from simple_chat_agent.worker.tools.approval import (
         ApprovalDecision,
         ChildToolApprovalRequest,
         MutatingToolApprovalProvider,
     )
-    from simple_chat_agent.tools.artifacts import ArtifactProvider
-    from simple_chat_agent.tools.fetch_url import fetch_url
-    from simple_chat_agent.tools.github import GitHubProvider
-    from simple_chat_agent.tools.python_sandbox import python_sandbox
+    from simple_chat_agent.worker.tools.artifacts import ArtifactProvider
+    from simple_chat_agent.worker.tools.fetch_url import fetch_url
+    from simple_chat_agent.worker.tools.github import GitHubProvider
+    from simple_chat_agent.worker.tools.python_sandbox import python_sandbox
 
 
 CREATE_SUBAGENT_TOOL = "create_subagent"

@@ -40,7 +40,7 @@ from claude_harness.mcp import (
 )
 from claude_harness.mcp_types import HttpMcpServerConfig
 from simple_chat_agent import TASK_QUEUE
-from simple_chat_agent.auth import (
+from simple_chat_agent.api.auth import (
     DEFAULT_SESSION_SECONDS,
     SESSION_COOKIE,
     AuthenticatedUser,
@@ -49,12 +49,12 @@ from simple_chat_agent.auth import (
     user_from_google_subject,
     user_from_session_token,
 )
-from simple_chat_agent.env import load_dotenv
-from simple_chat_agent.external_storage import (
+from simple_chat_agent.common.env import load_dotenv
+from simple_chat_agent.common.external_storage import (
     purge_workflow_payloads,
     simple_chat_data_converter,
 )
-from simple_chat_agent.github_oauth import (
+from simple_chat_agent.api.github_oauth import (
     GITHUB_PROVIDER,
     GitHubOAuthError,
     exchange_github_code,
@@ -63,7 +63,7 @@ from simple_chat_agent.github_oauth import (
     github_oauth_configured,
     github_scopes,
 )
-from simple_chat_agent.google_oauth import (
+from simple_chat_agent.api.google_oauth import (
     GOOGLE_PROVIDER,
     GoogleOAuthError,
     exchange_google_code,
@@ -73,18 +73,18 @@ from simple_chat_agent.google_oauth import (
     google_redirect_uri_from_base,
     identity_from_id_token,
 )
-from simple_chat_agent.mcp_auth import (
+from simple_chat_agent.common.mcp_auth import (
     mcp_oauth_provider,
     resolve_mcp_auth_headers,
     resolve_mcp_http_auth,
 )
-from simple_chat_agent.mcp_oauth import (
+from simple_chat_agent.common.mcp_oauth import (
     PendingMcpOAuthFlow,
     authorize_mcp_oauth_flow,
 )
-from simple_chat_agent.store import AppStore, ArtifactRecord
-from simple_chat_agent.streaming import stream_path
-from simple_chat_agent.tools import (
+from simple_chat_agent.common.store import AppStore, ArtifactRecord
+from simple_chat_agent.common.streaming import stream_path
+from simple_chat_agent.worker.tools import (
     CREATE_ARTIFACT_TOOL,
     CREATE_SUBAGENT_TOOL,
     FETCH_URL_TOOL,
@@ -92,7 +92,7 @@ from simple_chat_agent.tools import (
     PYTHON_SANDBOX_TOOL,
     tool_names_for_connections,
 )
-from simple_chat_agent.user_chats_workflow import (
+from simple_chat_agent.worker.user_chats_workflow import (
     ChatRecord,
     CreateChatRequest,
     DeleteMcpServerRequest,
@@ -103,14 +103,13 @@ from simple_chat_agent.user_chats_workflow import (
     user_chats_workflow_id,
     user_email_search_attributes,
 )
-from simple_chat_agent.workflow import (
+from simple_chat_agent.worker.workflow import (
     DEFAULT_MAX_TOKENS,
     SimpleChatState,
     SimpleChatWorkflow,
 )
 
-STATE_POLL_INTERVAL_SECONDS = 0.1
-STREAM_POLL_INTERVAL_SECONDS = 0.02
+STREAM_POLL_INTERVAL_SECONDS = 0.01
 DEFAULT_THINKING_EFFORT: ClaudeThinkingEffort = "medium"
 ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-7",)
 DEFAULT_MODEL_OPTIONS = [
@@ -189,15 +188,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(lifespan=lifespan)
 
-# The frontend (HTML/CSS/JS) lives in static files rather than an inline string,
-# so it gets proper editor tooling and the API module stays focused.
-_STATIC_DIR = Path(__file__).parent / "static"
+# The React frontend owns static assets; FastAPI exposes them at /static.
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend" / "static"
+_FRONTEND_INDEX = _STATIC_DIR / "dist" / "index.html"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "index.html")
+    return FileResponse(_FRONTEND_INDEX)
 
 
 @app.get("/api/me")
@@ -1117,17 +1116,22 @@ def _stream_buffers() -> dict[str, dict[str, Any]]:
     return buffers
 
 
-def _stream_buffer_events(stream_id: str) -> list[dict[str, Any]]:
-    entry = _stream_buffers().get(stream_id)
-    return entry["events"] if entry else []
+def _ensure_stream_buffer(stream_id: str) -> dict[str, Any]:
+    buffers = _stream_buffers()
+    entry = buffers.get(stream_id)
+    if entry is None:
+        entry = {
+            "events": [],
+            "generation": uuid4().hex[:12],
+            "updated": time.monotonic(),
+        }
+        buffers[stream_id] = entry
+    return entry
 
 
 def _append_stream_event(stream_id: str, event: dict[str, Any]) -> None:
     buffers = _stream_buffers()
-    entry = buffers.get(stream_id)
-    if entry is None:
-        entry = {"events": [], "updated": 0.0}
-        buffers[stream_id] = entry
+    entry = _ensure_stream_buffer(stream_id)
     entry["events"].append(event)
     now = time.monotonic()
     entry["updated"] = now
@@ -1138,6 +1142,24 @@ def _append_stream_event(stream_id: str, event: dict[str, Any]) -> None:
         if now - value["updated"] > STREAM_BUFFER_TTL_SECONDS
     ]:
         buffers.pop(stale, None)
+
+
+def _buffer_event_id(entry: dict[str, Any], position: int) -> str:
+    return f"{entry['generation']}:{position}"
+
+
+def _parse_buffer_event_id(
+    last_event_id: str | None,
+    entry: dict[str, Any],
+) -> int | None:
+    if not last_event_id:
+        return None
+    generation, separator, position = last_event_id.partition(":")
+    if separator != ":" or generation != entry.get("generation"):
+        return None
+    with suppress(ValueError):
+        return max(0, int(position))
+    return None
 
 
 def _clear_stream(stream_id: str) -> None:
@@ -1152,6 +1174,8 @@ async def _poll_state(
     request: Request,
     user: AuthenticatedUser,
     last_state_json: str | None,
+    *,
+    state_event_id: str | None = None,
 ) -> tuple[list[str], str | None, bool]:
     """Query workflow state; return (sse chunks to emit, new last_state_json, stop)."""
     try:
@@ -1186,7 +1210,7 @@ async def _poll_state(
 
     state_json = json.dumps(state, separators=(",", ":"))
     if state_json != last_state_json:
-        return ([_sse("state", state)], state_json, False)
+        return ([_sse("state", state, event_id=state_event_id)], state_json, False)
     return ([], last_state_json, False)
 
 
@@ -1207,19 +1231,57 @@ async def _file_event_stream(workflow_id: str, request: Request) -> AsyncIterato
     # this the whole stream file is re-sent on every reconnect, which duplicates
     # already-finalized turns in the UI.
     offset = 0
+    needs_state_snapshot = False
     last_event_id = request.headers.get("last-event-id")
     if last_event_id:
-        with suppress(ValueError):
+        try:
             offset = max(0, int(last_event_id))
-    # Guard against a stale/oversized cursor (e.g. the stream file was reset).
-    if path.exists() and offset > path.stat().st_size:
-        offset = 0
+        except ValueError:
+            needs_state_snapshot = True
+            offset = path.stat().st_size if path.exists() else 0
+        if not path.exists() or offset > path.stat().st_size:
+            needs_state_snapshot = True
+            offset = path.stat().st_size if path.exists() else 0
+    elif path.exists():
+        # A new browser load gets an authoritative workflow snapshot first; do
+        # not replay historical visibility events into a stale stream panel.
+        # Browser auto-reconnects still send Last-Event-ID and resume normally.
+        needs_state_snapshot = True
+        offset = path.stat().st_size
+    else:
+        needs_state_snapshot = True
+
     last_state_json: str | None = None
-    state_elapsed = STATE_POLL_INTERVAL_SECONDS
     user = _current_user(request)
+    if needs_state_snapshot:
+        chunks, last_state_json, stop = await _poll_state(
+            workflow_id,
+            request,
+            user,
+            last_state_json,
+            state_event_id=str(offset),
+        )
+        for chunk in chunks:
+            yield chunk
+        if stop:
+            return
 
     while not await request.is_disconnected():
         if path.exists():
+            if offset > path.stat().st_size:
+                offset = path.stat().st_size
+                chunks, last_state_json, stop = await _poll_state(
+                    workflow_id,
+                    request,
+                    user,
+                    last_state_json,
+                    state_event_id=str(offset),
+                )
+                for chunk in chunks:
+                    yield chunk
+                if stop:
+                    break
+
             new_lines: list[tuple[str, int]] = []
             with path.open("r", encoding="utf-8") as stream:
                 stream.seek(offset)
@@ -1234,51 +1296,73 @@ async def _file_event_stream(workflow_id: str, request: Request) -> AsyncIterato
                 with suppress(json.JSONDecodeError):
                     yield _sse("stream", json.loads(line), event_id=str(position))
 
-        state_elapsed += STREAM_POLL_INTERVAL_SECONDS
-        if state_elapsed >= STATE_POLL_INTERVAL_SECONDS:
-            state_elapsed = 0
-            chunks, last_state_json, stop = await _poll_state(
-                workflow_id, request, user, last_state_json
-            )
-            for chunk in chunks:
-                yield chunk
-            if stop:
-                break
-
         await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
 
 
 async def _buffer_event_stream(
     workflow_id: str, request: Request
 ) -> AsyncIterator[str]:
-    # Resume by buffer index (the browser replays its last received id).
-    resume = 0
+    # Resume by generation-scoped buffer index (the browser replays its last
+    # received id). If the generation changed, this web process no longer has
+    # the exact missed events and must fall back to one authoritative snapshot.
+    entry = _ensure_stream_buffer(workflow_id)
+    events = entry["events"]
     last_event_id = request.headers.get("last-event-id")
+    needs_state_snapshot = False
     if last_event_id:
-        with suppress(ValueError):
-            resume = max(0, int(last_event_id))
-    last_state_json: str | None = None
-    state_elapsed = STATE_POLL_INTERVAL_SECONDS
-    user = _current_user(request)
-
-    while not await request.is_disconnected():
-        events = _stream_buffer_events(workflow_id)
-        if resume > len(events):
-            resume = 0
-        for index in range(resume, len(events)):
-            yield _sse("stream", events[index], event_id=str(index + 1))
+        parsed_resume = _parse_buffer_event_id(last_event_id, entry)
+        if parsed_resume is None or parsed_resume > len(events):
+            needs_state_snapshot = True
+            resume = len(events)
+        else:
+            resume = parsed_resume
+    else:
+        # A fresh browser load gets a full state snapshot first. Start at the
+        # current tail so old stream events do not recreate completed turns.
+        needs_state_snapshot = True
         resume = len(events)
 
-        state_elapsed += STREAM_POLL_INTERVAL_SECONDS
-        if state_elapsed >= STATE_POLL_INTERVAL_SECONDS:
-            state_elapsed = 0
+    last_state_json: str | None = None
+    user = _current_user(request)
+    if needs_state_snapshot:
+        chunks, last_state_json, stop = await _poll_state(
+            workflow_id,
+            request,
+            user,
+            last_state_json,
+            state_event_id=_buffer_event_id(entry, resume),
+        )
+        for chunk in chunks:
+            yield chunk
+        if stop:
+            return
+    cursor_generation = entry["generation"]
+
+    while not await request.is_disconnected():
+        entry = _ensure_stream_buffer(workflow_id)
+        events = entry["events"]
+        if entry["generation"] != cursor_generation or resume > len(events):
+            resume = len(events)
+            cursor_generation = entry["generation"]
             chunks, last_state_json, stop = await _poll_state(
-                workflow_id, request, user, last_state_json
+                workflow_id,
+                request,
+                user,
+                last_state_json,
+                state_event_id=_buffer_event_id(entry, resume),
             )
             for chunk in chunks:
                 yield chunk
             if stop:
                 break
+
+        for index in range(resume, len(events)):
+            yield _sse(
+                "stream",
+                events[index],
+                event_id=_buffer_event_id(entry, index + 1),
+            )
+        resume = len(events)
 
         await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
 
@@ -1697,12 +1781,16 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
-if __name__ == "__main__":
+def main() -> None:
     uvicorn.run(
-        "simple_chat_agent.web:app",
+        "simple_chat_agent.api.main:app",
         host="127.0.0.1",
         port=8000,
         reload=True,
         proxy_headers=True,
         forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"),
     )
+
+
+if __name__ == "__main__":
+    main()

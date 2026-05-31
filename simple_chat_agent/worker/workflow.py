@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from typing import Any, Literal, cast
 
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio.common import RetryPolicy
     from claude_harness.mcp_types import HttpMcpServerConfig
     from claude_harness.claude_agent import (
         ClaudeAgent,
@@ -14,14 +16,18 @@ with workflow.unsafe.imports_passed_through():
         ClaudeThinkingConfig,
         SteeringMode,
     )
-    from simple_chat_agent.tools import build_tools, tool_names_for_connections
-    from simple_chat_agent.tools.approval import (
+    from simple_chat_agent.worker.tools import build_tools, tool_names_for_connections
+    from simple_chat_agent.worker.tools.approval import (
         ApprovalDecision,
         ChildToolApprovalRequest,
     )
-    from simple_chat_agent.good_place_guards import (
+    from simple_chat_agent.worker.good_place_guards import (
         good_place_post_guard,
         good_place_pre_guard,
+    )
+    from claude_harness.streaming import (
+        EmitStreamEventRequest,
+        emit_stream_event_activity,
     )
 
 
@@ -72,6 +78,8 @@ class SimpleChatInput:
     approval_memory: list[str] = field(default_factory=list)
     approval_counter: int = 0
     good_place_censor: bool = False
+    state_revision: int = 0
+    transcript_revision: int = 0
 
 
 @dataclass
@@ -89,6 +97,8 @@ class SimpleChatState:
     active_message_index: int | None = None
     queued_message_indices: list[int] = field(default_factory=list)
     transcript: list[ChatMessage] = field(default_factory=list)
+    state_revision: int = 0
+    transcript_revision: int = 0
 
 
 @workflow.defn
@@ -111,10 +121,15 @@ class SimpleChatWorkflow:
         self._approval_memory: set[str] = set()
         self._approval_counter = 0
         self._delete_requested = False
+        self._stream_id: str | None = None
+        self._state_revision = 0
+        self._transcript_revision = 0
 
     @workflow.signal
     async def chat(self, message: str) -> None:
         self._enqueue_chat(message)
+        await self._emit_transcript_projection()
+        await self._emit_state_projection()
 
     @workflow.signal
     async def delete(self) -> None:
@@ -126,6 +141,7 @@ class SimpleChatWorkflow:
             self._transcript.append(
                 ChatMessage(role="system", content=f"Unknown steering mode: {mode}")
             )
+            await self._emit_transcript_projection()
             return
 
         if self._agent is None:
@@ -135,6 +151,7 @@ class SimpleChatWorkflow:
                     content="Agent is not ready yet; steering was ignored.",
                 )
             )
+            await self._emit_transcript_projection()
             return
 
         self._agent.steer(message, mode=cast(SteeringMode, mode))
@@ -149,11 +166,14 @@ class SimpleChatWorkflow:
                 content=f"Steering queued {label}: {message}",
             )
         )
+        await self._emit_transcript_projection()
 
     @workflow.signal
     async def interrupt(self, message: str) -> None:
         if self._agent is None or self._status != "responding":
             self._enqueue_chat(message)
+            await self._emit_transcript_projection()
+            await self._emit_state_projection()
             return
 
         self._agent.interrupt(message)
@@ -163,6 +183,7 @@ class SimpleChatWorkflow:
                 content=f"Interrupt sent; Claude will continue with: {message}",
             )
         )
+        await self._emit_transcript_projection()
 
     @workflow.signal
     async def update_tool_connections(
@@ -186,6 +207,8 @@ class SimpleChatWorkflow:
                 ),
             )
         )
+        await self._emit_state_projection()
+        await self._emit_transcript_projection()
 
     @workflow.signal
     async def resolve_approval(
@@ -200,6 +223,7 @@ class SimpleChatWorkflow:
                     content=f"Unknown approval decision: {decision}",
                 )
             )
+            await self._emit_transcript_projection()
             return
         approval = self._pending_approvals.get(approval_id)
         if approval is None:
@@ -209,6 +233,7 @@ class SimpleChatWorkflow:
                     content=f"Approval is no longer pending: {approval_id}",
                 )
             )
+            await self._emit_transcript_projection()
             return
 
         if (
@@ -218,6 +243,7 @@ class SimpleChatWorkflow:
             self._pending_approvals.pop(approval_id, None)
             if decision == "always_allow":
                 self._approval_memory.add(approval.memory_key)
+            await self._emit_state_projection()
             await self._signal_child_approval(
                 workflow_id=approval.requesting_workflow_id,
                 approval_id=approval.requesting_approval_id,
@@ -260,6 +286,7 @@ class SimpleChatWorkflow:
             requesting_workflow_id=request.child_workflow_id,
             requesting_approval_id=request.child_approval_id,
         )
+        await self._emit_state_projection()
 
     @workflow.query
     def state(self) -> SimpleChatState:
@@ -279,6 +306,8 @@ class SimpleChatWorkflow:
                 message.transcript_index for message in self._pending_messages
             ],
             transcript=list(self._transcript),
+            state_revision=self._state_revision,
+            transcript_revision=self._transcript_revision,
         )
 
     @workflow.query
@@ -292,12 +321,15 @@ class SimpleChatWorkflow:
         self._active_message_index = chat_input.active_message_index
         self._approval_memory = set(chat_input.approval_memory)
         self._approval_counter = chat_input.approval_counter
+        self._state_revision = chat_input.state_revision
+        self._transcript_revision = chat_input.transcript_revision
         self._user_ref = chat_input.user_ref
         self._conversation_id = chat_input.conversation_id
         self._model = chat_input.model
         self._thinking = chat_input.thinking
         self._github_connection_id = chat_input.github_connection_id
         self._mcp_servers = list(chat_input.mcp_servers)
+        self._stream_id = chat_input.stream_id or workflow.info().workflow_id
         self._available_tool_names = set(
             chat_input.available_tool_names
             or tool_names_for_connections(
@@ -321,11 +353,12 @@ class SimpleChatWorkflow:
             model=chat_input.model,
             max_tokens=chat_input.max_tokens,
             thinking=chat_input.thinking,
-            stream_id=chat_input.stream_id or workflow.info().workflow_id,
+            stream_id=self._stream_id,
             pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,
             post_llm_guards=[good_place_post_guard] if chat_input.good_place_censor else None,
         )
         self._status = "idle"
+        await self._emit_state_projection()
         resume_agent_state = chat_input.agent_state
 
         while True:
@@ -341,6 +374,7 @@ class SimpleChatWorkflow:
             else:
                 message = None
             self._status = "responding"
+            await self._emit_state_projection()
             try:
                 result = await self._run_agent_turn(
                     message=message,
@@ -366,12 +400,14 @@ class SimpleChatWorkflow:
                             role=original.role,
                             content=effective,
                         )
+                        await self._emit_transcript_projection()
                 self._transcript.append(
                     ChatMessage(
                         role="assistant",
                         content=_assistant_text(result.message),
                     )
                 )
+                await self._emit_transcript_projection()
             except Exception as err:
                 self._transcript.append(
                     ChatMessage(
@@ -379,9 +415,11 @@ class SimpleChatWorkflow:
                         content=f"{type(err).__name__}: {err}",
                     )
                 )
+                await self._emit_transcript_projection()
             finally:
                 self._active_message_index = None
                 self._status = "idle"
+                await self._emit_state_projection()
 
     def _enqueue_chat(self, message: str) -> None:
         transcript_index = len(self._transcript)
@@ -424,12 +462,14 @@ class SimpleChatWorkflow:
             summary=_approval_summary(tool_name, tool_args),
             memory_key=memory_key,
         )
+        await self._emit_state_projection()
 
         await workflow.wait_condition(
             lambda: approval_id in self._approval_decisions
         )
         decision = self._approval_decisions.pop(approval_id)
         self._pending_approvals.pop(approval_id, None)
+        await self._emit_state_projection()
 
         if decision == "always_allow":
             self._approval_memory.add(memory_key)
@@ -458,6 +498,80 @@ class SimpleChatWorkflow:
                     ),
                 )
             )
+            await self._emit_transcript_projection()
+
+    async def _emit_state_projection(self) -> None:
+        if not self._projection_events_enabled():
+            return
+        self._state_revision += 1
+        payload = {
+            **self._state_projection_payload(),
+            "revision": self._state_revision,
+            "transcript_revision": self._transcript_revision,
+        }
+        await self._emit_projection("workflow_state", payload)
+
+    async def _emit_transcript_projection(self) -> None:
+        if not self._projection_events_enabled():
+            return
+        self._transcript_revision += 1
+        await self._emit_projection(
+            "workflow_transcript",
+            {
+                "revision": self._transcript_revision,
+                "state_revision": self._state_revision,
+                "transcript": [asdict(message) for message in self._transcript],
+            },
+        )
+
+    def _projection_events_enabled(self) -> bool:
+        return self._stream_id is not None and workflow.patched(
+            "simple-chat-projection-events-v1"
+        )
+
+    async def _emit_projection(self, kind: str, payload: dict[str, Any]) -> None:
+        if self._stream_id is None:
+            return
+
+        try:
+            await workflow.execute_activity(
+                emit_stream_event_activity,
+                EmitStreamEventRequest(
+                    stream_id=self._stream_id,
+                    tool_name="workflow",
+                    step=None,
+                    kind=kind,
+                    payload=payload,
+                ),
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                summary=kind,
+            )
+        except Exception:
+            # The workflow state remains authoritative. Projection events are
+            # live UI visibility and are reconciled by occasional full queries.
+            pass
+
+    def _state_projection_payload(self) -> dict[str, Any]:
+        return {
+            "status": self._status,
+            "pending_messages": len(self._pending_messages),
+            "user_ref": self._user_ref,
+            "conversation_id": self._conversation_id,
+            "model": self._model,
+            "thinking": _dataclass_dict(self._thinking),
+            "available_tool_names": sorted(self._available_tool_names),
+            "github_connected": self._github_connection_id is not None,
+            "mcp_servers": [_dataclass_dict(server) for server in self._mcp_servers],
+            "pending_approvals": [
+                _dataclass_dict(approval)
+                for approval in self._pending_approvals.values()
+            ],
+            "active_message_index": self._active_message_index,
+            "queued_message_indices": [
+                message.transcript_index for message in self._pending_messages
+            ],
+        }
 
     def _continue_as_new_input(
         self,
@@ -483,6 +597,8 @@ class SimpleChatWorkflow:
             approval_memory=sorted(self._approval_memory),
             approval_counter=self._approval_counter,
             good_place_censor=chat_input.good_place_censor,
+            state_revision=self._state_revision,
+            transcript_revision=self._transcript_revision,
         )
 
 
@@ -500,6 +616,16 @@ def _assistant_text(message: dict[str, Any]) -> str:
                 text_parts.append(text)
 
     return "\n".join(text_parts)
+
+
+def _dataclass_dict(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "__dataclass_fields__"):
+        return asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
 
 
 def _block_dict(block: Any) -> dict[str, Any]:

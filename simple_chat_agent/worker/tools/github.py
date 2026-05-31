@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from claude_harness.streaming import StreamContext
 from claude_harness.tools import ToolContext, ToolResult, tool
 from claude_harness.tool_types import ToolType
-from simple_chat_agent.store import app_store
+from simple_chat_agent.common.store import app_store
 
 
 class GitHubProvider:

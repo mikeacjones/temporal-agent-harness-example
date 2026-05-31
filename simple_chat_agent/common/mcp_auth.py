@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from simple_chat_agent.store import app_store
-from simple_chat_agent.store import OAuthConnectionRecord
+from simple_chat_agent.common.store import app_store
+from simple_chat_agent.common.store import OAuthConnectionRecord
 
 
 def mcp_oauth_provider(server_id: str) -> str:
@@ -23,7 +23,7 @@ def resolve_mcp_auth_headers(auth_ref: str) -> Mapping[str, str]:
 
 
 def resolve_mcp_http_auth(auth_ref: str, server_url: str) -> Any | None:
-    from simple_chat_agent.mcp_oauth import mcp_oauth_provider_for_connection
+    from simple_chat_agent.common.mcp_oauth import mcp_oauth_provider_for_connection
 
     connection = _connection_for_auth_ref(auth_ref)
     if connection is None or not connection.access_token:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from claude_harness.llm_guards import LlmGuardContext, LlmGuardResult
 
-from simple_chat_agent.good_place import censor_content
+from simple_chat_agent.worker.good_place import censor_content
 
 
 def good_place_pre_guard(ctx: LlmGuardContext) -> LlmGuardResult:

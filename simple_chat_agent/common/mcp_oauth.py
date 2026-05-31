@@ -28,8 +28,8 @@ from mcp.shared.auth import (
 )
 from mcp.types import LATEST_PROTOCOL_VERSION
 
-from simple_chat_agent.mcp_auth import mcp_oauth_provider
-from simple_chat_agent.store import AppStore, OAuthConnectionRecord
+from simple_chat_agent.common.mcp_auth import mcp_oauth_provider
+from simple_chat_agent.common.store import AppStore, OAuthConnectionRecord
 
 
 @dataclass

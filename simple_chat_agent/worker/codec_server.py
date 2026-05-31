@@ -10,7 +10,7 @@ from google.protobuf.json_format import MessageToDict, ParseDict
 from temporalio.api.common.v1 import Payloads
 from temporalio.converter import DataConverter
 
-from simple_chat_agent.external_storage import simple_chat_data_converter
+from simple_chat_agent.common.external_storage import simple_chat_data_converter
 
 DEFAULT_CODEC_SERVER_HOST = "127.0.0.1"
 DEFAULT_CODEC_SERVER_PORT = 8001

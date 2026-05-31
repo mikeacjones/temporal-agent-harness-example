@@ -9,11 +9,11 @@ from typing import Any
 from temporalio.client import WorkflowHistory
 from temporalio.worker import Replayer
 
-from simple_chat_agent.env import load_dotenv
-from simple_chat_agent.external_storage import simple_chat_data_converter
-from simple_chat_agent.tools.subagent import SubagentWorkflow
-from simple_chat_agent.user_chats_workflow import UserChatsWorkflow
-from simple_chat_agent.workflow import SimpleChatWorkflow
+from simple_chat_agent.common.env import load_dotenv
+from simple_chat_agent.common.external_storage import simple_chat_data_converter
+from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
+from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
+from simple_chat_agent.worker.workflow import SimpleChatWorkflow
 
 
 WORKFLOWS = [SimpleChatWorkflow, UserChatsWorkflow, SubagentWorkflow]
