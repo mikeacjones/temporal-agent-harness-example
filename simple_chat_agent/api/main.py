@@ -13,7 +13,7 @@ from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     RedirectResponse,
@@ -22,6 +22,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.gzip import GZipMiddleware
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.service import RPCError, RPCStatusCode
@@ -31,6 +32,7 @@ from claude_harness.claude_agent import (
     MIN_THINKING_BUDGET_TOKENS,
     ClaudeThinkingConfig,
     ClaudeThinkingEffort,
+    ClaudeThinkingMode,
 )
 from claude_harness.mcp import (
     configure_mcp_auth_resolver,
@@ -62,6 +64,13 @@ from simple_chat_agent.api.github_oauth import (
     github_authorize_url,
     github_oauth_configured,
     github_scopes,
+)
+from simple_chat_agent.api.anthropic_models import (
+    EFFORT_ORDER,
+    AnthropicModelCatalog,
+    default_effort,
+    default_thinking_mode,
+    get_anthropic_model_catalog,
 )
 from simple_chat_agent.api.google_oauth import (
     GOOGLE_PROVIDER,
@@ -105,24 +114,20 @@ from simple_chat_agent.worker.user_chats_workflow import (
 )
 from simple_chat_agent.worker.workflow import (
     DEFAULT_MAX_TOKENS,
+    SimpleChatSnapshot,
     SimpleChatState,
     SimpleChatWorkflow,
+    TranscriptPage,
 )
 
-STREAM_POLL_INTERVAL_SECONDS = 0.01
-DEFAULT_THINKING_EFFORT: ClaudeThinkingEffort = "medium"
-ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-7",)
-DEFAULT_MODEL_OPTIONS = [
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-opus-4-7",
-    "claude-haiku-4-5",
-]
+STREAM_ACTIVE_POLL_INTERVAL_SECONDS = 0.02
+STREAM_IDLE_POLL_INTERVAL_SECONDS = 0.5
+DEFAULT_THINKING_EFFORT: ClaudeThinkingEffort = "max"
 
 
 class ThinkingSessionRequest(BaseModel):
     enabled: bool = False
+    mode: ClaudeThinkingMode | None = None
     budget_tokens: int = DEFAULT_THINKING_BUDGET_TOKENS
     effort: ClaudeThinkingEffort = DEFAULT_THINKING_EFFORT
 
@@ -187,6 +192,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+# Starlette excludes text/event-stream from gzip, so live SSE latency is not
+# traded for buffering while large JSON state snapshots still compress.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 # Local-dev fallback: the dedicated frontend server owns static assets in
 # deployment, but FastAPI can still serve them when run directly.
@@ -215,16 +223,22 @@ async def me(request: Request) -> dict[str, Any]:
 @app.get("/api/config")
 async def config(request: Request) -> dict[str, Any]:
     _current_user(request)
+    model_catalog = await asyncio.to_thread(get_anthropic_model_catalog)
+    default_model = model_catalog.model_by_id(model_catalog.default_model)
     return {
-        "default_model": _default_model(),
-        "model_options": _model_options(),
+        "default_model": model_catalog.default_model,
+        "model_options": model_catalog.model_ids(),
+        "models": [model.to_api_dict() for model in model_catalog.models],
+        "model_source": model_catalog.source,
+        "model_error": model_catalog.error,
         "thinking": {
             "enabled": False,
             "budget_tokens": DEFAULT_THINKING_BUDGET_TOKENS,
             "min_budget_tokens": MIN_THINKING_BUDGET_TOKENS,
-            "effort": DEFAULT_THINKING_EFFORT,
-            "effort_options": ["low", "medium", "high", "xhigh", "max"],
-            "adaptive_model_prefixes": list(ADAPTIVE_THINKING_MODEL_PREFIXES),
+            "mode": default_thinking_mode(default_model),
+            "mode_options": list(default_model.thinking_modes if default_model else ()),
+            "effort": default_effort(default_model),
+            "effort_options": list(default_model.effort_options if default_model else EFFORT_ORDER),
         },
     }
 
@@ -343,7 +357,8 @@ async def create_session(
     )
     registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
-    model = session_request.model or _default_model()
+    model_catalog = await asyncio.to_thread(get_anthropic_model_catalog)
+    model = session_request.model or _default_model(model_catalog)
     conversation = await registry.execute_update(
         UserChatsWorkflow.create_chat,
         CreateChatRequest(
@@ -379,8 +394,14 @@ async def create_session(
 
 
 @app.get("/api/sessions/{workflow_id}/state")
-async def get_state(request: Request, workflow_id: str) -> dict[str, Any]:
+async def get_state(
+    request: Request,
+    workflow_id: str,
+    response: Response,
+) -> dict[str, Any]:
     user = await _require_conversation_owner(request, workflow_id)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Stream-Cursor"] = _stream_cursor(workflow_id)
     try:
         state = await _query_state(workflow_id)
     except Exception as err:
@@ -398,6 +419,81 @@ async def get_state(request: Request, workflow_id: str) -> dict[str, Any]:
             workflow_id=workflow_id,
         ),
     )
+
+
+@app.get("/api/sessions/{workflow_id}/snapshot")
+async def get_snapshot(
+    request: Request,
+    workflow_id: str,
+    response: Response,
+    limit: int = Query(default=60, ge=1, le=200),
+) -> dict[str, Any]:
+    timings: list[tuple[str, float]] = []
+    started = time.perf_counter()
+    user = await _require_conversation_owner(request, workflow_id)
+    _record_timing(timings, "owner", started)
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Stream-Cursor"] = _stream_cursor(workflow_id)
+    query_started = time.perf_counter()
+    try:
+        snapshot = await _query_snapshot(workflow_id, limit=limit)
+    except Exception as err:
+        if not _is_temporal_not_found(err):
+            raise
+        await _forget_conversation(user.user_id, workflow_id, user.username)
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow execution not found. Start a new chat.",
+        ) from err
+    _record_timing(timings, "temporal", query_started)
+
+    artifacts_started = time.perf_counter()
+    artifacts = _store().list_artifacts(
+        user_id=user.user_id,
+        workflow_id=workflow_id,
+    )
+    _record_timing(timings, "artifacts", artifacts_started)
+
+    body = _snapshot_to_dict(snapshot, artifacts=artifacts)
+    _set_transcript_headers(response, body)
+    response.headers["Server-Timing"] = _server_timing(timings)
+    return body
+
+
+@app.get("/api/sessions/{workflow_id}/messages")
+async def get_messages(
+    request: Request,
+    workflow_id: str,
+    response: Response,
+    before: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=60, ge=1, le=200),
+) -> dict[str, Any]:
+    timings: list[tuple[str, float]] = []
+    started = time.perf_counter()
+    user = await _require_conversation_owner(request, workflow_id)
+    _record_timing(timings, "owner", started)
+    response.headers["Cache-Control"] = "no-store"
+
+    query_started = time.perf_counter()
+    try:
+        page = await _query_transcript_page(workflow_id, before=before, limit=limit)
+    except Exception as err:
+        if not _is_temporal_not_found(err):
+            raise
+        await _forget_conversation(user.user_id, workflow_id, user.username)
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow execution not found. Start a new chat.",
+        ) from err
+    _record_timing(timings, "temporal", query_started)
+
+    body = _transcript_page_to_dict(page)
+    response.headers["Server-Timing"] = _server_timing(timings)
+    response.headers["X-Transcript-Start"] = str(body["start"])
+    response.headers["X-Transcript-End"] = str(body["end"])
+    response.headers["X-Transcript-Total"] = str(body["total"])
+    return body
 
 
 @app.post("/api/sessions/{workflow_id}/chat")
@@ -1170,49 +1266,29 @@ def _clear_stream(stream_id: str) -> None:
         stream_path(stream_id).unlink(missing_ok=True)
 
 
-async def _poll_state(
-    workflow_id: str,
-    request: Request,
-    user: AuthenticatedUser,
-    last_state_json: str | None,
-    *,
-    state_event_id: str | None = None,
-) -> tuple[list[str], str | None, bool]:
-    """Query workflow state; return (sse chunks to emit, new last_state_json, stop)."""
-    try:
-        state = _state_to_dict(
-            await _query_state(workflow_id),
-            artifacts=_store().list_artifacts(
-                user_id=user.user_id,
-                workflow_id=workflow_id,
-            ),
-        )
-    except Exception as err:
-        if _is_temporal_not_found(err):
-            await _forget_conversation(user.user_id, workflow_id, user.username)
-            return (
-                [
-                    _sse(
-                        "missing",
-                        {
-                            "workflow_id": workflow_id,
-                            "message": "Workflow execution was not found.",
-                        },
-                    )
-                ],
-                last_state_json,
-                True,
-            )
-        return (
-            [_sse("error", {"message": f"{type(err).__name__}: {err}"})],
-            last_state_json,
-            False,
-        )
+def _stream_cursor(stream_id: str) -> str:
+    if _stream_http_enabled():
+        entry = _ensure_stream_buffer(stream_id)
+        return _buffer_event_id(entry, len(entry["events"]))
 
-    state_json = json.dumps(state, separators=(",", ":"))
-    if state_json != last_state_json:
-        return ([_sse("state", state, event_id=state_event_id)], state_json, False)
-    return ([], last_state_json, False)
+    path = stream_path(stream_id)
+    return str(path.stat().st_size if path.exists() else 0)
+
+
+def _stream_reconcile_event(
+    workflow_id: str,
+    *,
+    reason: str,
+    event_id: str,
+) -> str:
+    return _sse(
+        "reconcile",
+        {
+            "workflow_id": workflow_id,
+            "reason": reason,
+        },
+        event_id=event_id,
+    )
 
 
 async def _event_stream(workflow_id: str, request: Request) -> AsyncIterator[str]:
@@ -1232,56 +1308,43 @@ async def _file_event_stream(workflow_id: str, request: Request) -> AsyncIterato
     # this the whole stream file is re-sent on every reconnect, which duplicates
     # already-finalized turns in the UI.
     offset = 0
-    needs_state_snapshot = False
-    last_event_id = request.headers.get("last-event-id")
+    needs_reconcile = False
+    last_event_id = request.headers.get("last-event-id") or request.query_params.get(
+        "cursor"
+    )
     if last_event_id:
         try:
             offset = max(0, int(last_event_id))
         except ValueError:
-            needs_state_snapshot = True
+            needs_reconcile = True
             offset = path.stat().st_size if path.exists() else 0
         if not path.exists() or offset > path.stat().st_size:
-            needs_state_snapshot = True
+            needs_reconcile = True
             offset = path.stat().st_size if path.exists() else 0
-    elif path.exists():
-        # A new browser load gets an authoritative workflow snapshot first; do
-        # not replay historical visibility events into a stale stream panel.
-        # Browser auto-reconnects still send Last-Event-ID and resume normally.
-        needs_state_snapshot = True
-        offset = path.stat().st_size
     else:
-        needs_state_snapshot = True
+        offset = path.stat().st_size if path.exists() else 0
+        needs_reconcile = True
 
-    last_state_json: str | None = None
-    user = _current_user(request)
-    if needs_state_snapshot:
-        chunks, last_state_json, stop = await _poll_state(
+    if needs_reconcile:
+        yield _stream_reconcile_event(
             workflow_id,
-            request,
-            user,
-            last_state_json,
-            state_event_id=str(offset),
+            reason="stream cursor unavailable",
+            event_id=str(offset),
         )
-        for chunk in chunks:
-            yield chunk
-        if stop:
-            return
+        return
 
+    sleep_seconds = STREAM_ACTIVE_POLL_INTERVAL_SECONDS
     while not await request.is_disconnected():
+        emitted = False
         if path.exists():
             if offset > path.stat().st_size:
                 offset = path.stat().st_size
-                chunks, last_state_json, stop = await _poll_state(
+                yield _stream_reconcile_event(
                     workflow_id,
-                    request,
-                    user,
-                    last_state_json,
-                    state_event_id=str(offset),
+                    reason="stream cursor reset",
+                    event_id=str(offset),
                 )
-                for chunk in chunks:
-                    yield chunk
-                if stop:
-                    break
+                break
 
             new_lines: list[tuple[str, int]] = []
             with path.open("r", encoding="utf-8") as stream:
@@ -1295,9 +1358,15 @@ async def _file_event_stream(workflow_id: str, request: Request) -> AsyncIterato
 
             for line, position in new_lines:
                 with suppress(json.JSONDecodeError):
+                    emitted = True
                     yield _sse("stream", json.loads(line), event_id=str(position))
 
-        await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
+        sleep_seconds = (
+            STREAM_ACTIVE_POLL_INTERVAL_SECONDS
+            if emitted
+            else STREAM_IDLE_POLL_INTERVAL_SECONDS
+        )
+        await asyncio.sleep(sleep_seconds)
 
 
 async def _buffer_event_stream(
@@ -1305,59 +1374,50 @@ async def _buffer_event_stream(
 ) -> AsyncIterator[str]:
     # Resume by generation-scoped buffer index (the browser replays its last
     # received id). If the generation changed, this web process no longer has
-    # the exact missed events and must fall back to one authoritative snapshot.
+    # the exact missed events and asks the browser to fetch a JSON snapshot.
     entry = _ensure_stream_buffer(workflow_id)
     events = entry["events"]
-    last_event_id = request.headers.get("last-event-id")
-    needs_state_snapshot = False
+    last_event_id = request.headers.get("last-event-id") or request.query_params.get(
+        "cursor"
+    )
+    needs_reconcile = False
     if last_event_id:
         parsed_resume = _parse_buffer_event_id(last_event_id, entry)
         if parsed_resume is None or parsed_resume > len(events):
-            needs_state_snapshot = True
+            needs_reconcile = True
             resume = len(events)
         else:
             resume = parsed_resume
     else:
-        # A fresh browser load gets a full state snapshot first. Start at the
-        # current tail so old stream events do not recreate completed turns.
-        needs_state_snapshot = True
         resume = len(events)
+        needs_reconcile = True
 
-    last_state_json: str | None = None
-    user = _current_user(request)
-    if needs_state_snapshot:
-        chunks, last_state_json, stop = await _poll_state(
+    if needs_reconcile:
+        yield _stream_reconcile_event(
             workflow_id,
-            request,
-            user,
-            last_state_json,
-            state_event_id=_buffer_event_id(entry, resume),
+            reason="stream cursor unavailable",
+            event_id=_buffer_event_id(entry, resume),
         )
-        for chunk in chunks:
-            yield chunk
-        if stop:
-            return
+        return
     cursor_generation = entry["generation"]
 
+    sleep_seconds = STREAM_ACTIVE_POLL_INTERVAL_SECONDS
     while not await request.is_disconnected():
+        emitted = False
         entry = _ensure_stream_buffer(workflow_id)
         events = entry["events"]
         if entry["generation"] != cursor_generation or resume > len(events):
             resume = len(events)
             cursor_generation = entry["generation"]
-            chunks, last_state_json, stop = await _poll_state(
+            yield _stream_reconcile_event(
                 workflow_id,
-                request,
-                user,
-                last_state_json,
-                state_event_id=_buffer_event_id(entry, resume),
+                reason="stream buffer reset",
+                event_id=_buffer_event_id(entry, resume),
             )
-            for chunk in chunks:
-                yield chunk
-            if stop:
-                break
+            break
 
         for index in range(resume, len(events)):
+            emitted = True
             yield _sse(
                 "stream",
                 events[index],
@@ -1365,11 +1425,33 @@ async def _buffer_event_stream(
             )
         resume = len(events)
 
-        await asyncio.sleep(STREAM_POLL_INTERVAL_SECONDS)
+        sleep_seconds = (
+            STREAM_ACTIVE_POLL_INTERVAL_SECONDS
+            if emitted
+            else STREAM_IDLE_POLL_INTERVAL_SECONDS
+        )
+        await asyncio.sleep(sleep_seconds)
 
 
 async def _query_state(workflow_id: str) -> SimpleChatState:
     return await _handle(workflow_id).query(SimpleChatWorkflow.state)
+
+
+async def _query_snapshot(workflow_id: str, *, limit: int) -> SimpleChatSnapshot:
+    return await _handle(workflow_id).query(SimpleChatWorkflow.snapshot, limit)
+
+
+async def _query_transcript_page(
+    workflow_id: str,
+    *,
+    before: int | None,
+    limit: int,
+) -> TranscriptPage:
+    return await _handle(workflow_id).query(
+        SimpleChatWorkflow.transcript_page,
+        before,
+        limit,
+    )
 
 
 async def _signal_workflow(
@@ -1601,6 +1683,61 @@ def _state_to_dict(
     return state_dict
 
 
+def _snapshot_to_dict(
+    snapshot: SimpleChatSnapshot,
+    *,
+    artifacts: list[ArtifactRecord],
+) -> dict[str, Any]:
+    state = _state_to_dict(snapshot.state, artifacts=artifacts)
+    page = _transcript_page_to_dict(snapshot.transcript_page)
+    state["transcript"] = page["messages"]
+    state["transcript_offset"] = page["start"]
+    state["transcript_total"] = page["total"]
+    state["transcript_has_more_before"] = page["has_more_before"]
+    state["transcript_revision"] = max(
+        int(state.get("transcript_revision") or 0),
+        int(page.get("revision") or 0),
+    )
+    state["transcript_length"] = page["total"]
+    return state
+
+
+def _transcript_page_to_dict(page: TranscriptPage) -> dict[str, Any]:
+    return {
+        "messages": [
+            asdict(message) if is_dataclass(message) else dict(message)
+            for message in page.messages
+        ],
+        "start": page.start,
+        "end": page.end,
+        "total": page.total,
+        "revision": page.transcript_revision,
+        "has_more_before": page.start > 0,
+    }
+
+
+def _set_transcript_headers(response: Response, state: dict[str, Any]) -> None:
+    response.headers["X-Transcript-Start"] = str(state.get("transcript_offset", 0))
+    response.headers["X-Transcript-End"] = str(
+        int(state.get("transcript_offset", 0)) + len(state.get("transcript", []))
+    )
+    response.headers["X-Transcript-Total"] = str(
+        state.get("transcript_total", len(state.get("transcript", [])))
+    )
+
+
+def _record_timing(
+    timings: list[tuple[str, float]],
+    name: str,
+    started: float,
+) -> None:
+    timings.append((name, (time.perf_counter() - started) * 1000))
+
+
+def _server_timing(timings: list[tuple[str, float]]) -> str:
+    return ", ".join(f"{name};dur={duration:.1f}" for name, duration in timings)
+
+
 def _artifact_dicts(artifacts: list[ArtifactRecord]) -> list[dict[str, Any]]:
     return [_artifact_dict(artifact) for artifact in artifacts]
 
@@ -1725,22 +1862,13 @@ def _conversation_title(message: str) -> str:
     return f"{normalized[:61]}..."
 
 
-def _default_model() -> str:
-    return os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL_OPTIONS[0])
+def _default_model(model_catalog: AnthropicModelCatalog | None = None) -> str:
+    catalog = model_catalog or get_anthropic_model_catalog()
+    return catalog.default_model
 
 
 def _good_place_enabled() -> bool:
     return os.environ.get("SIMPLE_CHAT_GOOD_PLACE", "1").lower() in ("1", "true", "yes")
-
-
-def _model_options() -> list[str]:
-    configured = [
-        model.strip()
-        for model in os.environ.get("ANTHROPIC_MODEL_OPTIONS", "").split(",")
-        if model.strip()
-    ]
-    options = configured or DEFAULT_MODEL_OPTIONS
-    return _dedupe([_default_model(), *options])
 
 
 def _thinking_config_from_request(
@@ -1751,7 +1879,8 @@ def _thinking_config_from_request(
 ) -> ClaudeThinkingConfig | None:
     if not request.enabled:
         return None
-    if _uses_adaptive_thinking(model):
+    mode = request.mode or _default_thinking_mode_for_model(model)
+    if mode == "adaptive":
         return ClaudeThinkingConfig(
             enabled=True,
             mode="adaptive",
@@ -1766,23 +1895,17 @@ def _thinking_config_from_request(
         max(request.budget_tokens, MIN_THINKING_BUDGET_TOKENS),
         max_tokens - 1,
     )
-    return ClaudeThinkingConfig(enabled=True, budget_tokens=budget_tokens)
+    return ClaudeThinkingConfig(
+        enabled=True,
+        mode="enabled",
+        budget_tokens=budget_tokens,
+    )
 
 
-def _uses_adaptive_thinking(model: str) -> bool:
-    return any(model.startswith(prefix) for prefix in ADAPTIVE_THINKING_MODEL_PREFIXES)
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
-
+def _default_thinking_mode_for_model(model_id: str) -> ClaudeThinkingMode:
+    model = get_anthropic_model_catalog().model_by_id(model_id)
+    mode = default_thinking_mode(model)
+    return "adaptive" if mode == "adaptive" else "enabled"
 
 def main() -> None:
     uvicorn.run(

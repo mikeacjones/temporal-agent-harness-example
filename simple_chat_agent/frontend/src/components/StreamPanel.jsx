@@ -108,7 +108,7 @@ function StreamToolList({ events }) {
 
 function StreamToolEvent({ event }) {
   const payloadText = streamToolPayloadText(event);
-  const status = event.payload?.status;
+  const status = event.payload?.status || sandboxProgressStatus(event.payload);
   return (
     <div
       className={`stream-tool-event${
@@ -190,9 +190,21 @@ function streamPanelPreview(turn) {
 }
 
 function streamToolLabel(event) {
+  if (event.kind === "python_sandbox_stdout") return "python_sandbox stdout";
+  if (event.kind === "python_sandbox_stderr") return "python_sandbox stderr";
+  if (event.kind === "python_sandbox_progress") return "python_sandbox progress";
   const payloadToolName = event.payload?.tool_name;
   const name = payloadToolName || event.tool_name || "stream";
   return event.step ? `${name}:${event.step}` : name;
+}
+
+function sandboxProgressStatus(payload = {}) {
+  const elapsed = Number(payload.elapsed_seconds);
+  const timeout = Number(payload.timeout_seconds);
+  if (!Number.isFinite(elapsed) || !Number.isFinite(timeout) || timeout <= 0) {
+    return "";
+  }
+  return `${elapsed}s / ${timeout}s`;
 }
 
 function formatStreamValue(value) {

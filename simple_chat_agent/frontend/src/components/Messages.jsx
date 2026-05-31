@@ -6,16 +6,30 @@ import { visibleMessageItems } from "../state/chatState.js";
 export function Messages({
   workflowState,
   draftConversation,
+  loadingConversation,
+  olderMessagesLoading,
+  olderMessagesError,
   localPending,
   streamTurn,
   streamPanelCollapsed,
   resolvingApprovals,
   onToggleStreamPanel,
   onResolveApproval,
+  onLoadOlderMessages,
 }) {
   const transcript = workflowState?.transcript || [];
-  const messageItems = visibleMessageItems(transcript, localPending);
+  const transcriptOffset = workflowState?.transcript_offset || 0;
+  const transcriptTotal = workflowState?.transcript_total ?? transcriptOffset + transcript.length;
+  const messageItems = visibleMessageItems(
+    transcript,
+    localPending,
+    transcriptOffset,
+    transcriptTotal,
+  );
   const hasContent = workflowState || localPending.length > 0;
+  if (loadingConversation) {
+    return <ConversationLoading />;
+  }
   return (
     <>
       {!hasContent ? (
@@ -24,6 +38,13 @@ export function Messages({
             ? "Type your first message to start a Temporal workflow."
             : "Starting a Temporal workflow..."}
         </div>
+      ) : null}
+      {workflowState?.transcript_has_more_before ? (
+        <HistoryLoader
+          loading={olderMessagesLoading}
+          error={olderMessagesError}
+          onLoad={onLoadOlderMessages}
+        />
       ) : null}
       {messageItems.map((item) => (
         item.kind === "pending" ? (
@@ -53,6 +74,31 @@ export function Messages({
         onResolve={onResolveApproval}
       />
     </>
+  );
+}
+
+function HistoryLoader({ loading, error, onLoad }) {
+  return (
+    <div className="history-loader">
+      <button type="button" disabled={loading} onClick={onLoad}>
+        {loading ? "Loading earlier messages..." : "Load earlier messages"}
+      </button>
+      {error ? <span>{error}</span> : null}
+    </div>
+  );
+}
+
+function ConversationLoading() {
+  return (
+    <div className="conversation-loading" role="status" aria-live="polite">
+      <div className="conversation-loading-label">Loading</div>
+      <img
+        className="temporal-loading-animation"
+        src="/static/animated/temporal-logo-animation-inverted-transparent.gif"
+        alt=""
+        aria-hidden="true"
+      />
+    </div>
   );
 }
 

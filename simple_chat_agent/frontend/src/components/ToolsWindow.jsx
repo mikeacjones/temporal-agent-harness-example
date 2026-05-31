@@ -203,7 +203,11 @@ function ToolCard({ tool, status, connected, disabled, children }) {
 function McpForm({ values, submitting, error, onUpdate, onSubmit, onCancel }) {
   const prefixTouchedRef = useRef(false);
   return (
-    <form className="mcp-form" onSubmit={onSubmit}>
+    <form
+      className="mcp-form"
+      onSubmit={(event) => onSubmit(event, values)}
+      noValidate
+    >
       <McpField
         label="Label"
         name="label"

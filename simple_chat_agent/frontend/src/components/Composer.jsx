@@ -1,10 +1,23 @@
+import { useEffect, useState } from "react";
+
 export function Composer({
-  message,
   temporalUiUrl,
   onMessageChange,
   onSend,
   onInterrupt,
+  resetToken,
 }) {
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setMessage("");
+  }, [resetToken]);
+
+  function updateMessage(value) {
+    setMessage(value);
+    onMessageChange(value);
+  }
+
   return (
     <form
       className="composer"
@@ -15,7 +28,7 @@ export function Composer({
     >
       <textarea
         value={message}
-        onChange={(event) => onMessageChange(event.currentTarget.value)}
+        onChange={(event) => updateMessage(event.currentTarget.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();

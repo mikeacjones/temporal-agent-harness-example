@@ -8,14 +8,17 @@ import { Messages } from "./components/Messages.jsx";
 import { ToolsWindow } from "./components/ToolsWindow.jsx";
 import { artifactNeedsTextFetch, artifactPreviewKind } from "./utils/artifacts.js";
 import { jsonHeaders, responseErrorText } from "./utils/http.js";
+import { mcpOAuthStartUrl } from "./utils/tools.js";
 import {
   agentSettingsFromConfig,
   createPendingMessage,
   displayStatus,
   handleStreamEventInState,
   markStreamInterruptedInState,
+  normalizeAgentSettings,
+  prependTranscriptPageInState,
   saveAgentSettings,
-  selectedModelUsesAdaptiveThinking,
+  streamEventNeedsDeferredWorkflowReconcile,
   temporalUiUrl,
   updateWorkflowStateInState,
 } from "./state/chatState.js";
@@ -27,33 +30,57 @@ import {
 
 export default function App() {
   const [state, setState] = useState(initialState);
-  const [message, setMessage] = useState("");
+  const [composerResetToken, setComposerResetToken] = useState(0);
   const stateRef = useRef(state);
-  const messageRef = useRef(message);
+  const messageRef = useRef("");
   const eventSourceRef = useRef(null);
   const messagesRef = useRef(null);
   const pinnedToBottomRef = useRef(true);
+  const stateLoadRequestRef = useRef(0);
+  const restoreScrollAfterPrependRef = useRef(null);
+  const olderMessagesRequestRef = useRef(false);
+  const deferredWorkflowReconcileTimerRef = useRef(null);
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
   useEffect(() => {
-    messageRef.current = message;
-  }, [message]);
-
-  useEffect(() => {
     const run = { cancelled: false };
     boot(run);
     return () => {
       run.cancelled = true;
+      clearDeferredWorkflowReconcile();
       closeEventSource();
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        closeEventSource();
+        return;
+      }
+      const current = stateRef.current;
+      if (current.auth === "app" && current.workflowId) {
+        reconcileWorkflow(current.workflowId);
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 
   useLayoutEffect(() => {
     const messages = messagesRef.current;
     if (!messages) return;
+    if (restoreScrollAfterPrependRef.current !== null) {
+      messages.scrollTop = messages.scrollHeight - restoreScrollAfterPrependRef.current;
+      restoreScrollAfterPrependRef.current = null;
+      return;
+    }
     if (pinnedToBottomRef.current) {
       messages.scrollTop = messages.scrollHeight;
     }
@@ -117,13 +144,44 @@ export default function App() {
   }
 
   function closeEventSource() {
+    clearDeferredWorkflowReconcile();
     if (!eventSourceRef.current) return;
     eventSourceRef.current.close();
     eventSourceRef.current = null;
   }
 
+  function clearDeferredWorkflowReconcile() {
+    if (!deferredWorkflowReconcileTimerRef.current) return;
+    clearTimeout(deferredWorkflowReconcileTimerRef.current);
+    deferredWorkflowReconcileTimerRef.current = null;
+  }
+
+  function scheduleDeferredWorkflowReconcile(workflowId) {
+    clearDeferredWorkflowReconcile();
+    deferredWorkflowReconcileTimerRef.current = setTimeout(() => {
+      deferredWorkflowReconcileTimerRef.current = null;
+      if (document.hidden || stateRef.current.workflowId !== workflowId) return;
+      reconcileWorkflow(workflowId);
+    }, 900);
+  }
+
+  function nextStateLoadRequest() {
+    stateLoadRequestRef.current += 1;
+    return stateLoadRequestRef.current;
+  }
+
+  function updateComposerMessage(value) {
+    messageRef.current = value;
+  }
+
+  function clearComposerInput() {
+    messageRef.current = "";
+    setComposerResetToken((token) => token + 1);
+  }
+
   function showLogin() {
     closeEventSource();
+    nextStateLoadRequest();
     const params = new URLSearchParams(window.location.search);
     const loginError = params.has("oauth_error") ? params.get("oauth_error") || "" : "";
     if (params.has("oauth_error")) history.replaceState({}, "", "/");
@@ -189,6 +247,42 @@ export default function App() {
     return response.json();
   }
 
+  async function loadWorkflowStateData(workflowId) {
+    const started = performance.now();
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(workflowId)}/snapshot?limit=60`,
+    );
+    if (response.status === 401) {
+      showLogin();
+      return null;
+    }
+    if (response.status === 404) {
+      await handleMissingWorkflow();
+      return null;
+    }
+    if (!response.ok) throw new Error(await responseErrorText(response));
+    const workflowState = await response.json();
+    logSessionLoadTiming("snapshot", workflowId, started, response, workflowState);
+    return {
+      workflowState,
+      streamCursor: response.headers.get("x-stream-cursor") || "",
+    };
+  }
+
+  function logSessionLoadTiming(label, workflowId, started, response, workflowState) {
+    const elapsed = Math.round(performance.now() - started);
+    const serverTiming = response.headers.get("server-timing") || "";
+    console.debug("conversation load", {
+      label,
+      workflowId,
+      elapsed,
+      serverTiming,
+      transcriptStart: workflowState?.transcript_offset ?? 0,
+      transcriptCount: workflowState?.transcript?.length ?? 0,
+      transcriptTotal: workflowState?.transcript_total ?? 0,
+    });
+  }
+
   async function refreshTools() {
     const tools = await loadToolsData();
     setState((previous) => ({ ...previous, tools }));
@@ -202,6 +296,9 @@ export default function App() {
 
   function startDraftConversation() {
     closeEventSource();
+    nextStateLoadRequest();
+    olderMessagesRequestRef.current = false;
+    restoreScrollAfterPrependRef.current = null;
     localStorage.removeItem("simpleChatWorkflowId");
     setState((previous) => ({
       ...previous,
@@ -211,6 +308,8 @@ export default function App() {
       workflowState: null,
       workflowStateProjectionRevision: 0,
       workflowTranscriptProjectionRevision: 0,
+      olderMessagesLoading: false,
+      olderMessagesError: "",
       streamTurn: null,
       streamPanelCollapsed: false,
       currentClaudeSequence: null,
@@ -228,6 +327,9 @@ export default function App() {
     const conversation = conversations.find((item) => item.workflow_id === workflowId);
     if (!conversation) return;
     closeEventSource();
+    const loadRequest = nextStateLoadRequest();
+    olderMessagesRequestRef.current = false;
+    restoreScrollAfterPrependRef.current = null;
     localStorage.setItem("simpleChatWorkflowId", conversation.workflow_id);
     setState((previous) => ({
       ...previous,
@@ -238,6 +340,8 @@ export default function App() {
       workflowState: null,
       workflowStateProjectionRevision: 0,
       workflowTranscriptProjectionRevision: 0,
+      olderMessagesLoading: false,
+      olderMessagesError: "",
       streamTurn: null,
       streamPanelCollapsed: false,
       currentClaudeSequence: null,
@@ -248,13 +352,119 @@ export default function App() {
       artifactViewer: emptyArtifactViewer,
       statusNotice: "",
     }));
-    connectEvents(conversation.workflow_id);
+    loadWorkflowStateAndConnect(conversation.workflow_id, loadRequest).catch((error) => {
+      if (stateLoadRequestRef.current !== loadRequest) return;
+      setStatusNotice(`state load failed: ${error}`);
+    });
   }
 
-  function connectEvents(workflowId) {
+  async function loadWorkflowStateAndConnect(workflowId, loadRequest) {
+    const loaded = await loadWorkflowStateData(workflowId);
+    if (!loaded) return;
+    if (
+      stateLoadRequestRef.current !== loadRequest ||
+      stateRef.current.workflowId !== workflowId
+    ) {
+      return;
+    }
+    setState((previous) =>
+      previous.workflowId === workflowId
+        ? updateWorkflowStateInState(previous, loaded.workflowState)
+        : previous,
+    );
+    connectEvents(workflowId, { cursor: loaded.streamCursor });
+  }
+
+  function reconcileWorkflow(workflowId) {
     if (!workflowId) return;
     closeEventSource();
-    const eventSource = new EventSource(`/api/sessions/${workflowId}/events`);
+    const loadRequest = nextStateLoadRequest();
+    loadWorkflowStateAndConnect(workflowId, loadRequest).catch((error) => {
+      if (stateLoadRequestRef.current !== loadRequest) return;
+      setStatusNotice(`state reconcile failed: ${error}`);
+    });
+  }
+
+  async function loadOlderMessages() {
+    const current = stateRef.current;
+    const workflowState = current.workflowState;
+    if (
+      !current.workflowId ||
+      !workflowState ||
+      current.olderMessagesLoading ||
+      olderMessagesRequestRef.current ||
+      !workflowState.transcript_has_more_before
+    ) {
+      return;
+    }
+
+    const before = Number(workflowState.transcript_offset || 0);
+    if (before <= 0) return;
+
+    const messages = messagesRef.current;
+    restoreScrollAfterPrependRef.current = messages
+      ? messages.scrollHeight - messages.scrollTop
+      : null;
+    olderMessagesRequestRef.current = true;
+
+    setState((previous) => ({
+      ...previous,
+      olderMessagesLoading: true,
+      olderMessagesError: "",
+    }));
+
+    try {
+      const started = performance.now();
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(current.workflowId)}/messages?before=${before}&limit=60`,
+      );
+      if (response.status === 401) {
+        setState((previous) => ({ ...previous, olderMessagesLoading: false }));
+        showLogin();
+        return;
+      }
+      if (response.status === 404) {
+        setState((previous) => ({ ...previous, olderMessagesLoading: false }));
+        await handleMissingWorkflow();
+        return;
+      }
+      if (!response.ok) throw new Error(await responseErrorText(response));
+      const page = await response.json();
+      console.debug("conversation load", {
+        label: "messages",
+        workflowId: current.workflowId,
+        elapsed: Math.round(performance.now() - started),
+        serverTiming: response.headers.get("server-timing") || "",
+        transcriptStart: page.start,
+        transcriptCount: page.messages?.length || 0,
+        transcriptTotal: page.total,
+      });
+      setState((previous) =>
+        previous.workflowId === current.workflowId
+          ? prependTranscriptPageInState(previous, page)
+          : previous,
+      );
+    } catch (error) {
+      restoreScrollAfterPrependRef.current = null;
+      setState((previous) => ({
+        ...previous,
+        olderMessagesLoading: false,
+        olderMessagesError: String(error),
+      }));
+    } finally {
+      olderMessagesRequestRef.current = false;
+    }
+  }
+
+  function connectEvents(workflowId, options = {}) {
+    if (!workflowId) return;
+    closeEventSource();
+    const params = new URLSearchParams();
+    if (options.cursor) params.set("cursor", options.cursor);
+    const query = params.toString();
+    const eventSource = new EventSource(
+      `/api/sessions/${encodeURIComponent(workflowId)}/events${query ? `?${query}` : ""}`,
+    );
     eventSourceRef.current = eventSource;
     eventSource.addEventListener("state", (event) => {
       const nextState = JSON.parse(event.data);
@@ -262,13 +472,26 @@ export default function App() {
     });
     eventSource.addEventListener("stream", (event) => {
       const streamEvent = JSON.parse(event.data);
+      clearDeferredWorkflowReconcile();
       setState((previous) => handleStreamEventInState(previous, streamEvent));
+      if (streamEventNeedsDeferredWorkflowReconcile(streamEvent)) {
+        scheduleDeferredWorkflowReconcile(workflowId);
+      }
     });
     eventSource.addEventListener("missing", () => {
       handleMissingWorkflow();
     });
+    eventSource.addEventListener("reconcile", () => {
+      if (stateRef.current.workflowId === workflowId) {
+        reconcileWorkflow(workflowId);
+      }
+    });
     eventSource.addEventListener("error", () => {
-      setStatusNotice("event stream reconnecting...");
+      setState((previous) =>
+        previous.statusNotice === "event stream reconnecting..."
+          ? previous
+          : { ...previous, statusNotice: "event stream reconnecting..." },
+      );
     });
   }
 
@@ -307,17 +530,20 @@ export default function App() {
     const agentSettings = {
       model: current.agentSettings.model || config.default_model || "",
       thinkingEnabled: Boolean(current.agentSettings.thinkingEnabled),
+      thinkingMode: current.agentSettings.thinkingMode || config.thinking?.mode || "enabled",
       thinkingBudgetTokens: budgetTokens,
-      thinkingEffort: current.agentSettings.thinkingEffort || config.thinking?.effort || "medium",
+      thinkingEffort: current.agentSettings.thinkingEffort || config.thinking?.effort || "max",
     };
-    saveAgentSettings(agentSettings);
-    setState((previous) => ({ ...previous, agentSettings }));
+    const normalizedSettings = normalizeAgentSettings(agentSettings, config);
+    saveAgentSettings(normalizedSettings);
+    setState((previous) => ({ ...previous, agentSettings: normalizedSettings }));
     return {
-      model: agentSettings.model,
+      model: normalizedSettings.model,
       thinking: {
-        enabled: agentSettings.thinkingEnabled,
+        enabled: normalizedSettings.thinkingEnabled,
+        mode: normalizedSettings.thinkingMode,
         budget_tokens: budgetTokens,
-        effort: agentSettings.thinkingEffort,
+        effort: normalizedSettings.thinkingEffort,
       },
     };
   }
@@ -337,7 +563,7 @@ export default function App() {
     const current = stateRef.current;
     if (!current.workflowId) {
       if (action === "interrupt" || action === "steer" || action === "after-tool") return;
-      setMessage("");
+      clearComposerInput();
       const pending = createPendingMessage(label, content, phase, current);
       setState((previous) => ({
         ...previous,
@@ -352,7 +578,7 @@ export default function App() {
       return;
     }
 
-    setMessage("");
+    clearComposerInput();
     const pending = createPendingMessage(label, content, phase, current);
     setState((previous) => {
       let next = {
@@ -462,6 +688,7 @@ export default function App() {
 
     if (deletingCurrent) {
       closeEventSource();
+      nextStateLoadRequest();
       if (localStorage.getItem("simpleChatWorkflowId") === workflowId) {
         localStorage.removeItem("simpleChatWorkflowId");
       }
@@ -471,6 +698,8 @@ export default function App() {
         workflowState: null,
         workflowStateProjectionRevision: 0,
         workflowTranscriptProjectionRevision: 0,
+        olderMessagesLoading: false,
+        olderMessagesError: "",
         streamTurn: null,
         localPending: [],
         artifactViewer: emptyArtifactViewer,
@@ -496,6 +725,23 @@ export default function App() {
     try {
       await post(`/api/sessions/${stateRef.current.workflowId}/approvals/${approvalId}`, {
         decision,
+      });
+      setState((previous) => {
+        const resolvingApprovals = new Set(previous.resolvingApprovals);
+        resolvingApprovals.delete(approvalId);
+        if (!previous.workflowState) {
+          return { ...previous, resolvingApprovals };
+        }
+        return {
+          ...previous,
+          resolvingApprovals,
+          workflowState: {
+            ...previous.workflowState,
+            pending_approvals: (previous.workflowState.pending_approvals || []).filter(
+              (approval) => approval.approval_id !== approvalId,
+            ),
+          },
+        };
       });
     } catch (error) {
       setState((previous) => {
@@ -588,14 +834,28 @@ export default function App() {
     await refreshTools();
   }
 
-  async function addHttpMcpServer(event) {
+  async function addHttpMcpServer(event, submittedValues = null) {
     event.preventDefault();
-    const values = stateRef.current.mcpFormValues;
+    const values = submittedValues || stateRef.current.mcpFormValues;
     const label = values.label.trim();
     const serverUrl = values.server_url.trim();
     const toolPrefix = values.tool_prefix.trim();
     const authMode = values.auth_mode || "none";
     const bearerToken = values.bearer_token.trim();
+    const validationError = mcpFormValidationError({
+      label,
+      serverUrl,
+      toolPrefix,
+      authMode,
+      bearerToken,
+    });
+    if (validationError) {
+      setState((previous) => ({
+        ...previous,
+        mcpFormError: validationError,
+      }));
+      return;
+    }
 
     if (authMode === "oauth") {
       window.location.href = mcpOAuthStartUrl({
@@ -637,9 +897,26 @@ export default function App() {
     }
   }
 
+  function mcpFormValidationError({
+    label,
+    serverUrl,
+    toolPrefix,
+    authMode,
+    bearerToken,
+  }) {
+    if (!label) return "Label is required.";
+    if (!serverUrl) return "HTTP URL is required.";
+    if (!toolPrefix) return "Tool prefix is required.";
+    if (authMode === "bearer" && !bearerToken) return "Bearer token is required.";
+    return "";
+  }
+
   function updateAgentSettings(patch) {
     setState((previous) => {
-      const agentSettings = { ...previous.agentSettings, ...patch };
+      const agentSettings = normalizeAgentSettings(
+        { ...previous.agentSettings, ...patch },
+        previous.config || {},
+      );
       saveAgentSettings(agentSettings);
       return { ...previous, agentSettings };
     });
@@ -693,9 +970,14 @@ export default function App() {
     }, 750);
   }
 
-  const adaptiveThinking = selectedModelUsesAdaptiveThinking(state);
   const status = displayStatus(state);
   const artifacts = state.workflowState?.artifacts || [];
+  const loadingConversation = Boolean(
+    state.workflowId &&
+      !state.workflowState &&
+      !state.draftConversation &&
+      state.localPending.length === 0,
+  );
 
   return (
     <>
@@ -710,7 +992,6 @@ export default function App() {
       <div className="app" hidden={state.auth !== "app"}>
         <AppHeader
           state={state}
-          adaptiveThinking={adaptiveThinking}
           status={status}
           onNewChat={startDraftConversation}
           onOpenTools={() =>
@@ -743,11 +1024,19 @@ export default function App() {
               const node = event.currentTarget;
               pinnedToBottomRef.current =
                 node.scrollHeight - node.scrollTop - node.clientHeight < 80;
+              if (node.scrollTop < 180) {
+                loadOlderMessages().catch((error) => {
+                  setStatusNotice(`older messages failed: ${error}`);
+                });
+              }
             }}
           >
             <Messages
               workflowState={state.workflowState}
               draftConversation={state.draftConversation}
+              loadingConversation={loadingConversation}
+              olderMessagesLoading={state.olderMessagesLoading}
+              olderMessagesError={state.olderMessagesError}
               localPending={state.localPending}
               streamTurn={state.streamTurn}
               streamPanelCollapsed={state.streamPanelCollapsed}
@@ -759,6 +1048,7 @@ export default function App() {
                 }))
               }
               onResolveApproval={resolveApproval}
+              onLoadOlderMessages={loadOlderMessages}
             />
           </section>
           <aside className="sidebar">
@@ -768,11 +1058,11 @@ export default function App() {
         </main>
         <ArtifactsPanel artifacts={artifacts} onOpen={openArtifactViewer} />
         <Composer
-          message={message}
           temporalUiUrl={state.temporalUiUrl}
-          onMessageChange={setMessage}
+          onMessageChange={updateComposerMessage}
           onSend={sendDefault}
           onInterrupt={() => sendAction("interrupt", "you interrupt", "sending")}
+          resetToken={composerResetToken}
         />
         <ToolsWindow
           open={state.toolsWindowOpen}

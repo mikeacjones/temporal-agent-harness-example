@@ -33,7 +33,10 @@ LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
     description=(
         "Execute Python code in an isolated sandbox. Use this for calculations, "
         "scripts, imports, network calls, parsing, and data transformations. "
-        "Runtime, output, permissions, and retries are bounded by the sandbox."
+        "For long-running work, write progress to stdout or stderr with print() "
+        "or sys.stderr.write(); that output streams back to the user while the "
+        "code is still running. Runtime, output, permissions, and retries are "
+        "bounded by the sandbox."
     ),
     tool_type=ToolType.MUTATING,
     pre_guards=["mutating_tool_approval"],

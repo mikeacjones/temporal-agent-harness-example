@@ -14,7 +14,7 @@ from claude_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
-from claude_harness.streaming import configure_stream_sink, emit_stream_event_activity
+from claude_harness.streaming import configure_stream_sink
 from claude_harness.tools import run_tool_activity
 from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.worker.codec_server import (
@@ -60,7 +60,6 @@ async def main() -> None:
             call_claude,
             run_tool_activity,
             run_guard_activity,
-            emit_stream_event_activity,
         ],
     )
     if not codec_server_enabled():

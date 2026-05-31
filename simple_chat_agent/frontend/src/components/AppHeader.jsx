@@ -1,8 +1,14 @@
 import { ConversationList } from "./ConversationList.jsx";
+import {
+  agentSettingsFromWorkflowState,
+  defaultThinkingModeForModel,
+  effortOptionsForModel,
+  modelOptionsForSelection,
+  thinkingModesForModel,
+} from "../state/chatState.js";
 
 export function AppHeader({
   state,
-  adaptiveThinking,
   status,
   onNewChat,
   onOpenTools,
@@ -12,6 +18,27 @@ export function AppHeader({
   onSelectConversation,
   onDeleteConversation,
 }) {
+  const settingsLocked = Boolean(state.workflowId && !state.draftConversation);
+  const displayedSettings =
+    settingsLocked && state.workflowState
+      ? agentSettingsFromWorkflowState(state.workflowState, state.config || {})
+      : state.agentSettings;
+  const selectedModel = displayedSettings.model || state.config?.default_model || "";
+  const modelOptions = modelOptionsForSelection(state.config, selectedModel);
+  const baseThinkingModes = thinkingModesForModel(state.config, selectedModel);
+  const thinkingModes =
+    displayedSettings.thinkingMode && !baseThinkingModes.includes(displayedSettings.thinkingMode)
+      ? [displayedSettings.thinkingMode, ...baseThinkingModes]
+      : baseThinkingModes;
+  const baseEffortOptions = effortOptionsForModel(state.config, selectedModel);
+  const effortOptions =
+    displayedSettings.thinkingEffort && !baseEffortOptions.includes(displayedSettings.thinkingEffort)
+      ? [displayedSettings.thinkingEffort, ...baseEffortOptions]
+      : baseEffortOptions;
+  const adaptiveThinking =
+    displayedSettings.thinkingMode === "adaptive" &&
+    thinkingModes.includes("adaptive");
+
   return (
     <header>
       <div className="header-left">
@@ -48,14 +75,15 @@ export function AppHeader({
               <label htmlFor="modelSelect">Model</label>
               <select
                 id="modelSelect"
-                value={state.agentSettings.model || state.config?.default_model || ""}
+                value={selectedModel}
+                disabled={settingsLocked}
                 onChange={(event) =>
                   onUpdateAgentSettings({ model: event.currentTarget.value })
                 }
               >
-                {(state.config?.model_options || []).map((model) => (
-                  <option key={model} value={model}>
-                    {model}
+                {modelOptions.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.display_name || model.id}
                   </option>
                 ))}
               </select>
@@ -64,7 +92,8 @@ export function AppHeader({
               <input
                 id="thinkingEnabled"
                 type="checkbox"
-                checked={state.agentSettings.thinkingEnabled}
+                checked={displayedSettings.thinkingEnabled}
+                disabled={settingsLocked || !thinkingModes.length}
                 onChange={(event) =>
                   onUpdateAgentSettings({
                     thinkingEnabled: event.currentTarget.checked,
@@ -75,8 +104,32 @@ export function AppHeader({
             </label>
             <div
               className="agent-field"
+              id="thinkingModeField"
+              hidden={!displayedSettings.thinkingEnabled || thinkingModes.length <= 1}
+            >
+              <label htmlFor="thinkingMode">Mode</label>
+              <select
+                id="thinkingMode"
+                disabled={settingsLocked}
+                value={
+                  displayedSettings.thinkingMode ||
+                  defaultThinkingModeForModel(state.config, selectedModel)
+                }
+                onChange={(event) =>
+                  onUpdateAgentSettings({ thinkingMode: event.currentTarget.value })
+                }
+              >
+                {thinkingModes.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {thinkingModeLabel(mode)}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div
+              className="agent-field"
               id="thinkingBudgetField"
-              hidden={!state.agentSettings.thinkingEnabled || adaptiveThinking}
+              hidden={!displayedSettings.thinkingEnabled || adaptiveThinking}
             >
               <label htmlFor="thinkingBudget">Budget tokens</label>
               <input
@@ -84,24 +137,26 @@ export function AppHeader({
                 type="number"
                 min={state.config?.thinking?.min_budget_tokens || 1024}
                 step="1024"
-                value={state.agentSettings.thinkingBudgetTokens}
+                value={displayedSettings.thinkingBudgetTokens}
+                disabled={settingsLocked}
                 onChange={(event) => onUpdateThinkingBudget(event.currentTarget.value)}
               />
             </div>
             <div
               className="agent-field"
               id="thinkingEffortField"
-              hidden={!state.agentSettings.thinkingEnabled || !adaptiveThinking}
+              hidden={!displayedSettings.thinkingEnabled || !adaptiveThinking}
             >
               <label htmlFor="thinkingEffort">Effort</label>
               <select
                 id="thinkingEffort"
-                value={state.agentSettings.thinkingEffort}
+                value={displayedSettings.thinkingEffort}
+                disabled={settingsLocked}
                 onChange={(event) =>
                   onUpdateAgentSettings({ thinkingEffort: event.currentTarget.value })
                 }
               >
-                {(state.config?.thinking?.effort_options || ["medium"]).map((effort) => (
+                {effortOptions.map((effort) => (
                   <option key={effort} value={effort}>
                     {effort}
                   </option>
@@ -125,4 +180,10 @@ export function AppHeader({
       <div className="status">{status}</div>
     </header>
   );
+}
+
+function thinkingModeLabel(mode) {
+  if (mode === "adaptive") return "Adaptive effort";
+  if (mode === "enabled") return "Token budget";
+  return mode;
 }

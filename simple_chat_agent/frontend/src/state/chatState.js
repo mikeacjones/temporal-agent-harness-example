@@ -36,9 +36,29 @@ export function updateWorkflowStateInState(previous, nextWorkflowState) {
 }
 
 function normalizeWorkflowState(nextWorkflowState, previousWorkflowState = null) {
+  const nextTranscript = nextWorkflowState.transcript || previousWorkflowState?.transcript || [];
+  const hasTranscript = Object.prototype.hasOwnProperty.call(
+    nextWorkflowState,
+    "transcript",
+  );
+  const transcriptOffset = hasTranscript
+    ? Number(nextWorkflowState.transcript_offset || 0)
+    : Number(previousWorkflowState?.transcript_offset || 0);
+  const transcriptTotal = Number(
+    nextWorkflowState.transcript_total ??
+      nextWorkflowState.transcript_length ??
+      previousWorkflowState?.transcript_total ??
+      transcriptOffset + nextTranscript.length,
+  );
   return {
     ...nextWorkflowState,
-    transcript: nextWorkflowState.transcript || [],
+    transcript: nextTranscript,
+    transcript_offset: transcriptOffset,
+    transcript_total: transcriptTotal,
+    transcript_has_more_before:
+      nextWorkflowState.transcript_has_more_before ??
+      previousWorkflowState?.transcript_has_more_before ??
+      transcriptOffset > 0,
     pending_approvals: nextWorkflowState.pending_approvals || [],
     queued_message_indices: nextWorkflowState.queued_message_indices || [],
     artifacts: nextWorkflowState.artifacts || previousWorkflowState?.artifacts || [],
@@ -51,36 +71,120 @@ export function createPendingMessage(label, content, phase, state) {
     label,
     content,
     phase,
-    transcriptIndex: state.workflowState?.transcript?.length || 0,
+    transcriptIndex: workflowTranscriptEnd(state.workflowState),
   };
 }
 
-export function visibleMessageItems(transcript, localPending) {
+export function visibleMessageItems(transcript, localPending, transcriptOffset = 0, transcriptTotal = null) {
+  const transcriptEnd = transcriptOffset + transcript.length;
+  const total = transcriptTotal ?? transcriptEnd;
   const pendingByIndex = new Map();
   for (const pending of localPending) {
     if (isPendingAcknowledgedByTranscript(pending, transcript)) continue;
-    const index = pendingTranscriptIndex(pending, transcript.length);
+    const index = pendingTranscriptIndex(pending, total);
+    if (index < transcriptOffset || index > transcriptEnd) continue;
     const pendingAtIndex = pendingByIndex.get(index) || [];
     pendingAtIndex.push(pending);
     pendingByIndex.set(index, pendingAtIndex);
   }
 
   const items = [];
-  for (let index = 0; index <= transcript.length; index += 1) {
+  for (let index = transcriptOffset; index <= transcriptEnd; index += 1) {
     for (const pending of pendingByIndex.get(index) || []) {
       items.push({ kind: "pending", pending });
     }
-    if (index < transcript.length) {
-      items.push({ kind: "transcript", message: transcript[index], index });
+    if (index < transcriptEnd) {
+      items.push({
+        kind: "transcript",
+        message: transcript[index - transcriptOffset],
+        index,
+      });
     }
   }
   return items;
+}
+
+export function prependTranscriptPageInState(previous, page) {
+  if (!previous.workflowState) return previous;
+  return {
+    ...previous,
+    workflowState: mergeWorkflowTranscriptPage(previous.workflowState, page),
+    workflowTranscriptProjectionRevision: Math.max(
+      previous.workflowTranscriptProjectionRevision || 0,
+      Number(page.revision || 0),
+    ),
+    olderMessagesLoading: false,
+    olderMessagesError: "",
+  };
+}
+
+function mergeWorkflowTranscriptPage(workflowState, page) {
+  const messages = page.messages || page.transcript || [];
+  const pageStart = Number(page.start ?? 0);
+  const pageEnd = Number(page.end ?? pageStart + messages.length);
+  const pageTotal = Number(page.total ?? workflowTranscriptEnd(workflowState));
+  const currentTranscript = workflowState.transcript || [];
+  const currentStart = Number(workflowState.transcript_offset || 0);
+  const currentEnd = currentStart + currentTranscript.length;
+
+  if (!currentTranscript.length) {
+    return {
+      ...workflowState,
+      transcript: messages,
+      transcript_offset: pageStart,
+      transcript_total: pageTotal,
+      transcript_length: pageTotal,
+      transcript_has_more_before: pageStart > 0,
+    };
+  }
+
+  if (pageEnd < currentStart || pageStart > currentEnd) {
+    return {
+      ...workflowState,
+      transcript: messages,
+      transcript_offset: pageStart,
+      transcript_total: pageTotal,
+      transcript_length: pageTotal,
+      transcript_has_more_before: pageStart > 0,
+    };
+  }
+
+  const mergedStart = Math.min(currentStart, pageStart);
+  const mergedEnd = Math.max(currentEnd, pageEnd);
+  const merged = new Array(mergedEnd - mergedStart);
+  currentTranscript.forEach((message, index) => {
+    merged[currentStart - mergedStart + index] = message;
+  });
+  messages.forEach((message, index) => {
+    merged[pageStart - mergedStart + index] = message;
+  });
+
+  return {
+    ...workflowState,
+    transcript: merged.filter(Boolean),
+    transcript_offset: mergedStart,
+    transcript_total: Math.max(pageTotal, workflowState.transcript_total || 0, mergedEnd),
+    transcript_length: Math.max(pageTotal, workflowState.transcript_total || 0, mergedEnd),
+    transcript_has_more_before: mergedStart > 0,
+  };
+}
+
+function workflowTranscriptEnd(workflowState) {
+  if (!workflowState) return 0;
+  const total = Number(workflowState.transcript_total ?? workflowState.transcript_length);
+  if (Number.isFinite(total)) return total;
+  return Number(workflowState.transcript_offset || 0) + (workflowState.transcript || []).length;
 }
 
 function pendingTranscriptIndex(pending, transcriptLength) {
   const index = Number(pending.transcriptIndex);
   if (!Number.isFinite(index)) return transcriptLength;
   return Math.max(0, Math.min(transcriptLength, index));
+}
+
+function rawPendingTranscriptIndex(pending) {
+  const index = Number(pending.transcriptIndex);
+  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
 }
 
 export function handleStreamEventInState(previous, event) {
@@ -101,6 +205,9 @@ export function handleStreamEventInState(previous, event) {
   if (event.kind === "claude_start") {
     next.currentClaudeSequence = sequence;
     next.ignoreClaudeUntilStart = false;
+    if (next.workflowState) {
+      next.workflowState = { ...next.workflowState, status: "responding" };
+    }
     if (isOpenStreamTurn(next.streamTurn)) {
       registerStreamSequence(next.streamTurn, sequence);
       next.streamTurn.status = "streaming";
@@ -137,7 +244,7 @@ export function handleStreamEventInState(previous, event) {
       turn.lastClaudeCompletedAt = new Date().toISOString();
     }
     if (terminal) {
-      return next;
+      return settleCompletedClaudeTurnInState(next, event.payload || {});
     }
   } else if (isClaudeToolEvent(event)) {
     const turn = ensureStreamTurn(next, next.currentClaudeSequence);
@@ -153,6 +260,10 @@ export function handleStreamEventInState(previous, event) {
     }
   }
   return next;
+}
+
+export function streamEventNeedsDeferredWorkflowReconcile(event) {
+  return event.kind === "claude_complete" && event.payload?.stop_reason === "tool_use";
 }
 
 function applyWorkflowProjectionEventInState(previous, event) {
@@ -173,6 +284,12 @@ function applyWorkflowProjectionEventInState(previous, event) {
         state_revision: revision || previous.workflowState.state_revision || 0,
         transcript_revision: previous.workflowState.transcript_revision || 0,
         transcript: previous.workflowState.transcript || [],
+        transcript_offset: previous.workflowState.transcript_offset || 0,
+        transcript_total:
+          previous.workflowState.transcript_total ||
+          previous.workflowState.transcript_length ||
+          (previous.workflowState.transcript || []).length,
+        transcript_has_more_before: previous.workflowState.transcript_has_more_before || false,
         artifacts: previous.workflowState.artifacts || [],
       }),
     };
@@ -188,7 +305,26 @@ function applyWorkflowProjectionEventInState(previous, event) {
       state: updateWorkflowStateInState(previous, {
         ...previous.workflowState,
         transcript: payload.transcript || [],
+        transcript_offset: 0,
+        transcript_total: (payload.transcript || []).length,
+        transcript_has_more_before: false,
         transcript_revision: revision || previous.workflowState.transcript_revision || 0,
+        artifacts: previous.workflowState.artifacts || [],
+      }),
+    };
+  }
+
+  if (event.kind === "workflow_transcript_page") {
+    const revision = Number(payload.revision || 0);
+    if (revision && revision <= previous.workflowTranscriptProjectionRevision) {
+      return { handled: true, state: previous };
+    }
+    const workflowState = mergeWorkflowTranscriptPage(previous.workflowState, payload);
+    return {
+      handled: true,
+      state: updateWorkflowStateInState(previous, {
+        ...workflowState,
+        transcript_revision: revision || workflowState.transcript_revision || 0,
         artifacts: previous.workflowState.artifacts || [],
       }),
     };
@@ -307,6 +443,14 @@ function isClaudeToolEvent(event) {
 }
 
 function mergeStreamToolEvent(events, event) {
+  if (isPythonSandboxOutputEvent(event)) {
+    return mergePythonSandboxOutputEvent(events, event).slice(-5);
+  }
+
+  if (isPythonSandboxProgressEvent(event)) {
+    return mergePythonSandboxProgressEvent(events, event).slice(-5);
+  }
+
   if (!event.kind?.startsWith("claude_tool_input_")) {
     return [...events, event].slice(-5);
   }
@@ -326,6 +470,82 @@ function mergeStreamToolEvent(events, event) {
     nextEvents.push(merged);
   }
   return nextEvents.slice(-5);
+}
+
+function isPythonSandboxOutputEvent(event) {
+  return event.kind === "python_sandbox_stdout" || event.kind === "python_sandbox_stderr";
+}
+
+function isPythonSandboxProgressEvent(event) {
+  return event.kind === "python_sandbox_progress";
+}
+
+function isPythonSandboxEvent(event) {
+  return event.kind?.startsWith("python_sandbox_");
+}
+
+function mergePythonSandboxOutputEvent(events, event) {
+  const key = pythonSandboxOutputKey(event);
+  const nextEvents = [...events];
+  const existingIndex = nextEvents.findIndex(
+    (candidate) =>
+      isPythonSandboxOutputEvent(candidate) && pythonSandboxOutputKey(candidate) === key,
+  );
+  if (existingIndex < 0) return [...nextEvents, event];
+
+  const existing = nextEvents[existingIndex];
+  const existingPayload = existing.payload || {};
+  const payload = event.payload || {};
+  nextEvents[existingIndex] = {
+    ...existing,
+    payload: {
+      ...existingPayload,
+      ...payload,
+      text: String(existingPayload.text || "") + String(payload.text || ""),
+    },
+  };
+  return nextEvents;
+}
+
+function mergePythonSandboxProgressEvent(events, event) {
+  const key = pythonSandboxInstanceKey(event);
+  const nextEvents = [...events];
+  const existingIndex = findPythonSandboxProgressTargetIndex(nextEvents, key);
+  if (existingIndex < 0) return [...nextEvents, event];
+
+  const existing = nextEvents[existingIndex];
+  nextEvents[existingIndex] = {
+    ...existing,
+    payload: {
+      ...(existing.payload || {}),
+      ...(event.payload || {}),
+    },
+  };
+  return nextEvents;
+}
+
+function findPythonSandboxProgressTargetIndex(events, key) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const candidate = events[index];
+    if (isPythonSandboxOutputEvent(candidate) && pythonSandboxInstanceKey(candidate) === key) {
+      return index;
+    }
+  }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const candidate = events[index];
+    if (isPythonSandboxEvent(candidate) && pythonSandboxInstanceKey(candidate) === key) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function pythonSandboxOutputKey(event) {
+  return `${event.kind}:${event.tool_name || ""}:${event.step || ""}`;
+}
+
+function pythonSandboxInstanceKey(event) {
+  return `${event.tool_name || ""}:${event.step || ""}`;
 }
 
 function mergeToolInputEvent(existing, event, key) {
@@ -376,6 +596,71 @@ function markStreamCommittedInState(state) {
   };
 }
 
+function settleCompletedClaudeTurnInState(state, payload) {
+  const workflowState = state.workflowState;
+  if (!workflowState) return markStreamCommittedInState(state);
+
+  const transcript = [...(workflowState.transcript || [])];
+  const consumedPendingIds = new Set();
+  const pendingMessages = [...state.localPending].sort(
+    (left, right) => rawPendingTranscriptIndex(left) - rawPendingTranscriptIndex(right),
+  );
+  const pendingToCommit = pendingMessages.find(transcriptMessageForPending);
+
+  if (pendingToCommit) {
+    const message = transcriptMessageForPending(pendingToCommit);
+    if (message && !isPendingAcknowledgedByTranscript(pendingToCommit, transcript)) {
+      transcript.push(message);
+    }
+    consumedPendingIds.add(pendingToCommit.id);
+  }
+
+  const assistantText = String(payload.text || "").trim();
+  if (assistantText && !lastTranscriptMessageMatches(transcript, "assistant", assistantText)) {
+    transcript.push({ role: "assistant", content: assistantText });
+  }
+
+  const transcriptOffset = Number(workflowState.transcript_offset || 0);
+  const transcriptEnd = transcriptOffset + transcript.length;
+  const transcriptTotal = Math.max(
+    transcriptEnd,
+    Number(workflowState.transcript_total || 0),
+  );
+  const localPending = state.localPending.filter(
+    (pending) => !consumedPendingIds.has(pending.id),
+  );
+  const pendingMessagesCount = localPending.filter(transcriptMessageForPending).length;
+
+  return markStreamCommittedInState({
+    ...state,
+    workflowState: {
+      ...workflowState,
+      status: pendingMessagesCount ? "responding" : "idle",
+      pending_messages: pendingMessagesCount,
+      active_message_index: null,
+      queued_message_indices: [],
+      transcript,
+      transcript_total: transcriptTotal,
+      transcript_length: transcriptTotal,
+      state_revision: Number(workflowState.state_revision || 0) + 1,
+      transcript_revision: Number(workflowState.transcript_revision || 0) + 1,
+    },
+    localPending,
+  });
+}
+
+function transcriptMessageForPending(pending) {
+  const phase = String(pending.phase || "");
+  if (phase.startsWith("failed")) return null;
+  if (!String(pending.label || "").startsWith("you")) return null;
+  return { role: "user", content: pending.content };
+}
+
+function lastTranscriptMessageMatches(transcript, role, content) {
+  const last = transcript[transcript.length - 1];
+  return last?.role === role && last?.content === content;
+}
+
 export function markStreamInterruptedInState(state) {
   return {
     ...state,
@@ -422,41 +707,144 @@ export function displayStatus(state) {
   return state.auth === "app" ? "starting..." : "connecting...";
 }
 
-export function selectedModelUsesAdaptiveThinking(state) {
-  const model = state.agentSettings.model || "";
-  return (state.config?.thinking?.adaptive_model_prefixes || []).some((prefix) =>
-    model.startsWith(prefix),
+export function agentSettingsFromConfig(config) {
+  return normalizeAgentSettings(
+    {
+      model: localStorage.getItem("simpleChatModel") || config.default_model || "",
+      thinkingEnabled: localStorage.getItem("simpleChatThinkingEnabled") === "true",
+      thinkingMode: localStorage.getItem("simpleChatThinkingMode") || config.thinking?.mode || "enabled",
+      thinkingBudgetTokens: Number(
+        localStorage.getItem("simpleChatThinkingBudgetTokens") ||
+          config.thinking?.budget_tokens ||
+          4096,
+      ),
+      thinkingEffort: localStorage.getItem("simpleChatThinkingEffort") || config.thinking?.effort || "max",
+    },
+    config,
   );
 }
 
-export function agentSettingsFromConfig(config) {
+export function agentSettingsFromWorkflowState(workflowState, config) {
+  const thinking = workflowState?.thinking || {};
+  return normalizeAgentSettings(
+    {
+      model: workflowState?.model || config.default_model || "",
+      thinkingEnabled: Boolean(thinking.enabled),
+      thinkingMode: thinking.mode || config.thinking?.mode || "enabled",
+      thinkingBudgetTokens: Number(
+        thinking.budget_tokens ||
+          config.thinking?.budget_tokens ||
+          4096,
+      ),
+      thinkingEffort: thinking.effort || config.thinking?.effort || "max",
+    },
+    config,
+    { allowUnknownModel: true },
+  );
+}
+
+export function normalizeAgentSettings(agentSettings, config, options = {}) {
   const modelOptions = config.model_options || [];
-  const savedModel = localStorage.getItem("simpleChatModel");
-  const savedEffort = localStorage.getItem("simpleChatThinkingEffort");
-  const effortOptions = config.thinking?.effort_options || ["medium"];
+  const model =
+    agentSettings.model && modelOptions.includes(agentSettings.model)
+      ? agentSettings.model
+      : options.allowUnknownModel && agentSettings.model
+        ? agentSettings.model
+        : config.default_model || "";
+  let thinkingModes = thinkingModesForModel(config, model);
+  if (
+    options.allowUnknownModel &&
+    agentSettings.thinkingMode &&
+    !thinkingModes.includes(agentSettings.thinkingMode)
+  ) {
+    thinkingModes = [agentSettings.thinkingMode, ...thinkingModes];
+  }
+  const thinkingMode = thinkingModes.includes(agentSettings.thinkingMode)
+    ? agentSettings.thinkingMode
+    : defaultThinkingModeForModel(config, model);
+  const effortOptions = effortOptionsForModel(config, model);
+  const thinkingEffort = effortOptions.includes(agentSettings.thinkingEffort)
+    ? agentSettings.thinkingEffort
+    : defaultEffortForModel(config, model);
   return {
-    model: savedModel && modelOptions.includes(savedModel) ? savedModel : config.default_model || "",
-    thinkingEnabled: localStorage.getItem("simpleChatThinkingEnabled") === "true",
-    thinkingBudgetTokens: Number(
-      localStorage.getItem("simpleChatThinkingBudgetTokens") ||
-        config.thinking?.budget_tokens ||
-        4096,
-    ),
-    thinkingEffort:
-      savedEffort && effortOptions.includes(savedEffort)
-        ? savedEffort
-        : config.thinking?.effort || "medium",
+    ...agentSettings,
+    model,
+    thinkingEnabled: Boolean(agentSettings.thinkingEnabled && thinkingModes.length),
+    thinkingMode,
+    thinkingEffort,
   };
 }
 
 export function saveAgentSettings(agentSettings) {
   localStorage.setItem("simpleChatModel", agentSettings.model);
   localStorage.setItem("simpleChatThinkingEnabled", String(agentSettings.thinkingEnabled));
+  localStorage.setItem("simpleChatThinkingMode", agentSettings.thinkingMode);
   localStorage.setItem(
     "simpleChatThinkingBudgetTokens",
     String(agentSettings.thinkingBudgetTokens),
   );
   localStorage.setItem("simpleChatThinkingEffort", agentSettings.thinkingEffort);
+}
+
+export function modelOptionsFromConfig(config) {
+  if (Array.isArray(config?.models) && config.models.length) {
+    return config.models;
+  }
+  return (config?.model_options || []).map((model) => ({
+    id: model,
+    display_name: model,
+  }));
+}
+
+export function modelOptionsForSelection(config, selectedModel) {
+  const options = modelOptionsFromConfig(config);
+  if (!selectedModel || options.some((model) => model.id === selectedModel)) {
+    return options;
+  }
+  return [
+    {
+      id: selectedModel,
+      display_name: selectedModel,
+    },
+    ...options,
+  ];
+}
+
+export function thinkingModesForModel(config, modelId) {
+  const model = modelConfigForId(config, modelId);
+  const modes = model?.thinking?.modes || [];
+  if (model) return modes;
+  if (modes.length) return modes;
+  return config?.thinking?.mode_options?.length ? config.thinking.mode_options : ["enabled"];
+}
+
+export function defaultThinkingModeForModel(config, modelId) {
+  const model = modelConfigForId(config, modelId);
+  const mode = model?.thinking?.default_mode || config?.thinking?.mode || "enabled";
+  return thinkingModesForModel(config, modelId).includes(mode)
+    ? mode
+    : thinkingModesForModel(config, modelId)[0] || "enabled";
+}
+
+export function effortOptionsForModel(config, modelId) {
+  const model = modelConfigForId(config, modelId);
+  const options = model?.effort_options || [];
+  if (options.length) return options;
+  return config?.thinking?.effort_options?.length
+    ? config.thinking.effort_options
+    : ["max"];
+}
+
+export function defaultEffortForModel(config, modelId) {
+  const model = modelConfigForId(config, modelId);
+  const effort = model?.default_effort || config?.thinking?.effort || "max";
+  return effortOptionsForModel(config, modelId).includes(effort)
+    ? effort
+    : effortOptionsForModel(config, modelId).at(-1) || "max";
+}
+
+function modelConfigForId(config, modelId) {
+  return (config?.models || []).find((model) => model.id === modelId) || null;
 }
 
 export function temporalUiUrl(conversation) {

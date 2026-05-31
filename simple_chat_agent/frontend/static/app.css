@@ -251,7 +251,7 @@ h1::before {
     flex: 0 0 auto;
 }
 .temporal-link {
-    display: none;
+    display: flex;
     min-height: 36px;
     align-items: center;
     justify-content: center;
@@ -1032,6 +1032,8 @@ main {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    content-visibility: auto;
+    contain-intrinsic-size: auto 180px;
 }
 .bubble:hover {
     background: var(--color-bg-tertiary);
@@ -1092,6 +1094,8 @@ main {
         inset 3px 0 0 rgba(68, 76, 231, 0.75),
         0 1px 2px rgba(0, 0, 0, 0.25);
     overflow: hidden;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 260px;
 }
 .stream-panel.complete {
     border-color: rgba(110, 118, 129, 0.32);
@@ -1564,6 +1568,53 @@ button:disabled {
     margin: 28px auto;
     max-width: 520px;
     text-align: center;
+}
+.history-loader {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-xs);
+    margin: 0 auto var(--space-md);
+    color: var(--color-danger);
+    font-size: var(--font-size-xs);
+}
+.history-loader button {
+    min-height: 34px;
+    padding: 0 var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg-secondary);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 700;
+}
+.history-loader button:hover:not(:disabled) {
+    border-color: var(--color-border-focus);
+    color: var(--color-text-primary);
+}
+.history-loader button:disabled {
+    cursor: wait;
+    opacity: 0.72;
+}
+.conversation-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100%;
+    gap: var(--space-md);
+    color: var(--color-text-secondary);
+    text-align: center;
+}
+.conversation-loading-label {
+    color: var(--color-text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 700;
+}
+.temporal-loading-animation {
+    width: 160px;
+    height: 160px;
+    object-fit: contain;
 }
 @media (max-width: 860px) {
     .app {

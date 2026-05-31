@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import SyntaxHighlighter from "react-syntax-highlighter/dist/esm/prism-async-light.js";
 import oneDark from "react-syntax-highlighter/dist/esm/styles/prism/one-dark.js";
 import remarkGfm from "remark-gfm";
 import { inferCodeLanguage, normalizeCodeLanguage, syntaxHighlighterLanguage } from "../utils/code.js";
 
-export function MarkdownContent({ content, className = "" }) {
+export const MarkdownContent = memo(function MarkdownContent({ content, className = "" }) {
   return (
     <div className={`bubble-content${className ? ` ${className}` : ""}`}>
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
@@ -13,7 +13,7 @@ export function MarkdownContent({ content, className = "" }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 const markdownComponents = {
   a({ href, children }) {
@@ -75,11 +75,35 @@ export function CodeBlock({
   compact = false,
 }) {
   const [copied, setCopied] = useState(false);
+  const [highlightVisible, setHighlightVisible] = useState(false);
+  const blockRef = useRef(null);
   const code = String(source ?? "");
   const language = normalizeCodeLanguage(languageHint) || inferCodeLanguage(code);
   const displayLanguage = language || "text";
   const highlighterLanguage = syntaxHighlighterLanguage(displayLanguage);
   const lineCount = code ? code.split("\n").length : 1;
+
+  useEffect(() => {
+    setHighlightVisible(false);
+    if (highlighterLanguage === "text") return undefined;
+    const node = blockRef.current;
+    if (!node) return undefined;
+    if (!("IntersectionObserver" in window)) {
+      setHighlightVisible(true);
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting) return;
+        setHighlightVisible(true);
+        observer.disconnect();
+      },
+      { rootMargin: "640px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [code, highlighterLanguage]);
 
   async function copyCode() {
     try {
@@ -92,14 +116,14 @@ export function CodeBlock({
   }
 
   return (
-    <div className={`code-block${compact ? " compact" : ""}`}>
+    <div className={`code-block${compact ? " compact" : ""}`} ref={blockRef}>
       <div className="code-block-header">
         <span>{displayLanguage}</span>
         <button type="button" onClick={copyCode}>
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      {highlighterLanguage === "text" ? (
+      {highlighterLanguage === "text" || !highlightVisible ? (
         <pre className="plain-code">
           <code>{code}</code>
         </pre>

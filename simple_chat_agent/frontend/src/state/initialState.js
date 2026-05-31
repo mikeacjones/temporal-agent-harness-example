@@ -1,8 +1,9 @@
 export const defaultAgentSettings = {
   model: "",
   thinkingEnabled: false,
+  thinkingMode: "enabled",
   thinkingBudgetTokens: 4096,
-  thinkingEffort: "medium",
+  thinkingEffort: "max",
 };
 
 export const defaultMcpFormValues = {
@@ -39,6 +40,8 @@ export const initialState = {
   workflowState: null,
   workflowStateProjectionRevision: 0,
   workflowTranscriptProjectionRevision: 0,
+  olderMessagesLoading: false,
+  olderMessagesError: "",
   streamTurn: null,
   streamPanelCollapsed: false,
   currentClaudeSequence: null,

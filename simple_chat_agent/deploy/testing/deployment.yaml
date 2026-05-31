@@ -110,6 +110,11 @@ spec:
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            # Override shared prod secret values for OAuth redirect generation.
+            - name: SIMPLE_CHAT_PUBLIC_URL
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud
+            - name: GITHUB_OAUTH_REDIRECT_URI
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud/oauth/github/callback
             # --- test isolation ---
             - name: SIMPLE_CHAT_TASK_QUEUE
               value: simple-chat-agent-testing
