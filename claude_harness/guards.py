@@ -36,7 +36,7 @@ class GuardTiming(StrEnum):
 @dataclass(frozen=True)
 class GuardPolicy:
     required_pre: frozenset[ToolType] = frozenset(
-        {ToolType.ADMIN, ToolType.MUTATING}
+        {ToolType.ADMIN, ToolType.MUTATING, ToolType.MCP}
     )
     required_post: frozenset[ToolType] = frozenset()
 
