@@ -36,7 +36,8 @@ LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
         "For long-running work, write progress to stdout or stderr with print() "
         "or sys.stderr.write(); that output streams back to the user while the "
         "code is still running. Runtime, output, permissions, and retries are "
-        "bounded by the sandbox."
+        "bounded by the sandbox. The sandbox ceases to exist when the tool finishes, "
+        "as well as any files written to disk. Treat this as purely ephemeral."
     ),
     tool_type=ToolType.MUTATING,
     pre_guards=["mutating_tool_approval"],
