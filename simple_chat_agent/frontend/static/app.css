@@ -353,6 +353,10 @@ h1::before {
     font-size: var(--font-size-xs);
     overflow-wrap: anywhere;
 }
+.demo-workspace-countdown {
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-xs);
+}
 .demo-workspace-progress {
     color: var(--color-text-secondary);
     font-size: var(--font-size-xs);

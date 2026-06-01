@@ -573,9 +573,6 @@ def _demo_workspace_config(user: AuthenticatedUser) -> DemoWorkspaceConfig:
             "",
         ).strip(),
         search_attr_name=_user_email_sa_name(),
-        idle_ttl_seconds=int(
-            os.environ.get("SIMPLE_CHAT_DEMO_IDLE_TTL_SECONDS", "3600")
-        ),
     )
 
 

@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 DEMO_WORKSPACE_PREFIX = "simple-chat-demo-workspace-"
+IDLE_TIMEOUT = timedelta(hours=1)
 DemoWorkspaceStatus = Literal[
     "inactive",
     "provisioning",
@@ -55,7 +56,6 @@ class DemoWorkspaceConfig:
     source_worker_deployment: str
     service_account_role_arn: str = ""
     search_attr_name: str = ""
-    idle_ttl_seconds: int = 3600
 
 
 @dataclass
@@ -82,7 +82,6 @@ class DemoWorkspaceState:
     created_at: str = ""
     updated_at: str = ""
     last_activity_at: str = ""
-    idle_ttl_seconds: int = 3600
     error: str = ""
     provisioning_step: str = ""
     provisioning_message: str = ""
@@ -113,6 +112,7 @@ class DemoWorkspaceWorkflow:
     def __init__(self) -> None:
         self._state = DemoWorkspaceState(user_id="", user_email="")
         self._finished = False
+        self._activity_version = 0
 
     @workflow.run
     async def run(self, request: DemoWorkspaceInput) -> None:
@@ -140,12 +140,14 @@ class DemoWorkspaceWorkflow:
                 )
                 continue
 
+            activity_version = self._activity_version
             try:
                 await workflow.wait_condition(
                     lambda: self._state.status != "active"
                     or self._finished
-                    or workflow.info().is_continue_as_new_suggested(),
-                    timeout=self._idle_sleep_interval(),
+                    or workflow.info().is_continue_as_new_suggested()
+                    or self._activity_version != activity_version,
+                    timeout=self._idle_timeout(),
                 )
             except asyncio.TimeoutError:
                 pass
@@ -186,7 +188,6 @@ class DemoWorkspaceWorkflow:
             created_at=now,
             updated_at=now,
             last_activity_at=now,
-            idle_ttl_seconds=config.idle_ttl_seconds,
             chats=[],
         )
 
@@ -373,6 +374,7 @@ class DemoWorkspaceWorkflow:
         now = workflow.now().isoformat()
         self._state.updated_at = now
         self._state.last_activity_at = now
+        self._activity_version += 1
 
     def _mark_updated(self) -> None:
         self._state.updated_at = workflow.now().isoformat()
@@ -382,26 +384,17 @@ class DemoWorkspaceWorkflow:
         self._state.provisioning_message = message
         self._mark_updated()
 
-    def _idle_sleep_interval(self) -> timedelta:
-        ttl_seconds = max(60, int(self._state.idle_ttl_seconds or 3600))
-        try:
-            last_activity = datetime.fromisoformat(self._state.last_activity_at)
-        except ValueError:
-            return timedelta(seconds=ttl_seconds)
-        remaining = (last_activity + timedelta(seconds=ttl_seconds)) - workflow.now()
-        if remaining.total_seconds() <= 0:
-            return timedelta(seconds=1)
-        return min(remaining, timedelta(minutes=5))
+    def _idle_timeout(self) -> timedelta:
+        return IDLE_TIMEOUT
 
     def _idle_expired(self) -> bool:
         if self._state.status != "active":
             return False
-        ttl_seconds = max(60, int(self._state.idle_ttl_seconds or 3600))
         try:
             last_activity = datetime.fromisoformat(self._state.last_activity_at)
         except ValueError:
             return False
-        return workflow.now() >= last_activity + timedelta(seconds=ttl_seconds)
+        return workflow.now() >= last_activity + IDLE_TIMEOUT
 
 
 @dataclass
