@@ -37,7 +37,8 @@ class HttpMcpProvider:
                 name=public_name,
                 description=_mcp_tool_description(self._config, mcp_tool),
                 input_schema=mcp_tool.input_schema,
-                tool_type=ToolType.READ,
+                tool_type=ToolType.MCP,
+                pre_guards=["mutating_tool_approval"],
                 fn=self._make_tool_runner(public_name),
             )
 

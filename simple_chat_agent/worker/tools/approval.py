@@ -27,18 +27,21 @@ class MutatingToolApprovalProvider:
     ) -> None:
         self._request_mutating_tool_approval = request_mutating_tool_approval
 
-    @guard(name="mutating_tool_approval", fulfills=ToolType.MUTATING)
+    @guard(
+        name="mutating_tool_approval",
+        fulfills=(ToolType.MUTATING, ToolType.MCP),
+    )
     async def require_mutating_approval(self, ctx: GuardContext) -> GuardResult:
         if self._request_mutating_tool_approval is None:
             return GuardResult(
                 passed=False,
-                reason="No approval handler is configured for mutating tools.",
+                reason="No approval handler is configured for tools that require approval.",
                 llm_payload={
                     "error": "Approval unavailable",
                     "tool": ctx.tool_name,
                     "reason": (
                         "This agent is not configured to request user approval "
-                        "for mutating actions."
+                        "for this action."
                     ),
                 },
             )
@@ -52,7 +55,7 @@ class MutatingToolApprovalProvider:
 
         return GuardResult(
             passed=False,
-            reason="User denied the mutation.",
+            reason="User denied the tool call.",
             llm_payload={
                 "error": "Approval denied",
                 "tool": ctx.tool_name,
