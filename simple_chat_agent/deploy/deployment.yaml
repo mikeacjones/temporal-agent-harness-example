@@ -123,6 +123,26 @@ spec:
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            - name: SIMPLE_CHAT_PUBLIC_URL
+              value: https://agent-harness-demo.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED
+              value: "1"
+            - name: SIMPLE_CHAT_DEMO_WORKSPACE_HOST_SUFFIX
+              value: -agent-harness-demo.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_DEMO_SOURCE_NAMESPACE
+              value: temporal-michaelj-agent-harness-demo
+            - name: SIMPLE_CHAT_DEMO_SOURCE_SECRET_NAME
+              value: agent-harness-secrets
+            - name: SIMPLE_CHAT_DEMO_TLS_SECRET_NAME
+              value: agent-harness-workspace-tls
+            - name: SIMPLE_CHAT_DEMO_WORKSPACE_ROLE_ARN
+              value: arn:aws:iam::429214323166:role/temporal-michaelj-agent-harness-demo-s3
+            - name: SIMPLE_CHAT_DEMO_SOURCE_WEB_DEPLOYMENT
+              value: agent-harness-web
+            - name: SIMPLE_CHAT_DEMO_SOURCE_API_DEPLOYMENT
+              value: agent-harness-api
+            - name: SIMPLE_CHAT_DEMO_SOURCE_WORKER_DEPLOYMENT
+              value: agent-harness-worker
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
@@ -194,6 +214,12 @@ spec:
               value: http://agent-harness-api
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            - name: SIMPLE_CHAT_PUBLIC_URL
+              value: https://agent-harness-demo.tmprl-demo.cloud
+            - name: PYTHON_SANDBOX_LAMBDA_FUNCTION
+              value: temporal-michaelj-agent-harness-demo-python-sandbox
+            - name: PYTHON_SANDBOX_STREAM_SINK_URL
+              value: https://agent-harness-demo.tmprl-demo.cloud
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
