@@ -124,6 +124,7 @@ function StreamToolEvent({ event }) {
           source={payloadText}
           languageHint={streamToolLanguage(event, payloadText)}
           compact
+          wrapLongLines
         />
       </div>
     </div>

@@ -1086,6 +1086,7 @@ main {
 }
 .stream-panel {
     width: min(980px, 92%);
+    min-width: 0;
     margin: 0 auto var(--space-md);
     border: 1px solid rgba(68, 76, 231, 0.28);
     border-radius: var(--radius-md);
@@ -1139,6 +1140,7 @@ main {
     color: var(--color-text-secondary);
 }
 .stream-panel-body {
+    min-width: 0;
     display: grid;
     gap: var(--space-sm);
     padding: var(--space-sm) var(--space-md) var(--space-md);
@@ -1200,6 +1202,7 @@ main {
     text-transform: uppercase;
 }
 .stream-current-turn {
+    min-width: 0;
     display: grid;
     gap: var(--space-sm);
     padding: var(--space-sm);
@@ -1208,10 +1211,12 @@ main {
     background: rgba(68, 76, 231, 0.04);
 }
 .stream-tool-list {
+    min-width: 0;
     display: grid;
     gap: var(--space-xs);
 }
 .stream-tool-event {
+    min-width: 0;
     display: grid;
     gap: 2px;
     padding: var(--space-xs) var(--space-sm);
@@ -1235,6 +1240,7 @@ main {
     font-weight: 500;
 }
 .stream-tool-payload {
+    min-width: 0;
     color: var(--color-text-tertiary);
     overflow-wrap: anywhere;
     white-space: pre-wrap;
@@ -1320,6 +1326,7 @@ main {
 }
 .code-block {
     max-width: 100%;
+    min-width: 0;
     overflow: hidden;
     border: 1px solid var(--color-border-light);
     border-radius: var(--radius-sm);
@@ -1379,6 +1386,19 @@ main {
         "Liberation Mono",
         "Courier New",
         monospace !important;
+}
+.code-block.wrap-lines pre,
+.code-block.wrap-lines .plain-code {
+    overflow-x: hidden;
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.code-block.wrap-lines code,
+.code-block.wrap-lines span {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 .code-block.compact .code-block-header {
     min-height: 26px;

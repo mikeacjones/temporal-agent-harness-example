@@ -73,6 +73,7 @@ export function CodeBlock({
   languageHint = null,
   showLineNumbers = false,
   compact = false,
+  wrapLongLines = false,
 }) {
   const [copied, setCopied] = useState(false);
   const [highlightVisible, setHighlightVisible] = useState(false);
@@ -116,7 +117,12 @@ export function CodeBlock({
   }
 
   return (
-    <div className={`code-block${compact ? " compact" : ""}`} ref={blockRef}>
+    <div
+      className={`code-block${compact ? " compact" : ""}${
+        wrapLongLines ? " wrap-lines" : ""
+      }`}
+      ref={blockRef}
+    >
       <div className="code-block-header">
         <span>{displayLanguage}</span>
         <button type="button" onClick={copyCode}>
@@ -132,7 +138,7 @@ export function CodeBlock({
           language={highlighterLanguage}
           style={oneDark}
           showLineNumbers={showLineNumbers || lineCount >= 12}
-          wrapLongLines={false}
+          wrapLongLines={wrapLongLines}
           customStyle={{
             margin: 0,
             padding: "12px",
