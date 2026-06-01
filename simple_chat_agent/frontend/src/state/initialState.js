@@ -31,6 +31,8 @@ export const initialState = {
   loginError: "",
   loggingIn: false,
   config: null,
+  demoWorkspace: null,
+  demoWorkspaceLoading: false,
   agentSettings: defaultAgentSettings,
   conversations: [],
   tools: [],

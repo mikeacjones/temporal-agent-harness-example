@@ -60,6 +60,7 @@ class ToolRouteDeps:
     update_user_workflows_tool_connections: Callable[..., Any]
     upsert_user_mcp_server: Callable[..., Any]
     github_connection_id_for_user: Callable[[AuthenticatedUser], str | None]
+    github_tools_enabled: Callable[[], bool]
     mcp_oauth_flows: Callable[[], dict[str, PendingMcpOAuthFlow]]
 
 
@@ -69,30 +70,37 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
     @router.get("/api/tools")
     async def tools(request: Request) -> dict[str, Any]:
         user = deps.current_user(request)
-        github_connection = deps.store().get_oauth_connection(
-            user_id=user.user_id,
-            provider=GITHUB_PROVIDER,
+        github_enabled = deps.github_tools_enabled()
+        github_connection = (
+            deps.store().get_oauth_connection(
+                user_id=user.user_id,
+                provider=GITHUB_PROVIDER,
+            )
+            if github_enabled
+            else None
         )
         mcp_servers = await (
             await deps.ensure_user_chats_workflow(user.user_id, user.username)
         ).query(UserChatsWorkflow.list_mcp_servers)
-        return {
-            "tools": [
-                {
-                    "provider": "builtin:core",
-                    "label": "Harness tools",
-                    "configured": True,
-                    "connected": True,
-                    "enabled": True,
-                    "login": "local workflow activities",
-                    "scopes": "local",
-                    "available_tools": [
-                        FETCH_URL_TOOL,
-                        PYTHON_SANDBOX_TOOL,
-                        CREATE_ARTIFACT_TOOL,
-                        CREATE_SUBAGENT_TOOL,
-                    ],
-                },
+        tools = [
+            {
+                "provider": "builtin:core",
+                "label": "Harness tools",
+                "configured": True,
+                "connected": True,
+                "enabled": True,
+                "login": "local workflow activities",
+                "scopes": "local",
+                "available_tools": [
+                    FETCH_URL_TOOL,
+                    PYTHON_SANDBOX_TOOL,
+                    CREATE_ARTIFACT_TOOL,
+                    CREATE_SUBAGENT_TOOL,
+                ],
+            },
+        ]
+        if github_enabled:
+            tools.append(
                 {
                     "provider": GITHUB_PROVIDER,
                     "label": "GitHub",
@@ -111,36 +119,38 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
                     ),
                     "available_tools": GITHUB_TOOL_NAMES,
                 },
-                *[
-                    {
-                        "provider": f"mcp:{server.server_id}",
-                        "server_id": server.server_id,
-                        "server_url": server.server_url,
-                        "tool_prefix": server.tool_prefix,
-                        "auth_mode": server.auth_mode,
-                        "label": server.label,
-                        "configured": True,
-                        "connected": mcp_server_connected(
-                            user,
-                            server,
-                            deps.store(),
-                        ),
-                        "enabled": server.enabled,
-                        "login": server.server_url,
-                        "scopes": server.auth_mode,
-                        "available_tools": [
-                            tool.public_name
-                            or public_mcp_tool_name(server.tool_prefix, tool.name)
-                            for tool in server.tools
-                        ],
-                    }
-                    for server in mcp_servers
+            )
+        tools.extend(
+            {
+                "provider": f"mcp:{server.server_id}",
+                "server_id": server.server_id,
+                "server_url": server.server_url,
+                "tool_prefix": server.tool_prefix,
+                "auth_mode": server.auth_mode,
+                "label": server.label,
+                "configured": True,
+                "connected": mcp_server_connected(
+                    user,
+                    server,
+                    deps.store(),
+                ),
+                "enabled": server.enabled,
+                "login": server.server_url,
+                "scopes": server.auth_mode,
+                "available_tools": [
+                    tool.public_name
+                    or public_mcp_tool_name(server.tool_prefix, tool.name)
+                    for tool in server.tools
                 ],
-            ]
-        }
+            }
+            for server in mcp_servers
+        )
+        return {"tools": tools}
 
     @router.post("/api/tools/github/disconnect")
     async def disconnect_github(request: Request) -> dict[str, str]:
+        if not deps.github_tools_enabled():
+            raise HTTPException(status_code=404, detail="GitHub tools are disabled.")
         user = deps.current_user(request)
         deps.store().delete_oauth_connection(
             user_id=user.user_id,
@@ -322,6 +332,8 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
 
     @router.get("/oauth/github/start")
     async def github_oauth_start(request: Request) -> RedirectResponse:
+        if not deps.github_tools_enabled():
+            raise HTTPException(status_code=404, detail="GitHub tools are disabled.")
         user = deps.current_user(request)
         if not github_oauth_configured():
             raise HTTPException(status_code=400, detail="GitHub OAuth is not configured")
@@ -339,6 +351,8 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
         error: str | None = None,
         error_description: str | None = None,
     ) -> RedirectResponse:
+        if not deps.github_tools_enabled():
+            return RedirectResponse("/?oauth_error=GitHub%20tools%20are%20disabled")
         if error is not None:
             return RedirectResponse(
                 f"/?oauth_error={quote(error_description or error, safe='')}"

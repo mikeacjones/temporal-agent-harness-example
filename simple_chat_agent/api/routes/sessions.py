@@ -10,7 +10,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from temporalio.client import Client
 
-from simple_chat_agent.api.anthropic_models import get_anthropic_model_catalog
+from simple_chat_agent.api.anthropic_models import (
+    clamp_output_tokens_for_model,
+    get_anthropic_model_catalog,
+)
 from simple_chat_agent.api.artifacts import artifact_response
 from simple_chat_agent.api.auth import AuthenticatedUser
 from simple_chat_agent.api.schemas import (
@@ -66,6 +69,9 @@ class SessionRouteDeps:
     forget_conversation: Callable[..., Any]
     is_temporal_not_found: Callable[[BaseException], bool]
     github_connection_id_for_user: Callable[[AuthenticatedUser], str | None]
+    register_demo_workspace_chat: Callable[..., Any]
+    unregister_demo_workspace_chat: Callable[..., Any]
+    touch_demo_workspace: Callable[..., Any]
 
 
 def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
@@ -101,17 +107,22 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
         model_catalog = await asyncio.to_thread(get_anthropic_model_catalog)
         model = session_request.model or default_model(model_catalog)
+        max_tokens = clamp_output_tokens_for_model(
+            session_request.max_tokens,
+            model_catalog,
+            model,
+        )
         conversation: ChatRecord = await registry.execute_update(
             UserChatsWorkflow.create_chat,
             CreateChatRequest(
                 system_prompt=session_request.system_prompt,
                 model=model,
-                max_tokens=session_request.max_tokens,
+                max_tokens=max_tokens,
                 max_turns=session_request.max_turns,
                 thinking=thinking_config_from_request(
                     session_request.thinking,
                     model=model,
-                    max_tokens=session_request.max_tokens,
+                    max_tokens=max_tokens,
                 ),
                 initial_message=session_request.initial_message,
                 available_tool_names=tool_names_for_connections(
@@ -124,6 +135,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             ),
         )
         deps.stream_broker().clear(conversation.workflow_id)
+        await deps.register_demo_workspace_chat(conversation)
         return {
             "workflow_id": conversation.workflow_id,
             "run_id": conversation.run_id,
@@ -324,6 +336,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             title=conversation_title(request.message),
             user_email=user.username,
         )
+        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/steer")
@@ -344,6 +357,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
+        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/interrupt")
@@ -364,6 +378,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
+        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/approvals/{approval_id}")
@@ -385,6 +400,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
+        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.get("/api/sessions/{workflow_id}/artifacts")
@@ -451,6 +467,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
         )
         deps.stream_broker().clear(workflow_id)
+        await deps.unregister_demo_workspace_chat(workflow_id)
         return {"status": "ok"}
 
     return router

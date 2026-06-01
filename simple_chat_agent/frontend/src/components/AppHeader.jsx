@@ -12,6 +12,9 @@ export function AppHeader({
   status,
   onNewChat,
   onOpenTools,
+  onEnsureDemoWorkspace,
+  onCrashDemoWorkspace,
+  onDeleteDemoWorkspace,
   onLogout,
   onUpdateAgentSettings,
   onUpdateThinkingBudget,
@@ -68,6 +71,18 @@ export function AppHeader({
             </button>
           </div>
         </section>
+        {state.demoWorkspace?.enabled || state.demoWorkspace?.in_demo_workspace ? (
+          <section className="side-section">
+            <p className="side-section-title">My Demo Workspace</p>
+            <DemoWorkspaceControls
+              demoWorkspace={state.demoWorkspace}
+              loading={state.demoWorkspaceLoading}
+              onEnsure={onEnsureDemoWorkspace}
+              onCrash={onCrashDemoWorkspace}
+              onDelete={onDeleteDemoWorkspace}
+            />
+          </section>
+        ) : null}
         <section className="side-section">
           <p className="side-section-title">Agent</p>
           <div className="agent-settings">
@@ -179,6 +194,70 @@ export function AppHeader({
       </div>
       <div className="status">{status}</div>
     </header>
+  );
+}
+
+function DemoWorkspaceControls({
+  demoWorkspace,
+  loading,
+  onEnsure,
+  onCrash,
+  onDelete,
+}) {
+  const workspace = demoWorkspace?.workspace;
+  if (demoWorkspace?.in_demo_workspace) {
+    const active = workspace?.status === "active";
+    return (
+      <div className="demo-workspace-card">
+        <div className="demo-workspace-status">Disposable workspace</div>
+        {workspace?.namespace ? (
+          <div className="demo-workspace-namespace" title={workspace.namespace}>
+            {workspace.namespace}
+          </div>
+        ) : null}
+        <div className="demo-workspace-actions single">
+          <button
+            className="danger"
+            type="button"
+            disabled={!active || loading}
+            onClick={onCrash}
+          >
+            Crash Pods
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const status = workspace?.status || "inactive";
+  const active = status === "active";
+  const hasWorkspace = Boolean(workspace?.workspace_id) && status !== "inactive";
+  const provisioning = loading || status === "provisioning" || status === "deleting";
+  return (
+    <div className="demo-workspace-card">
+      <div className="demo-workspace-status">{status}</div>
+      {workspace?.host ? (
+        <div className="demo-workspace-host" title={workspace.host}>
+          {workspace.host}
+        </div>
+      ) : null}
+      {workspace?.provisioning_message ? (
+        <div className="demo-workspace-progress">{workspace.provisioning_message}</div>
+      ) : null}
+      <div className="demo-workspace-actions">
+        <button type="button" disabled={provisioning} onClick={onEnsure}>
+          {active ? "Open" : "Create"}
+        </button>
+        <button
+          className="danger"
+          type="button"
+          disabled={!hasWorkspace || provisioning}
+          onClick={onDelete}
+        >
+          Delete
+        </button>
+      </div>
+    </div>
   );
 }
 

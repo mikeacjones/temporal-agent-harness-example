@@ -13,6 +13,8 @@ FUNCTION_NAME="temporal-michaelj-agent-harness-demo-python-sandbox-testing"
 LAMBDA_ROLE="temporal-michaelj-agent-harness-demo-python-sandbox-testing"
 WORKER_ROLE="temporal-michaelj-agent-harness-demo-worker-testing"
 WORKER_SERVICE_ACCOUNT="agent-harness-worker-testing"
+WORKSPACE_SERVICE_ACCOUNT="agent-harness-workspace"
+WORKSPACE_NAMESPACE_PATTERN="agent-harness-demo-temp-*"
 BASE_APP_ROLE="temporal-michaelj-agent-harness-demo-s3"
 OIDC_PROVIDER_ARN="arn:aws:iam::429214323166:oidc-provider/oidc.eks.us-west-1.amazonaws.com/id/A19A2DDF9700D5C8E559A966B862CDAD"
 OIDC_PROVIDER_HOST="oidc.eks.us-west-1.amazonaws.com/id/A19A2DDF9700D5C8E559A966B862CDAD"
@@ -78,14 +80,22 @@ Path(sys.argv[1]).write_text(
 )
 PY
 
-uv run python - "${WORKER_TRUST}" "${OIDC_PROVIDER_ARN}" "${OIDC_PROVIDER_HOST}" "${NAMESPACE}" "${WORKER_SERVICE_ACCOUNT}" <<'PY'
+uv run python - "${WORKER_TRUST}" "${OIDC_PROVIDER_ARN}" "${OIDC_PROVIDER_HOST}" "${NAMESPACE}" "${WORKER_SERVICE_ACCOUNT}" "${WORKSPACE_NAMESPACE_PATTERN}" "${WORKSPACE_SERVICE_ACCOUNT}" <<'PY'
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
 
-path, provider_arn, provider_host, namespace, service_account = sys.argv[1:6]
+(
+    path,
+    provider_arn,
+    provider_host,
+    namespace,
+    worker_service_account,
+    workspace_namespace_pattern,
+    workspace_service_account,
+) = sys.argv[1:8]
 Path(path).write_text(
     json.dumps(
         {
@@ -99,9 +109,25 @@ Path(path).write_text(
                         "StringEquals": {
                             f"{provider_host}:aud": "sts.amazonaws.com",
                             f"{provider_host}:sub": (
-                                f"system:serviceaccount:{namespace}:{service_account}"
+                                f"system:serviceaccount:{namespace}:{worker_service_account}"
                             ),
                         }
+                    },
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Federated": provider_arn},
+                    "Action": "sts:AssumeRoleWithWebIdentity",
+                    "Condition": {
+                        "StringEquals": {
+                            f"{provider_host}:aud": "sts.amazonaws.com",
+                        },
+                        "StringLike": {
+                            f"{provider_host}:sub": (
+                                "system:serviceaccount:"
+                                f"{workspace_namespace_pattern}:{workspace_service_account}"
+                            ),
+                        },
                     },
                 }
             ],

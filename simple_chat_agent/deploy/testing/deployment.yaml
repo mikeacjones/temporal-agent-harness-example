@@ -120,6 +120,24 @@ spec:
               value: simple-chat-agent-testing
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
+            - name: SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED
+              value: "1"
+            - name: SIMPLE_CHAT_DEMO_WORKSPACE_HOST_SUFFIX
+              value: -agent-harness-demo.testing.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_DEMO_SOURCE_NAMESPACE
+              value: temporal-michaelj-agent-harness-demo
+            - name: SIMPLE_CHAT_DEMO_SOURCE_SECRET_NAME
+              value: agent-harness-secrets
+            - name: SIMPLE_CHAT_DEMO_TLS_SECRET_NAME
+              value: agent-harness-workspace-testing-tls
+            - name: SIMPLE_CHAT_DEMO_WORKSPACE_ROLE_ARN
+              value: arn:aws:iam::429214323166:role/temporal-michaelj-agent-harness-demo-worker-testing
+            - name: SIMPLE_CHAT_DEMO_SOURCE_WEB_DEPLOYMENT
+              value: agent-harness-web-testing
+            - name: SIMPLE_CHAT_DEMO_SOURCE_API_DEPLOYMENT
+              value: agent-harness-api-testing
+            - name: SIMPLE_CHAT_DEMO_SOURCE_WORKER_DEPLOYMENT
+              value: agent-harness-worker-testing
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
@@ -188,12 +206,12 @@ spec:
               value: simple-chat-agent-testing
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
+            - name: SIMPLE_CHAT_PUBLIC_URL
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-api-testing
             - name: PYTHON_SANDBOX_LAMBDA_FUNCTION
               value: temporal-michaelj-agent-harness-demo-python-sandbox-testing
-            - name: PYTHON_SANDBOX_STREAM_SINK_URL
-              value: https://agent-harness-demo.testing.tmprl-demo.cloud
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
