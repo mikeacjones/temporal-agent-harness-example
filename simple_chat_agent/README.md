@@ -90,9 +90,10 @@ unsetting them so same-UID child code cannot recover those values through
 `/proc/<pid>/environ`.
 
 The worker that hosts the Temporal Activity needs permission to invoke only that
-sandbox Lambda. Set `PYTHON_SANDBOX_STREAM_SINK_URL` on that worker to an app URL
-reachable from Lambda; `/internal/stream` must route to the API. Set
-`PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
+sandbox Lambda. Set `SIMPLE_CHAT_PUBLIC_URL` on that worker to the public base
+URL for its own app environment; the Lambda callback posts to
+`/internal/stream` under that URL. Use `PYTHON_SANDBOX_STREAM_SINK_URL` only as
+an explicit override. Set `PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
 published version or alias. The activity retries Lambda invoke/control-plane
 failures, but completed sandbox execution failures are returned to the LLM
 instead of retried.

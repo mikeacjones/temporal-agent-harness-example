@@ -26,7 +26,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 ChatRole = Literal["user", "assistant", "system"]
-DEFAULT_MAX_TOKENS = 64_000
+DEFAULT_MAX_TOKENS = 32_000
 TRANSCRIPT_DELTA_BUFFER_LIMIT = 80
 
 

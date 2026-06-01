@@ -8,10 +8,10 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any, Literal, Mapping, cast
 
-from anthropic import AsyncAnthropic
+from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.types import MessageParam, ToolResultBlockParam
 from temporalio import activity, workflow
-from temporalio.exceptions import is_cancelled_exception
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
 from .activity_options import DEFAULT_ACTIVITY_OPTIONS, ActivityOptions
 from .context_manager import (
@@ -717,13 +717,22 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
     if request.output_config is not None:
         create_params["output_config"] = request.output_config
 
-    async with AsyncAnthropic(max_retries=0) as client:
-        response = await _stream_claude_message(
-            client,
-            create_params,
-            stream_id=request.stream_id,
-            stream_sequence=request.stream_sequence,
-        )
+    try:
+        async with AsyncAnthropic(max_retries=0) as client:
+            response = await _stream_claude_message(
+                client,
+                create_params,
+                stream_id=request.stream_id,
+                stream_sequence=request.stream_sequence,
+            )
+    except APIStatusError as err:
+        if _anthropic_status_is_non_retryable(err.status_code):
+            raise ApplicationError(
+                str(err),
+                type=err.__class__.__name__,
+                non_retryable=True,
+            ) from err
+        raise
 
     return ClaudeResponse(
         id=response.id,
@@ -736,6 +745,12 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
         stop_sequence=response.stop_sequence,
         usage=response.usage.to_dict(),
     )
+
+
+def _anthropic_status_is_non_retryable(status_code: int) -> bool:
+    if status_code in {408, 409, 429}:
+        return False
+    return 400 <= status_code < 500
 
 
 async def _stream_claude_message(

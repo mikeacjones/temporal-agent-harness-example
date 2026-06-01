@@ -196,6 +196,8 @@ def _lambda_stream_sink_config() -> dict[str, str] | None:
     # it in the outer handler. The sandboxed child process still receives a
     # minimal env from python_sandbox_runtime._runner_env().
     url = os.environ.get("PYTHON_SANDBOX_STREAM_SINK_URL", "").strip()
+    if not url:
+        url = os.environ.get("SIMPLE_CHAT_PUBLIC_URL", "").strip()
     token = os.environ.get("PYTHON_SANDBOX_STREAM_TOKEN", "").strip()
     if not token:
         token = os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip()

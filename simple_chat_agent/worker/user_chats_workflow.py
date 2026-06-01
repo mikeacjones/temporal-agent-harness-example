@@ -41,6 +41,7 @@ class UserChatsInput:
     # every chat and MCP server. Empty on a first start.
     chats: list[ChatRecord] = field(default_factory=list)
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
+    demo_workspace: "UserDemoWorkspaceRecord | None" = None
 
 
 def user_email_search_attributes(
@@ -71,6 +72,7 @@ class CreateChatRequest:
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     good_place_censor: bool = False
+    task_queue: str = TASK_QUEUE
 
 
 @dataclass
@@ -87,6 +89,19 @@ class ChatRecord:
     status: ChatStatus
     created_at: str
     updated_at: str
+    task_queue: str = TASK_QUEUE
+
+
+@dataclass
+class UserDemoWorkspaceRecord:
+    control_workflow_id: str
+    status: str
+    workspace_id: str = ""
+    namespace: str = ""
+    host: str = ""
+    url: str = ""
+    task_queue: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -122,6 +137,7 @@ class UserChatsWorkflow:
         self._search_attr_name = ""
         self._chats: dict[str, ChatRecord] = {}
         self._mcp_servers: dict[str, HttpMcpServerConfig] = {}
+        self._demo_workspace: UserDemoWorkspaceRecord | None = None
 
     @workflow.run
     async def run(self, request: UserChatsInput) -> None:
@@ -134,6 +150,7 @@ class UserChatsWorkflow:
         self._mcp_servers = {
             server.server_id: server for server in request.mcp_servers
         }
+        self._demo_workspace = request.demo_workspace
 
         # This entity workflow receives an update on every chat create/touch/
         # forget and MCP change, so its history grows unbounded. Continue-as-new
@@ -152,12 +169,14 @@ class UserChatsWorkflow:
                 search_attr_name=self._search_attr_name,
                 chats=list(self._chats.values()),
                 mcp_servers=list(self._mcp_servers.values()),
+                demo_workspace=self._demo_workspace,
             )
         )
 
     @workflow.update
     async def create_chat(self, request: CreateChatRequest) -> ChatRecord:
         workflow_id = f"simple-chat-{workflow.uuid4()}"
+        task_queue = request.task_queue or TASK_QUEUE
         initial_message = (
             request.initial_message.strip()
             if request.initial_message is not None
@@ -192,7 +211,7 @@ class UserChatsWorkflow:
                 good_place_censor=request.good_place_censor,
             ),
             id=workflow_id,
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             parent_close_policy=ParentClosePolicy.ABANDON,
             static_summary="simple chat session",
             search_attributes=user_email_search_attributes(
@@ -208,6 +227,7 @@ class UserChatsWorkflow:
             status="active",
             created_at=now,
             updated_at=now,
+            task_queue=task_queue,
         )
         self._chats[workflow_id] = record
         return record
@@ -225,6 +245,7 @@ class UserChatsWorkflow:
             status=record.status,
             created_at=record.created_at,
             updated_at=workflow.now().isoformat(),
+            task_queue=record.task_queue,
         )
         self._chats[request.workflow_id] = updated
         return updated
@@ -268,6 +289,7 @@ class UserChatsWorkflow:
             status="deleting",
             created_at=record.created_at,
             updated_at=workflow.now().isoformat(),
+            task_queue=record.task_queue,
         )
 
         handle = workflow.get_external_workflow_handle(workflow_id)
@@ -278,6 +300,28 @@ class UserChatsWorkflow:
             pass
 
         self._chats.pop(workflow_id, None)
+
+    @workflow.update
+    async def set_demo_workspace(
+        self,
+        record: UserDemoWorkspaceRecord,
+    ) -> UserDemoWorkspaceRecord:
+        updated = UserDemoWorkspaceRecord(
+            control_workflow_id=record.control_workflow_id,
+            status=record.status,
+            workspace_id=record.workspace_id,
+            namespace=record.namespace,
+            host=record.host,
+            url=record.url,
+            task_queue=record.task_queue,
+            updated_at=record.updated_at or workflow.now().isoformat(),
+        )
+        self._demo_workspace = updated
+        return updated
+
+    @workflow.update
+    async def clear_demo_workspace(self) -> None:
+        self._demo_workspace = None
 
     @workflow.query
     def list_chats(self) -> list[ChatRecord]:
@@ -290,6 +334,10 @@ class UserChatsWorkflow:
     @workflow.query
     def has_chat(self, workflow_id: str) -> bool:
         return workflow_id in self._chats
+
+    @workflow.query
+    def demo_workspace(self) -> UserDemoWorkspaceRecord | None:
+        return self._demo_workspace
 
     @workflow.query
     def list_mcp_servers(self) -> list[HttpMcpServerConfig]:

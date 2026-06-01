@@ -17,6 +17,18 @@ from claude_harness.mcp import (
 from claude_harness.streaming import configure_stream_sink
 from claude_harness.tools import run_tool_activity
 from simple_chat_agent import TASK_QUEUE
+from simple_chat_agent.worker.demo_workspace_activities import (
+    configure_demo_workspace,
+    create_demo_workspace_namespace,
+    crash_demo_workspace,
+    delete_demo_workspace,
+    deploy_demo_workspace_workloads,
+    provision_demo_workspace,
+    purge_demo_workspace_payloads,
+    resolve_demo_workspace_images,
+    wait_demo_workspace_deployment,
+)
+from simple_chat_agent.worker.demo_workspace_workflow import DemoWorkspaceWorkflow
 from simple_chat_agent.worker.codec_server import (
     codec_server_enabled,
     codec_server_host,
@@ -55,11 +67,25 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[SimpleChatWorkflow, UserChatsWorkflow, SubagentWorkflow],
+        workflows=[
+            SimpleChatWorkflow,
+            UserChatsWorkflow,
+            SubagentWorkflow,
+            DemoWorkspaceWorkflow,
+        ],
         activities=[
             call_claude,
             run_tool_activity,
             run_guard_activity,
+            provision_demo_workspace,
+            resolve_demo_workspace_images,
+            create_demo_workspace_namespace,
+            configure_demo_workspace,
+            deploy_demo_workspace_workloads,
+            wait_demo_workspace_deployment,
+            crash_demo_workspace,
+            delete_demo_workspace,
+            purge_demo_workspace_payloads,
         ],
     )
     if not codec_server_enabled():

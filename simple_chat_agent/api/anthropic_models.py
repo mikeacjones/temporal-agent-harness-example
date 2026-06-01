@@ -21,6 +21,7 @@ FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-7",)
 THINKING_MODE_ORDER = ("adaptive", "enabled")
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_MODEL_CACHE_SECONDS = 300
+DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 _CATALOG_CACHE: tuple[float, "AnthropicModelCatalog"] | None = None
 _CATALOG_LOCK = Lock()
@@ -109,6 +110,27 @@ def default_effort(model: AnthropicModelOption | None) -> str:
     return "max"
 
 
+def max_output_tokens_for_model(
+    model_catalog: AnthropicModelCatalog,
+    model_id: str,
+) -> int:
+    model = model_catalog.model_by_id(model_id)
+    if model is None or model.max_tokens is None:
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    return max(1, int(model.max_tokens))
+
+
+def clamp_output_tokens_for_model(
+    requested: int,
+    model_catalog: AnthropicModelCatalog,
+    model_id: str,
+) -> int:
+    return max(
+        1,
+        min(int(requested), max_output_tokens_for_model(model_catalog, model_id)),
+    )
+
+
 def _load_anthropic_model_catalog() -> AnthropicModelCatalog:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -172,7 +194,7 @@ def _fallback_catalog(error: str | None = None) -> AnthropicModelCatalog:
                         display_name=model,
                         created_at=None,
                         max_input_tokens=None,
-                        max_tokens=None,
+                        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
                         thinking_modes=_fallback_thinking_modes(model),
                         effort_options=EFFORT_ORDER,
                     )
