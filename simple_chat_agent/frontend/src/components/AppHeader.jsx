@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 import { ConversationList } from "./ConversationList.jsx";
 import {
   agentSettingsFromWorkflowState,
@@ -6,6 +8,8 @@ import {
   modelOptionsForSelection,
   thinkingModesForModel,
 } from "../state/chatState.js";
+
+const WORKSPACE_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
 export function AppHeader({
   state,
@@ -215,6 +219,7 @@ function DemoWorkspaceControls({
             {workspace.namespace}
           </div>
         ) : null}
+        <WorkspaceCountdown workspace={workspace} />
         <div className="demo-workspace-actions single">
           <button
             className="danger"
@@ -241,6 +246,7 @@ function DemoWorkspaceControls({
           {workspace.host}
         </div>
       ) : null}
+      <WorkspaceCountdown workspace={workspace} />
       {workspace?.provisioning_message ? (
         <div className="demo-workspace-progress">{workspace.provisioning_message}</div>
       ) : null}
@@ -259,6 +265,42 @@ function DemoWorkspaceControls({
       </div>
     </div>
   );
+}
+
+function WorkspaceCountdown({ workspace }) {
+  const active = workspace?.status === "active" && workspace?.last_activity_at;
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!active) return undefined;
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [active, workspace?.last_activity_at]);
+
+  if (!active) return null;
+
+  const lastActivity = Date.parse(workspace.last_activity_at);
+  if (!Number.isFinite(lastActivity)) return null;
+
+  const remainingMs = Math.max(0, lastActivity + WORKSPACE_IDLE_TIMEOUT_MS - now);
+  return (
+    <div className="demo-workspace-countdown">
+      Auto-delete in {formatDuration(remainingMs)}
+    </div>
+  );
+}
+
+function formatDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
+  }
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
 function thinkingModeLabel(mode) {

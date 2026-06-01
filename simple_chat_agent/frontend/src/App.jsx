@@ -719,6 +719,7 @@ export default function App() {
     const body = await response.json();
     const conversations = await refreshConversations();
     selectConversation(body.workflow_id, options, conversations);
+    touchDemoWorkspaceCountdown();
     return body;
   }
 
@@ -853,9 +854,38 @@ export default function App() {
       await handleMissingWorkflow();
     }
     if (!response.ok) throw new Error(await responseErrorText(response));
+    if (url.startsWith("/api/sessions/")) {
+      touchDemoWorkspaceCountdown();
+    }
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) return response.json();
     return {};
+  }
+
+  function touchDemoWorkspaceCountdown() {
+    const now = new Date().toISOString();
+    setState((previous) => {
+      const demoWorkspace = previous.demoWorkspace;
+      const workspace = demoWorkspace?.workspace;
+      if (
+        !demoWorkspace?.in_demo_workspace ||
+        !workspace ||
+        workspace.status !== "active"
+      ) {
+        return previous;
+      }
+      return {
+        ...previous,
+        demoWorkspace: {
+          ...demoWorkspace,
+          workspace: {
+            ...workspace,
+            updated_at: now,
+            last_activity_at: now,
+          },
+        },
+      };
+    });
   }
 
   function writeDemoWorkspaceLoadingPage(workspaceTab) {
