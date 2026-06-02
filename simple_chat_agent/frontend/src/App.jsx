@@ -26,6 +26,7 @@ import {
   updateWorkflowStateInState,
 } from "./state/chatState.js";
 import {
+  defaultSystemPrompt,
   defaultMcpFormValues,
   emptyArtifactViewer,
   initialState,
@@ -408,6 +409,7 @@ export default function App() {
       localPending: [],
       resolvingApprovals: new Set(),
       draftConversation: true,
+      draftSystemPrompt: defaultSystemPrompt,
       artifactViewer: emptyArtifactViewer,
       statusNotice: "",
     }));
@@ -438,6 +440,7 @@ export default function App() {
       currentClaudeSequence: null,
       ignoreClaudeUntilStart: false,
       draftConversation: false,
+      draftSystemPrompt: defaultSystemPrompt,
       resolvingApprovals: new Set(),
       localPending: options.preserveLocalPending ? previous.localPending : [],
       artifactViewer: emptyArtifactViewer,
@@ -746,6 +749,7 @@ export default function App() {
     saveAgentSettings(normalizedSettings);
     setState((previous) => ({ ...previous, agentSettings: normalizedSettings }));
     return {
+      system_prompt: current.draftSystemPrompt.trim() || defaultSystemPrompt,
       model: normalizedSettings.model,
       thinking: {
         enabled: normalizedSettings.thinkingEnabled,
@@ -1564,6 +1568,10 @@ export default function App() {
               streamTurn={state.streamTurn}
               streamPanelCollapsed={state.streamPanelCollapsed}
               resolvingApprovals={state.resolvingApprovals}
+              draftSystemPrompt={state.draftSystemPrompt}
+              onUpdateDraftSystemPrompt={(draftSystemPrompt) =>
+                setState((previous) => ({ ...previous, draftSystemPrompt }))
+              }
               onToggleStreamPanel={() =>
                 setState((previous) => ({
                   ...previous,

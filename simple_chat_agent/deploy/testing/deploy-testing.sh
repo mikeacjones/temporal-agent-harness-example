@@ -34,6 +34,7 @@ echo ">> Deploying testing Python sandbox Lambda + IAM"
 "${ROOT}/simple_chat_agent/deploy/testing/deploy-python-sandbox-lambda-testing.sh"
 
 echo ">> Applying testing manifests"
+kubectl apply -f simple_chat_agent/deploy/searxng.yaml
 kubectl apply -f simple_chat_agent/deploy/testing/
 
 echo ">> Setting images + rolling out the test stack"

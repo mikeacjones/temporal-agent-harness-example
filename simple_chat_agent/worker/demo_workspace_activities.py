@@ -13,6 +13,10 @@ from urllib.request import Request, urlopen
 from temporalio import activity
 
 from simple_chat_agent.common.external_storage import purge_workflow_payloads
+from simple_chat_agent.worker.tools.research import (
+    GOOGLE_RESEARCH_API_KEY_NAMES,
+    SEARXNG_BASE_URL,
+)
 from simple_chat_agent.worker.demo_workspace_workflow import (
     ProvisionDemoWorkspaceRequest,
 )
@@ -450,6 +454,11 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         values["PYTHON_SANDBOX_LAMBDA_QUALIFIER"] = os.environ[
             "PYTHON_SANDBOX_LAMBDA_QUALIFIER"
         ]
+    if os.environ.get(SEARXNG_BASE_URL):
+        values[SEARXNG_BASE_URL] = os.environ[SEARXNG_BASE_URL]
+    for name in GOOGLE_RESEARCH_API_KEY_NAMES:
+        if os.environ.get(name):
+            values[name] = os.environ[name]
     if request.search_attr_name:
         values["SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR"] = request.search_attr_name
     if os.environ.get("SIMPLE_CHAT_GOOD_PLACE") is not None:

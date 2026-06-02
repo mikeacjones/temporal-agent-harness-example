@@ -13,6 +13,8 @@ export function Messages({
   streamTurn,
   streamPanelCollapsed,
   resolvingApprovals,
+  draftSystemPrompt,
+  onUpdateDraftSystemPrompt,
   onToggleStreamPanel,
   onResolveApproval,
   onLoadOlderMessages,
@@ -33,11 +35,14 @@ export function Messages({
   return (
     <>
       {!hasContent ? (
-        <div className="empty">
-          {draftConversation
-            ? "Type your first message to start a Temporal workflow."
-            : "Starting a Temporal workflow..."}
-        </div>
+        draftConversation ? (
+          <DraftEmptyState
+            systemPrompt={draftSystemPrompt}
+            onUpdateSystemPrompt={onUpdateDraftSystemPrompt}
+          />
+        ) : (
+          <div className="empty">Starting a Temporal workflow...</div>
+        )
       ) : null}
       {workflowState?.transcript_has_more_before ? (
         <HistoryLoader
@@ -74,6 +79,24 @@ export function Messages({
         onResolve={onResolveApproval}
       />
     </>
+  );
+}
+
+function DraftEmptyState({ systemPrompt, onUpdateSystemPrompt }) {
+  return (
+    <div className="empty draft-empty">
+      <label className="draft-system-prompt">
+        <span>System Prompt</span>
+        <textarea
+          rows={2}
+          value={systemPrompt}
+          onChange={(event) => onUpdateSystemPrompt(event.currentTarget.value)}
+          aria-label="System prompt"
+          spellCheck="true"
+        />
+      </label>
+      <p>Type your first message to start a Temporal workflow.</p>
+    </div>
   );
 }
 

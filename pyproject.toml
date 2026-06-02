@@ -8,10 +8,12 @@ dependencies = [
     "anthropic>=0.102.0",
     "boto3>=1.43.17",
     "fastapi>=0.136.1",
+    "httpx>=0.28.1",
     "mcp>=1.27.1",
     "prompt-toolkit>=3.0.52",
     "pydantic>=2.13.4",
     "pyjwt[crypto]>=2.12.1",
     "temporalio>=1.27.2",
+    "trafilatura>=2.0.0",
     "uvicorn>=0.47.0",
 ]

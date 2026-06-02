@@ -13,6 +13,7 @@ from temporalio.client import Client
 from simple_chat_agent.api.anthropic_models import (
     clamp_output_tokens_for_model,
     get_anthropic_model_catalog,
+    max_context_tokens_for_model,
 )
 from simple_chat_agent.api.artifacts import artifact_response
 from simple_chat_agent.api.auth import AuthenticatedUser
@@ -42,7 +43,10 @@ from simple_chat_agent.api.thinking import (
     thinking_config_from_request,
 )
 from simple_chat_agent.common.store import AppStore
-from simple_chat_agent.worker.tools import tool_names_for_connections
+from simple_chat_agent.worker.tools import (
+    configured_research_tool_names,
+    tool_names_for_connections,
+)
 from simple_chat_agent.worker.user_chats_workflow import (
     ChatRecord,
     CreateChatRequest,
@@ -112,12 +116,14 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             model_catalog,
             model,
         )
+        max_context_tokens = max_context_tokens_for_model(model_catalog, model)
         conversation: ChatRecord = await registry.execute_update(
             UserChatsWorkflow.create_chat,
             CreateChatRequest(
                 system_prompt=session_request.system_prompt,
                 model=model,
                 max_tokens=max_tokens,
+                max_context_tokens=max_context_tokens,
                 max_turns=session_request.max_turns,
                 thinking=thinking_config_from_request(
                     session_request.thinking,
@@ -128,6 +134,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 available_tool_names=tool_names_for_connections(
                     github_connection_id=github_connection_id,
                     mcp_servers=mcp_servers,
+                    research_tool_names=configured_research_tool_names(),
                 ),
                 github_connection_id=github_connection_id,
                 mcp_servers=mcp_servers,

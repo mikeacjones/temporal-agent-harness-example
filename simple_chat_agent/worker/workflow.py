@@ -12,6 +12,7 @@ with workflow.unsafe.imports_passed_through():
         ClaudeAgentResult,
         ClaudeAgentState,
         ClaudeThinkingConfig,
+        DEFAULT_MAX_CONTEXT_TOKENS,
         SteeringMode,
     )
     from simple_chat_agent.worker.tools import build_tools, tool_names_for_connections
@@ -80,6 +81,7 @@ class SimpleChatInput:
     system_prompt: str = "You are a concise test chatbot."
     model: str = "claude-sonnet-4-5"
     max_tokens: int = DEFAULT_MAX_TOKENS
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
     max_turns: int = 20
     stream_id: str | None = None
@@ -477,6 +479,7 @@ class SimpleChatWorkflow:
             tools,
             model=chat_input.model,
             max_tokens=chat_input.max_tokens,
+            max_context_tokens=chat_input.max_context_tokens,
             thinking=chat_input.thinking,
             stream_id=self._stream_id,
             pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,

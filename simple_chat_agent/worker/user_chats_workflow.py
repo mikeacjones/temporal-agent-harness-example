@@ -13,7 +13,10 @@ from temporalio.common import (
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.claude_agent import ClaudeThinkingConfig
+    from claude_harness.claude_agent import (
+        ClaudeThinkingConfig,
+        DEFAULT_MAX_CONTEXT_TOKENS,
+    )
     from claude_harness.mcp_types import HttpMcpServerConfig
     from simple_chat_agent import TASK_QUEUE
     from simple_chat_agent.worker.workflow import (
@@ -66,6 +69,7 @@ class CreateChatRequest:
     model: str
     max_tokens: int
     max_turns: int
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
     initial_message: str | None = None
     available_tool_names: list[str] = field(default_factory=list)
@@ -200,6 +204,7 @@ class UserChatsWorkflow:
                 system_prompt=request.system_prompt,
                 model=request.model,
                 max_tokens=request.max_tokens,
+                max_context_tokens=request.max_context_tokens,
                 thinking=request.thinking,
                 max_turns=request.max_turns,
                 stream_id=workflow_id,
