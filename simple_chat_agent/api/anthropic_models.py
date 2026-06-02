@@ -9,19 +9,32 @@ from typing import Any
 
 from anthropic import Anthropic
 
+from claude_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+
 
 FALLBACK_MODEL_OPTIONS = [
     "claude-sonnet-4-5",
     "claude-sonnet-4-6",
     "claude-opus-4-5",
     "claude-opus-4-7",
+    "claude-opus-4-8",
     "claude-haiku-4-5",
 ]
-FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-7",)
+FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+)
 THINKING_MODE_ORDER = ("adaptive", "enabled")
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_MODEL_CACHE_SECONDS = 300
 DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+
+FALLBACK_MODEL_CAPABILITIES: dict[str, tuple[int | None, int | None]] = {
+    "claude-opus-4-6": (1_000_000, 128_000),
+    "claude-opus-4-7": (1_000_000, 128_000),
+    "claude-opus-4-8": (1_000_000, 128_000),
+}
 
 _CATALOG_CACHE: tuple[float, "AnthropicModelCatalog"] | None = None
 _CATALOG_LOCK = Lock()
@@ -116,18 +129,31 @@ def max_output_tokens_for_model(
 ) -> int:
     model = model_catalog.model_by_id(model_id)
     if model is None or model.max_tokens is None:
-        return DEFAULT_MAX_OUTPUT_TOKENS
+        return _fallback_max_output_tokens(model_id)
     return max(1, int(model.max_tokens))
 
 
-def clamp_output_tokens_for_model(
-    requested: int,
+def max_context_tokens_for_model(
     model_catalog: AnthropicModelCatalog,
     model_id: str,
 ) -> int:
+    model = model_catalog.model_by_id(model_id)
+    if model is None or model.max_input_tokens is None:
+        return _fallback_max_input_tokens(model_id) or DEFAULT_MAX_CONTEXT_TOKENS
+    return max(1, int(model.max_input_tokens))
+
+
+def clamp_output_tokens_for_model(
+    requested: int | None,
+    model_catalog: AnthropicModelCatalog,
+    model_id: str,
+) -> int:
+    maximum = max_output_tokens_for_model(model_catalog, model_id)
+    if requested is None:
+        return maximum
     return max(
         1,
-        min(int(requested), max_output_tokens_for_model(model_catalog, model_id)),
+        min(int(requested), maximum),
     )
 
 
@@ -193,8 +219,8 @@ def _fallback_catalog(error: str | None = None) -> AnthropicModelCatalog:
                         id=model,
                         display_name=model,
                         created_at=None,
-                        max_input_tokens=None,
-                        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                        max_input_tokens=_fallback_max_input_tokens(model),
+                        max_tokens=_fallback_max_output_tokens(model),
                         thinking_modes=_fallback_thinking_modes(model),
                         effort_options=EFFORT_ORDER,
                     )
@@ -244,6 +270,21 @@ def _fallback_thinking_modes(model: str) -> tuple[str, ...]:
     ):
         return ("adaptive", "enabled")
     return ("enabled",)
+
+
+def _fallback_max_input_tokens(model: str) -> int | None:
+    return _fallback_capability(model)[0]
+
+
+def _fallback_max_output_tokens(model: str) -> int:
+    return _fallback_capability(model)[1] or DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def _fallback_capability(model: str) -> tuple[int | None, int | None]:
+    for prefix, capability in FALLBACK_MODEL_CAPABILITIES.items():
+        if model.startswith(prefix):
+            return capability
+    return None, DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _model_sort_key(model: AnthropicModelOption) -> tuple[int, float, str]:

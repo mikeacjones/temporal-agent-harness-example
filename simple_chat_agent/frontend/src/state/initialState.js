@@ -1,3 +1,5 @@
+export const defaultSystemPrompt = "You are a concise test chatbot.";
+
 export const defaultAgentSettings = {
   model: "",
   thinkingEnabled: false,
@@ -54,6 +56,7 @@ export const initialState = {
   toolsWindowOpen: false,
   artifactViewer: emptyArtifactViewer,
   draftConversation: true,
+  draftSystemPrompt: defaultSystemPrompt,
   mcpFormOpen: false,
   mcpFormSubmitting: false,
   mcpFormError: "",

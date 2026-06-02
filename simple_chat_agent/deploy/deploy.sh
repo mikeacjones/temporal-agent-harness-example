@@ -2,8 +2,8 @@
 #
 # Build, push, and roll out a new simple_chat_agent image.
 #
-# Use this to ship code/dependency updates. (For infra changes — manifests,
-# secret — use `kubectl apply -f simple_chat_agent/deploy/` instead.)
+# Use this to ship code/dependency updates and checked-in Kubernetes manifest
+# changes. Secrets still need to be managed separately.
 #
 # Prerequisites:
 #   - Your AWS CLI is authenticated (e.g. `aws sso login --profile <profile>`),
@@ -42,6 +42,9 @@ docker buildx build --platform linux/amd64 \
   -t "${IMAGE}:${TAG}" \
   -t "${IMAGE}:latest" \
   --push .
+
+echo ">> Applying manifests"
+kubectl apply -f simple_chat_agent/deploy/
 
 echo ">> Rolling out frontend + API + worker in ${NAMESPACE} to ${TAG}"
 kubectl set image "deployment/${FRONTEND_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"

@@ -22,6 +22,7 @@ with workflow.unsafe.imports_passed_through():
     from simple_chat_agent.worker.tools.fetch_url import fetch_url
     from simple_chat_agent.worker.tools.github import GitHubProvider
     from simple_chat_agent.worker.tools.python_sandbox import python_sandbox
+    from simple_chat_agent.worker.tools.research import ResearchProvider
 
 
 CREATE_SUBAGENT_TOOL = "create_subagent"
@@ -248,6 +249,7 @@ def _build_subagent_tools(
         )
     )
     tools.add_tool(fetch_url, python_sandbox)
+    tools.add_provider(ResearchProvider())
     tools.add_provider(
         GitHubProvider(lambda: github_connection_id),
         exclude_tools=_DISALLOWED_SUBAGENT_TOOLS,

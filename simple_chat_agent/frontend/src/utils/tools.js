@@ -5,6 +5,9 @@ export function toolMetaText(tool) {
   if (tool.provider?.startsWith("mcp:")) {
     return `${tool.login || "HTTP MCP"} | ${tool.available_tools?.length || 0} tools | ${tool.scopes}`;
   }
+  if (tool.provider?.startsWith("builtin:")) {
+    return `${tool.login || "built in"} | ${tool.scopes || "local"}`;
+  }
   if (tool.connected && tool.login) {
     return `@${tool.login} | ${tool.scopes || "no scopes returned"}`;
   }

@@ -89,7 +89,10 @@ from simple_chat_agent.common.mcp_auth import (
 )
 from simple_chat_agent.common.mcp_oauth import PendingMcpOAuthFlow
 from simple_chat_agent.common.store import AppStore
-from simple_chat_agent.worker.tools import tool_names_for_connections
+from simple_chat_agent.worker.tools import (
+    configured_research_tool_names,
+    tool_names_for_connections,
+)
 from simple_chat_agent.worker.demo_workspace_workflow import (
     DemoWorkspaceConfig,
     DemoWorkspaceInput,
@@ -708,6 +711,7 @@ async def _update_user_workflows_tool_connections(
     available_tool_names = tool_names_for_connections(
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
+        research_tool_names=configured_research_tool_names(),
     )
 
     for conversation in await _list_user_chats(user.user_id, user.username):
@@ -739,6 +743,7 @@ async def _upsert_user_mcp_server(
                     ],
                     server,
                 ],
+                research_tool_names=configured_research_tool_names(),
             ),
             github_connection_id=_github_connection_id_for_user(user),
         ),
@@ -752,6 +757,7 @@ async def _available_tool_names_for_user(user: AuthenticatedUser) -> list[str]:
     return tool_names_for_connections(
         github_connection_id=_github_connection_id_for_user(user),
         mcp_servers=mcp_servers,
+        research_tool_names=configured_research_tool_names(),
     )
 
 

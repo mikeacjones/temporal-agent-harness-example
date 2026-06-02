@@ -13,6 +13,10 @@ from .artifacts import ArtifactProvider, CREATE_ARTIFACT_TOOL
 from .fetch_url import fetch_url
 from .github import GitHubProvider
 from .python_sandbox import python_sandbox
+from .research import (
+    ResearchProvider,
+    configured_research_tool_names,
+)
 from .subagent import CREATE_SUBAGENT_TOOL, SubagentProvider
 
 ApprovalDecision = Literal["allow", "always_allow", "deny"]
@@ -131,6 +135,7 @@ def build_tools(
         )
     )
     tools.add_tool(fetch_url, python_sandbox)
+    tools.add_provider(ResearchProvider())
     tools.add_provider(GitHubProvider(github_connection_id))
     tools.add_provider(
         SubagentProvider(
@@ -150,6 +155,7 @@ def tool_names_for_connections(
     *,
     github_connection_id: str | None,
     mcp_servers: Iterable[HttpMcpServerConfig] | None = None,
+    research_tool_names: Iterable[str] | None = None,
 ) -> list[str]:
     names = [
         FETCH_URL_TOOL,
@@ -157,6 +163,7 @@ def tool_names_for_connections(
         CREATE_ARTIFACT_TOOL,
         CREATE_SUBAGENT_TOOL,
     ]
+    names.extend(research_tool_names or ())
     if github_connection_id is not None:
         names.extend(GITHUB_TOOL_NAMES)
     for server in mcp_servers or ():

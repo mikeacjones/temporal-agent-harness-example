@@ -16,7 +16,8 @@ The app includes:
 - A Temporal worker that hosts the chat workflows, subagent workflow, Claude
   activity, generic tool activity, and generic guard activity.
 - Example tools for URL fetches, Python sandbox execution, artifact creation,
-  GitHub operations, HTTP MCP servers, and subagents.
+  GitHub operations, HTTP MCP servers, optional research/search providers, and
+  subagents.
 
 The Python code is split by runtime boundary:
 
@@ -144,6 +145,32 @@ GITHUB_OAUTH_SCOPES=read:user,user:email,public_repo
 `public_repo` is needed for the demo issue-creation tool against public
 repositories. The issue-creation tool is also guarded by the same approval UI as
 other mutating tools.
+
+## Optional Research Tools
+
+Research tools are opt-in. If the corresponding environment value is absent,
+the tool is not shown in the Tools window and is not offered to new chats.
+
+```bash
+# Web search through an internal SearXNG instance.
+SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
+
+# Optional Google-backed research enrichers. This shared key enables all of
+# them when the corresponding Google APIs are enabled for the key's project.
+GOOGLE_API_KEY=...
+
+# Optional per-service overrides if you want separate/restricted keys.
+GOOGLE_FACT_CHECK_API_KEY=...
+GOOGLE_KNOWLEDGE_GRAPH_API_KEY=...
+GOOGLE_BOOKS_API_KEY=...
+GOOGLE_YOUTUBE_API_KEY=...
+GOOGLE_SAFE_BROWSING_API_KEY=...
+```
+
+The Kubernetes manifests deploy SearXNG as an internal ClusterIP service in the
+primary namespace; it is not routed through ingress. Temporary demo workspaces
+receive the same SearXNG URL and Google research API key environment values so
+the research tools carry over when those values are configured.
 
 ## HTTP MCP Servers
 

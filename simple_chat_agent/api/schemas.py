@@ -9,7 +9,6 @@ from claude_harness.claude_agent import (
     ClaudeThinkingEffort,
     ClaudeThinkingMode,
 )
-from simple_chat_agent.worker.workflow import DEFAULT_MAX_TOKENS
 
 DEFAULT_THINKING_EFFORT: ClaudeThinkingEffort = "max"
 
@@ -24,7 +23,7 @@ class ThinkingSessionRequest(BaseModel):
 class CreateSessionRequest(BaseModel):
     system_prompt: str = "You are a concise test chatbot."
     model: str | None = None
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_tokens: int | None = None
     max_turns: int = 20
     thinking: ThinkingSessionRequest = Field(default_factory=ThinkingSessionRequest)
     initial_message: str | None = None

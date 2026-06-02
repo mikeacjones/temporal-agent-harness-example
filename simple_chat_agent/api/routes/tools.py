@@ -43,6 +43,7 @@ from simple_chat_agent.worker.tools import (
     FETCH_URL_TOOL,
     GITHUB_TOOL_NAMES,
     PYTHON_SANDBOX_TOOL,
+    configured_research_tool_names,
     tool_names_for_connections,
 )
 from simple_chat_agent.worker.user_chats_workflow import (
@@ -99,6 +100,20 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
                 ],
             },
         ]
+        research_tool_names = configured_research_tool_names()
+        if research_tool_names:
+            tools.append(
+                {
+                    "provider": "builtin:research",
+                    "label": "Research tools",
+                    "configured": True,
+                    "connected": True,
+                    "enabled": True,
+                    "login": "configured research providers",
+                    "scopes": "web/search",
+                    "available_tools": research_tool_names,
+                },
+            )
         if github_enabled:
             tools.append(
                 {
@@ -273,6 +288,7 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
                 available_tool_names=tool_names_for_connections(
                     github_connection_id=deps.github_connection_id_for_user(user),
                     mcp_servers=remaining_servers,
+                    research_tool_names=configured_research_tool_names(),
                 ),
                 github_connection_id=deps.github_connection_id_for_user(user),
             ),

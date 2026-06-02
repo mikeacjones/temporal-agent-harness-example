@@ -113,6 +113,8 @@ spec:
             # Override shared prod secret values for OAuth redirect generation.
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.testing.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_SEARXNG_BASE_URL
+              value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: GITHUB_OAUTH_REDIRECT_URI
               value: https://agent-harness-demo.testing.tmprl-demo.cloud/oauth/github/callback
             # --- test isolation ---
@@ -210,6 +212,8 @@ spec:
               value: https://agent-harness-demo.testing.tmprl-demo.cloud
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-api-testing
+            - name: SIMPLE_CHAT_SEARXNG_BASE_URL
+              value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: PYTHON_SANDBOX_LAMBDA_FUNCTION
               value: temporal-michaelj-agent-harness-demo-python-sandbox-testing
           volumeMounts:
