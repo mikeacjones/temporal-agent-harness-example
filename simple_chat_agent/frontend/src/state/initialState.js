@@ -47,6 +47,8 @@ export const initialState = {
   olderMessagesLoading: false,
   olderMessagesError: "",
   streamTurn: null,
+  turnTraces: {},
+  expandedTraceIndex: null,
   streamPanelCollapsed: false,
   currentClaudeSequence: null,
   ignoreClaudeUntilStart: false,

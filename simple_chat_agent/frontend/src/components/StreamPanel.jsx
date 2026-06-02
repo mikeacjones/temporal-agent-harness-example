@@ -1,20 +1,26 @@
 import { CodeBlock, MarkdownContent } from "./MarkdownContent.jsx";
 import { inferCodeLanguage } from "../utils/code.js";
 
-export function StreamPanel({ turn, collapsed, onToggle }) {
+export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
   if (!turn) return null;
   const timeline = normalizeStreamTimeline(turn);
   if (!timeline.segments.length) return null;
   return (
-    <section className={`stream-panel ${timeline.status}${collapsed ? " collapsed" : ""}`}>
+    <section
+      className={`stream-panel ${timeline.status}${collapsed ? " collapsed" : ""}${
+        embedded ? " embedded" : ""
+      }`}
+    >
       <div className="stream-panel-header">
         <div className="stream-panel-title">
           Streaming visibility
           <span className="stream-panel-status">{streamPanelStatus(timeline)}</span>
         </div>
-        <button type="button" className="stream-panel-toggle" onClick={onToggle}>
-          {collapsed ? "Expand" : "Collapse"}
-        </button>
+        {onToggle ? (
+          <button type="button" className="stream-panel-toggle" onClick={onToggle}>
+            {collapsed ? "Expand" : "Collapse"}
+          </button>
+        ) : null}
       </div>
       <div className="stream-panel-body">
         {collapsed ? (
@@ -45,6 +51,7 @@ function AgentStreamSegment({ segment }) {
   const complete = segment.status === "complete";
   const text = String(segment.text || "").trim();
   const thinking = String(segment.thinking || "").trim();
+  const refusalDetails = refusalDetailsText(segment.stopDetails);
   return (
     <div className={`stream-agent-segment ${complete ? "complete" : "streaming"}`}>
       <div className="stream-finished-title">
@@ -52,6 +59,7 @@ function AgentStreamSegment({ segment }) {
         {complete && segment.stopReason ? ` | ${segment.stopReason}` : ""}
       </div>
       {thinking ? <div className="stream-thinking">{thinking}</div> : null}
+      {refusalDetails ? <div className="stream-refusal-details">{refusalDetails}</div> : null}
       {text ? (
         complete ? (
           <MarkdownContent content={text} />
@@ -167,6 +175,18 @@ function streamPanelStatus(turn) {
   return `streaming | ${turnText} | ${toolText}`;
 }
 
+function refusalDetailsText(stopDetails) {
+  if (!stopDetails || typeof stopDetails !== "object") return "";
+  const parts = [];
+  if (typeof stopDetails.category === "string" && stopDetails.category) {
+    parts.push(`Category: ${stopDetails.category}`);
+  }
+  if (typeof stopDetails.explanation === "string" && stopDetails.explanation) {
+    parts.push(stopDetails.explanation);
+  }
+  return parts.join(" | ");
+}
+
 function streamPanelPreview(turn) {
   const activeAgent = latestAgentSegment(turn, { active: true });
   const latestAgent = latestAgentSegment(turn);
@@ -196,6 +216,7 @@ function normalizeStreamTimeline(turn) {
       text: finishedTurn.text || "",
       thinking: finishedTurn.thinking || "",
       stopReason: finishedTurn.stopReason || "unknown",
+      stopDetails: finishedTurn.stopDetails || null,
       usage: finishedTurn.usage || null,
       completedAt: finishedTurn.completedAt || null,
     });

@@ -4,7 +4,7 @@ import { ArtifactViewer, ArtifactsPanel } from "./components/Artifacts.jsx";
 import { AppHeader } from "./components/AppHeader.jsx";
 import { Composer } from "./components/Composer.jsx";
 import { LoginScreen } from "./components/LoginScreen.jsx";
-import { Messages } from "./components/Messages.jsx";
+import { Messages, TurnTraceDrawer } from "./components/Messages.jsx";
 import { ToolsWindow } from "./components/ToolsWindow.jsx";
 import { artifactNeedsTextFetch, artifactPreviewKind } from "./utils/artifacts.js";
 import { jsonHeaders, responseErrorText } from "./utils/http.js";
@@ -17,12 +17,16 @@ import {
   displayStatus,
   handleStreamEventInState,
   markStreamInterruptedInState,
+  mergeReplayedTurnTracesInState,
   normalizeAgentSettings,
   prependTranscriptPageInState,
   saveAgentSettings,
+  setTurnTraceErrorInState,
+  setTurnTraceLoadingInState,
   streamEventNeedsSettledTranscriptDelta,
   streamEventNeedsWorkflowStateRefresh,
   temporalUiUrl,
+  toggleExpandedTraceInState,
   updateWorkflowStateInState,
 } from "./state/chatState.js";
 import {
@@ -32,6 +36,118 @@ import {
   initialState,
 } from "./state/initialState.js";
 
+const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:";
+const TURN_TRACE_CACHE_LIMIT = 12;
+const STREAM_SESSION_CACHE_PREFIX = "simpleChatStreamSession:";
+
+function turnTraceCacheKey(workflowId) {
+  return `${TURN_TRACE_CACHE_PREFIX}${workflowId}`;
+}
+
+function streamSessionCacheKey(workflowId) {
+  return `${STREAM_SESSION_CACHE_PREFIX}${workflowId}`;
+}
+
+function loadCachedTurnTraces(workflowId) {
+  if (!workflowId) return {};
+  try {
+    const raw = localStorage.getItem(turnTraceCacheKey(workflowId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCachedTurnTraces(workflowId, turnTraces) {
+  if (!workflowId) return;
+  const entries = Object.entries(turnTraces || {})
+    .filter(([, trace]) => trace?.turn)
+    .sort(([left], [right]) => Number(right) - Number(left))
+    .slice(0, TURN_TRACE_CACHE_LIMIT)
+    .sort(([left], [right]) => Number(left) - Number(right));
+  try {
+    localStorage.setItem(
+      turnTraceCacheKey(workflowId),
+      JSON.stringify(Object.fromEntries(entries)),
+    );
+  } catch {
+    // Browser cache is best-effort; traces are still available while in memory.
+  }
+}
+
+function loadCachedStreamSession(workflowId) {
+  if (!workflowId) return {};
+  try {
+    const raw = localStorage.getItem(streamSessionCacheKey(workflowId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCachedStreamSession(workflowId, snapshot) {
+  if (!workflowId || !snapshot?.streamTurn) return;
+  try {
+    localStorage.setItem(
+      streamSessionCacheKey(workflowId),
+      JSON.stringify({
+        cursor: snapshot.cursor || "",
+        streamTurn: trimCachedStreamTurn(snapshot.streamTurn),
+        currentClaudeSequence: snapshot.currentClaudeSequence ?? null,
+        ignoreClaudeUntilStart: Boolean(snapshot.ignoreClaudeUntilStart),
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+  } catch {
+    // Browser cache is best-effort; the live stream still owns current state.
+  }
+}
+
+function clearCachedStreamSession(workflowId) {
+  if (!workflowId) return;
+  try {
+    localStorage.removeItem(streamSessionCacheKey(workflowId));
+  } catch {
+    // Ignore storage failures; cache cleanup is not required for correctness.
+  }
+}
+
+function trimCachedStreamTurn(turn) {
+  return {
+    ...turn,
+    segments: (turn.segments || []).map((segment) => {
+      const next = { ...segment };
+      if (typeof next.text === "string" && next.text.length > 120_000) {
+        next.text = next.text.slice(-120_000);
+      }
+      if (typeof next.thinking === "string" && next.thinking.length > 120_000) {
+        next.thinking = next.thinking.slice(-120_000);
+      }
+      if (Array.isArray(next.events)) {
+        next.events = next.events.slice(-12).map(trimCachedStreamEvent);
+      }
+      return next;
+    }),
+  };
+}
+
+function trimCachedStreamEvent(event) {
+  const next = {
+    ...event,
+    payload: { ...(event.payload || {}) },
+  };
+  for (const key of ["text", "input_partial", "partial_json"]) {
+    if (typeof next.payload[key] === "string" && next.payload[key].length > 80_000) {
+      next.payload[key] = next.payload[key].slice(-80_000);
+    }
+  }
+  return next;
+}
+
 export default function App() {
   const [state, setState] = useState(initialState);
   const [composerResetToken, setComposerResetToken] = useState(0);
@@ -39,6 +155,7 @@ export default function App() {
   const messageRef = useRef("");
   const eventSourceRef = useRef(null);
   const eventSourceTokenRef = useRef(0);
+  const streamCursorRef = useRef("");
   const messagesRef = useRef(null);
   const pinnedToBottomRef = useRef(true);
   const stateLoadRequestRef = useRef(0);
@@ -54,6 +171,30 @@ export default function App() {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(() => {
+    if (!state.workflowId) return;
+    saveCachedTurnTraces(state.workflowId, state.turnTraces);
+  }, [state.workflowId, state.turnTraces]);
+
+  useEffect(() => {
+    if (!state.workflowId) return;
+    if (state.streamTurn) {
+      saveCachedStreamSession(state.workflowId, {
+        cursor: streamCursorRef.current,
+        streamTurn: state.streamTurn,
+        currentClaudeSequence: state.currentClaudeSequence,
+        ignoreClaudeUntilStart: state.ignoreClaudeUntilStart,
+      });
+    } else {
+      clearCachedStreamSession(state.workflowId);
+    }
+  }, [
+    state.workflowId,
+    state.streamTurn,
+    state.currentClaudeSequence,
+    state.ignoreClaudeUntilStart,
+  ]);
 
   useEffect(() => {
     const run = { cancelled: false };
@@ -75,7 +216,11 @@ export default function App() {
       }
       const current = stateRef.current;
       if (current.auth === "app" && current.workflowId) {
-        reconcileWorkflow(current.workflowId);
+        if (current.workflowState && streamCursorRef.current) {
+          connectEvents(current.workflowId, { cursor: streamCursorRef.current });
+        } else {
+          reconcileWorkflow(current.workflowId);
+        }
       }
     }
 
@@ -103,7 +248,14 @@ export default function App() {
       .forEach((node) => {
         node.scrollTop = node.scrollHeight;
       });
-  }, [state.workflowState, state.localPending, state.streamTurn, state.draftConversation]);
+  }, [
+    state.workflowState,
+    state.localPending,
+    state.streamTurn,
+    state.turnTraces,
+    state.expandedTraceIndex,
+    state.draftConversation,
+  ]);
 
   async function boot(run) {
     try {
@@ -388,6 +540,8 @@ export default function App() {
 
   function startDraftConversation() {
     closeEventSource();
+    if (stateRef.current.workflowId) clearCachedStreamSession(stateRef.current.workflowId);
+    streamCursorRef.current = "";
     nextStateLoadRequest();
     olderMessagesRequestRef.current = false;
     restoreScrollAfterPrependRef.current = null;
@@ -403,6 +557,8 @@ export default function App() {
       olderMessagesLoading: false,
       olderMessagesError: "",
       streamTurn: null,
+      turnTraces: {},
+      expandedTraceIndex: null,
       streamPanelCollapsed: false,
       currentClaudeSequence: null,
       ignoreClaudeUntilStart: false,
@@ -420,6 +576,8 @@ export default function App() {
     const conversation = conversations.find((item) => item.workflow_id === workflowId);
     if (!conversation) return;
     closeEventSource();
+    const cachedStreamSession = loadCachedStreamSession(conversation.workflow_id);
+    streamCursorRef.current = cachedStreamSession.cursor || "";
     const loadRequest = nextStateLoadRequest();
     olderMessagesRequestRef.current = false;
     restoreScrollAfterPrependRef.current = null;
@@ -435,10 +593,12 @@ export default function App() {
       workflowTranscriptProjectionRevision: 0,
       olderMessagesLoading: false,
       olderMessagesError: "",
-      streamTurn: null,
+      streamTurn: cachedStreamSession.streamTurn || null,
+      turnTraces: loadCachedTurnTraces(conversation.workflow_id),
+      expandedTraceIndex: null,
       streamPanelCollapsed: false,
-      currentClaudeSequence: null,
-      ignoreClaudeUntilStart: false,
+      currentClaudeSequence: cachedStreamSession.currentClaudeSequence ?? null,
+      ignoreClaudeUntilStart: Boolean(cachedStreamSession.ignoreClaudeUntilStart),
       draftConversation: false,
       draftSystemPrompt: defaultSystemPrompt,
       resolvingApprovals: new Set(),
@@ -466,7 +626,7 @@ export default function App() {
         ? updateWorkflowStateInState(previous, loaded.workflowState)
         : previous,
     );
-    connectEvents(workflowId, { cursor: loaded.streamCursor });
+    connectEvents(workflowId, { cursor: streamCursorRef.current || loaded.streamCursor });
   }
 
   function reconcileWorkflow(workflowId) {
@@ -651,6 +811,7 @@ export default function App() {
   function connectEvents(workflowId, options = {}) {
     if (!workflowId) return;
     closeEventSource();
+    streamCursorRef.current = options.cursor || streamCursorRef.current || "";
     const eventSourceToken = eventSourceTokenRef.current;
     const params = new URLSearchParams();
     if (options.cursor) params.set("cursor", options.cursor);
@@ -673,6 +834,7 @@ export default function App() {
     });
     eventSource.addEventListener("stream", (event) => {
       if (!isCurrentEventSource()) return;
+      if (event.lastEventId) streamCursorRef.current = event.lastEventId;
       const streamEvent = JSON.parse(event.data);
       enqueueStreamEvent(workflowId, streamEvent);
       if (streamEvent.kind === "claude_start") {
@@ -692,6 +854,7 @@ export default function App() {
     eventSource.addEventListener("reconcile", () => {
       if (!isCurrentEventSource()) return;
       if (stateRef.current.workflowId === workflowId) {
+        streamCursorRef.current = "";
         reconcileWorkflow(workflowId);
       }
     });
@@ -702,6 +865,58 @@ export default function App() {
           ? previous
           : { ...previous, statusNotice: "event stream reconnecting..." },
       );
+    });
+  }
+
+  function toggleTurnTrace(transcriptIndex) {
+    const current = stateRef.current;
+    const trace = current.turnTraces?.[transcriptIndex];
+    setState((previous) => toggleExpandedTraceInState(previous, transcriptIndex));
+    if (trace?.turn || trace?.status === "loading") return;
+    loadTurnTraceReplay(current.workflowId, transcriptIndex).catch((error) => {
+      setState((previous) =>
+        previous.workflowId === current.workflowId
+          ? setTurnTraceErrorInState(previous, transcriptIndex, error)
+          : previous,
+      );
+    });
+  }
+
+  async function loadTurnTraceReplay(workflowId, transcriptIndex) {
+    if (!workflowId) return;
+    setState((previous) =>
+      previous.workflowId === workflowId
+        ? setTurnTraceLoadingInState(previous, transcriptIndex)
+        : previous,
+    );
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(workflowId)}/stream/events?limit=5000`,
+      { headers: { "Cache-Control": "no-cache" } },
+    );
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    if (response.status === 404) {
+      await handleMissingWorkflow();
+      return;
+    }
+    if (!response.ok) throw new Error(await responseErrorText(response));
+    const body = await response.json();
+    if (!body.replay_available) {
+      throw new Error(body.reason || "stream replay unavailable");
+    }
+
+    setState((previous) => {
+      if (previous.workflowId !== workflowId) return previous;
+      const merged = mergeReplayedTurnTracesInState(previous, body.events || []);
+      return merged.turnTraces?.[transcriptIndex]?.turn
+        ? merged
+        : setTurnTraceErrorInState(
+            merged,
+            transcriptIndex,
+            "trace is no longer available for this turn",
+          );
     });
   }
 
@@ -1496,6 +1711,11 @@ export default function App() {
 
   const status = displayStatus(state);
   const artifacts = state.workflowState?.artifacts || [];
+  const selectedTraceIndex = state.expandedTraceIndex;
+  const selectedTrace =
+    selectedTraceIndex !== null && selectedTraceIndex !== undefined
+      ? state.turnTraces?.[selectedTraceIndex]
+      : null;
   const loadingConversation = Boolean(
     state.workflowId &&
       !state.workflowState &&
@@ -1566,6 +1786,8 @@ export default function App() {
               olderMessagesError={state.olderMessagesError}
               localPending={state.localPending}
               streamTurn={state.streamTurn}
+              turnTraces={state.turnTraces}
+              expandedTraceIndex={state.expandedTraceIndex}
               streamPanelCollapsed={state.streamPanelCollapsed}
               resolvingApprovals={state.resolvingApprovals}
               draftSystemPrompt={state.draftSystemPrompt}
@@ -1578,6 +1800,7 @@ export default function App() {
                   streamPanelCollapsed: !previous.streamPanelCollapsed,
                 }))
               }
+              onToggleTurnTrace={toggleTurnTrace}
               onResolveApproval={resolveApproval}
               onLoadOlderMessages={loadOlderMessages}
             />
@@ -1632,6 +1855,17 @@ export default function App() {
           onDeleteMcp={deleteMcpServer}
           setStatusNotice={setStatusNotice}
           post={post}
+        />
+        <TurnTraceDrawer
+          open={selectedTraceIndex !== null && selectedTraceIndex !== undefined}
+          trace={selectedTrace}
+          transcriptIndex={selectedTraceIndex}
+          onClose={() =>
+            setState((previous) => ({
+              ...previous,
+              expandedTraceIndex: null,
+            }))
+          }
         />
         <ArtifactViewer
           viewer={state.artifactViewer}

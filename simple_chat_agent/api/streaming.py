@@ -55,6 +55,17 @@ class StreamBroker:
         path = stream_path(stream_id)
         return str(path.stat().st_size if path.exists() else 0)
 
+    def replay(
+        self,
+        stream_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        if self.http_enabled:
+            return self._buffer_replay(stream_id, cursor=cursor, limit=limit)
+        return self._file_replay(stream_id, cursor=cursor, limit=limit)
+
     async def event_stream(
         self,
         workflow_id: str,
@@ -117,6 +128,82 @@ class StreamBroker:
             },
             event_id=event_id,
         )
+
+    def _file_replay(
+        self,
+        workflow_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        path = stream_path(workflow_id)
+        offset = 0
+        if cursor:
+            with suppress(ValueError):
+                offset = max(0, int(cursor))
+        if not path.exists():
+            return {
+                "events": [],
+                "cursor": "0",
+                "replay_available": False,
+                "reason": "stream file unavailable",
+            }
+        if offset > path.stat().st_size:
+            offset = 0
+
+        events: list[dict[str, Any]] = []
+        position = offset
+        with path.open("r", encoding="utf-8") as stream:
+            stream.seek(offset)
+            for line in stream:
+                position = stream.tell()
+                with suppress(json.JSONDecodeError):
+                    events.append(json.loads(line))
+                if len(events) >= limit:
+                    break
+
+        return {
+            "events": events,
+            "cursor": str(position),
+            "replay_available": True,
+            "reason": "",
+        }
+
+    def _buffer_replay(
+        self,
+        workflow_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        entry = self._buffers.get(workflow_id)
+        if entry is None:
+            return {
+                "events": [],
+                "cursor": "",
+                "replay_available": False,
+                "reason": "stream buffer unavailable",
+            }
+
+        events = entry["events"]
+        parsed = self._parse_buffer_event_id(cursor, entry)
+        if cursor and parsed is None:
+            return {
+                "events": [],
+                "cursor": self._buffer_event_id(entry, len(events)),
+                "replay_available": False,
+                "reason": "stream cursor unavailable",
+            }
+
+        start = parsed if parsed is not None else 0
+        start = min(max(0, start), len(events))
+        end = min(len(events), start + limit)
+        return {
+            "events": events[start:end],
+            "cursor": self._buffer_event_id(entry, end),
+            "replay_available": True,
+            "reason": "",
+        }
 
     async def _file_event_stream(
         self,

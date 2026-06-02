@@ -11,11 +11,14 @@ export function Messages({
   olderMessagesError,
   localPending,
   streamTurn,
+  turnTraces,
+  expandedTraceIndex,
   streamPanelCollapsed,
   resolvingApprovals,
   draftSystemPrompt,
   onUpdateDraftSystemPrompt,
   onToggleStreamPanel,
+  onToggleTurnTrace,
   onResolveApproval,
   onLoadOlderMessages,
 }) {
@@ -65,6 +68,9 @@ export function Messages({
             message={item.message}
             index={item.index}
             workflowState={workflowState}
+            turnTrace={turnTraces?.[item.index]}
+            expandedTraceIndex={expandedTraceIndex}
+            onToggleTurnTrace={onToggleTurnTrace}
           />
         )
       ))}
@@ -79,6 +85,36 @@ export function Messages({
         onResolve={onResolveApproval}
       />
     </>
+  );
+}
+
+export function TurnTraceDrawer({ trace, transcriptIndex, open, onClose }) {
+  return (
+    <section
+      className={`turn-trace-drawer-shell${open ? " open" : ""}`}
+      hidden={!open}
+      aria-hidden={!open}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="turn-trace-drawer" role="dialog" aria-modal="true">
+        <div className="turn-trace-drawer-header">
+          <div className="turn-trace-drawer-title">
+            <span>Assistant Run Details</span>
+            {transcriptIndex !== null && transcriptIndex !== undefined ? (
+              <small>Transcript index {transcriptIndex}</small>
+            ) : null}
+          </div>
+          <button type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <div className="turn-trace-drawer-body">
+          <TurnTraceDetails trace={trace} />
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -125,7 +161,14 @@ function ConversationLoading() {
   );
 }
 
-function MessageBubble({ message, index, workflowState }) {
+function MessageBubble({
+  message,
+  index,
+  workflowState,
+  turnTrace,
+  expandedTraceIndex,
+  onToggleTurnTrace,
+}) {
   if (message.role === "user") {
     if (workflowState.active_message_index === index) {
       return <Bubble kind="pending" label="you -> agent" content={`${message.content} (delivered)`} />;
@@ -136,16 +179,54 @@ function MessageBubble({ message, index, workflowState }) {
     return <Bubble kind="user" label="you" content={message.content} />;
   }
   if (message.role === "assistant") {
-    return <Bubble kind="assistant" label="assistant" content={message.content} />;
+    return (
+      <Bubble
+        kind="assistant"
+        label="assistant"
+        content={message.content}
+        trace={turnTrace}
+        traceExpanded={expandedTraceIndex === index}
+        onToggleTrace={() => onToggleTurnTrace(index)}
+      />
+    );
   }
   return <Bubble kind="system" label="system" content={message.content} />;
 }
 
-function Bubble({ kind, label, content }) {
+function Bubble({ kind, label, content, trace, traceExpanded, onToggleTrace }) {
+  const canShowTrace = kind === "assistant" && onToggleTrace;
   return (
-    <div className={`bubble ${kind}`}>
-      <span className="label">{label}</span>
+    <div className={`bubble ${kind}${traceExpanded ? " detail-open" : ""}`}>
+      <div className="bubble-header">
+        <span className="label">{label}</span>
+        {canShowTrace ? (
+          <button
+            type="button"
+            className="bubble-trace-toggle"
+            onClick={onToggleTrace}
+          >
+            {traceExpanded ? "Hide details" : "Details"}
+          </button>
+        ) : null}
+      </div>
       <MarkdownContent content={content} />
+    </div>
+  );
+}
+
+function TurnTraceDetails({ trace }) {
+  if (!trace || trace.status === "loading") {
+    return <div className="turn-trace-status">Loading turn details...</div>;
+  }
+  if (trace.status === "error") {
+    return <div className="turn-trace-status error">{trace.error}</div>;
+  }
+  if (!trace.turn) {
+    return <div className="turn-trace-status">No turn details available.</div>;
+  }
+  return (
+    <div className="turn-trace-panel">
+      <StreamPanel turn={trace.turn} collapsed={false} embedded />
     </div>
   );
 }

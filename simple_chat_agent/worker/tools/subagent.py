@@ -297,12 +297,21 @@ def _assistant_text(message: dict[str, Any]) -> str:
     text_parts: list[str] = []
     for block in content:
         block_dict = _block_dict(block)
-        if block_dict.get("type") == "text":
-            text = block_dict.get("text")
-            if isinstance(text, str):
-                text_parts.append(text)
+        text = _block_text(block_dict)
+        if text:
+            text_parts.append(text)
 
     return "\n".join(text_parts)
+
+
+def _block_text(block: dict[str, Any]) -> str:
+    if block.get("type") == "text":
+        text = block.get("text")
+        return text if isinstance(text, str) else ""
+    if block.get("type") == "refusal":
+        refusal = block.get("refusal")
+        return refusal if isinstance(refusal, str) else ""
+    return ""
 
 
 def _block_dict(block: Any) -> dict[str, Any]:
