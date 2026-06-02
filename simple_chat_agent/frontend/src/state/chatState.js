@@ -1,11 +1,15 @@
 export function updateWorkflowStateInState(previous, nextWorkflowState) {
   const normalized = normalizeWorkflowState(nextWorkflowState, previous.workflowState);
-  const previousAssistantCount = previous.workflowState
-    ? previous.workflowState.transcript.filter((message) => message.role === "assistant").length
-    : 0;
-  const nextAssistantCount = normalized.transcript.filter(
-    (message) => message.role === "assistant",
-  ).length;
+  const previousAssistantIndexes = assistantTranscriptIndexes(previous.workflowState);
+  const nextAssistantIndexes = assistantTranscriptIndexes(normalized);
+  const previousAssistantIndexSet = new Set(previousAssistantIndexes);
+  const newAssistantIndex = previous.workflowState
+    ? nextAssistantIndexes.find((index) => !previousAssistantIndexSet.has(index))
+    : undefined;
+  const initialCompletedStreamAssistantIndex =
+    !previous.workflowState && previous.streamTurn
+      ? nextAssistantIndexes[nextAssistantIndexes.length - 1]
+      : undefined;
   const resolvingApprovals = new Set(previous.resolvingApprovals);
   const pendingApprovalIds = new Set(
     (normalized.pending_approvals || []).map((approval) => approval.approval_id),
@@ -30,8 +34,14 @@ export function updateWorkflowStateInState(previous, nextWorkflowState) {
     resolvingApprovals,
     statusNotice: "",
   };
-  if (nextAssistantCount > previousAssistantCount) next = markStreamCommittedInState(next);
-  if (!hasLiveWorkflowActivity(next, normalized)) next = markStreamCommittedInState(next);
+  if (newAssistantIndex !== undefined) {
+    next = markStreamCommittedInState(next, { assistantIndex: newAssistantIndex });
+  }
+  if (!hasLiveWorkflowActivity(next, normalized)) {
+    next = markStreamCommittedInState(next, {
+      assistantIndex: initialCompletedStreamAssistantIndex,
+    });
+  }
   return next;
 }
 
@@ -133,6 +143,63 @@ export function visibleMessageItems(transcript, localPending, transcriptOffset =
     }
   }
   return items;
+}
+
+export function toggleExpandedTraceInState(previous, transcriptIndex) {
+  const normalizedIndex = Number(transcriptIndex);
+  if (!Number.isFinite(normalizedIndex)) return previous;
+  return {
+    ...previous,
+    expandedTraceIndex:
+      previous.expandedTraceIndex === normalizedIndex ? null : normalizedIndex,
+  };
+}
+
+export function setTurnTraceLoadingInState(previous, transcriptIndex) {
+  const normalizedIndex = Number(transcriptIndex);
+  if (!Number.isFinite(normalizedIndex)) return previous;
+  return {
+    ...previous,
+    turnTraces: {
+      ...(previous.turnTraces || {}),
+      [normalizedIndex]: {
+        ...(previous.turnTraces?.[normalizedIndex] || {}),
+        status: "loading",
+        error: "",
+      },
+    },
+  };
+}
+
+export function setTurnTraceErrorInState(previous, transcriptIndex, error) {
+  const normalizedIndex = Number(transcriptIndex);
+  if (!Number.isFinite(normalizedIndex)) return previous;
+  return {
+    ...previous,
+    turnTraces: {
+      ...(previous.turnTraces || {}),
+      [normalizedIndex]: {
+        ...(previous.turnTraces?.[normalizedIndex] || {}),
+        status: "error",
+        error: String(error),
+      },
+    },
+  };
+}
+
+export function mergeReplayedTurnTracesInState(previous, events) {
+  const replayed = turnTracesFromStreamEvents(
+    events || [],
+    previous.workflowState,
+  );
+  if (!Object.keys(replayed).length) return previous;
+  return {
+    ...previous,
+    turnTraces: {
+      ...(previous.turnTraces || {}),
+      ...replayed,
+    },
+  };
 }
 
 export function prependTranscriptPageInState(previous, page) {
@@ -267,6 +334,17 @@ function workflowTranscriptEnd(workflowState) {
   const total = Number(workflowState.transcript_total ?? workflowState.transcript_length);
   if (Number.isFinite(total)) return total;
   return Number(workflowState.transcript_offset || 0) + (workflowState.transcript || []).length;
+}
+
+function assistantTranscriptIndexes(workflowState) {
+  if (!workflowState) return [];
+  const transcript = workflowState.transcript || [];
+  const offset = Number(workflowState.transcript_offset || 0);
+  const indexes = [];
+  transcript.forEach((message, index) => {
+    if (message?.role === "assistant") indexes.push(offset + index);
+  });
+  return indexes;
 }
 
 function pendingTranscriptIndex(pending, transcriptLength) {
@@ -589,6 +667,7 @@ function finishAgentSegment(segment, payload) {
   segment.thinking = String(segment.thinking || "").trim();
   segment.status = "complete";
   segment.stopReason = payload.stop_reason || "unknown";
+  segment.stopDetails = payload.stop_details || null;
   segment.usage = payload.usage || null;
   segment.completedAt = new Date().toISOString();
 }
@@ -741,13 +820,133 @@ function streamToolInputKey(event) {
   );
 }
 
-function markStreamCommittedInState(state) {
+function markStreamCommittedInState(state, options = {}) {
+  const trace = turnTraceFromStreamTurn(
+    state.streamTurn,
+    state.workflowState,
+    options.assistantIndex,
+  );
+  const turnTraces = trace
+    ? {
+        ...(state.turnTraces || {}),
+        [trace.transcriptIndex]: trace,
+      }
+    : state.turnTraces;
   return {
     ...state,
+    turnTraces,
     streamTurn: null,
     currentClaudeSequence: null,
     ignoreClaudeUntilStart: false,
   };
+}
+
+function turnTraceFromStreamTurn(turn, workflowState, assistantIndex) {
+  if (!turn || assistantIndex === undefined || assistantIndex === null) return null;
+  const normalizedIndex = Number(assistantIndex);
+  if (!Number.isFinite(normalizedIndex)) return null;
+  const traceTurn = cloneStreamTurn(turn);
+  if (!traceTurn || !(traceTurn.segments || []).length) return null;
+  return {
+    status: "ready",
+    source: "live",
+    transcriptIndex: normalizedIndex,
+    capturedAt: new Date().toISOString(),
+    turn: trimTraceTurn(traceTurn),
+  };
+}
+
+function turnTracesFromStreamEvents(events, workflowState) {
+  const assistantIndexes = assistantTranscriptIndexes(workflowState);
+  if (!assistantIndexes.length || !Array.isArray(events) || !events.length) {
+    return {};
+  }
+
+  let replayState = {
+    workflowState: workflowState || {
+      transcript: [],
+      transcript_offset: 0,
+      transcript_total: 0,
+      pending_approvals: [],
+      queued_message_indices: [],
+      artifacts: [],
+    },
+    workflowStateProjectionRevision: 0,
+    workflowTranscriptProjectionRevision: 0,
+    localPending: [],
+    resolvingApprovals: new Set(),
+    streamTurn: null,
+    currentClaudeSequence: null,
+    ignoreClaudeUntilStart: false,
+    turnTraces: {},
+  };
+  const completedTurns = [];
+
+  for (const event of events) {
+    replayState = handleStreamEventInState(replayState, event);
+    if (
+      event.kind === "claude_complete" &&
+      isTerminalClaudeStop(event.payload || {}) &&
+      replayState.streamTurn
+    ) {
+      completedTurns.push(trimTraceTurn(cloneStreamTurn(replayState.streamTurn)));
+      replayState = {
+        ...replayState,
+        streamTurn: null,
+        currentClaudeSequence: null,
+        ignoreClaudeUntilStart: false,
+      };
+    }
+  }
+
+  const traces = {};
+  const start = Math.max(0, completedTurns.length - assistantIndexes.length);
+  const visibleTurns = completedTurns.slice(start);
+  visibleTurns.forEach((turn, index) => {
+    const transcriptIndex = assistantIndexes[index];
+    if (transcriptIndex === undefined || !turn) return;
+    traces[transcriptIndex] = {
+      status: "ready",
+      source: "replay",
+      transcriptIndex,
+      capturedAt: new Date().toISOString(),
+      turn,
+    };
+  });
+  return traces;
+}
+
+function trimTraceTurn(turn) {
+  if (!turn) return null;
+  return {
+    ...turn,
+    segments: (turn.segments || []).map((segment) => {
+      const next = { ...segment };
+      if (typeof next.text === "string" && next.text.length > 120_000) {
+        next.text = next.text.slice(-120_000);
+      }
+      if (typeof next.thinking === "string" && next.thinking.length > 120_000) {
+        next.thinking = next.thinking.slice(-120_000);
+      }
+      if (Array.isArray(next.events)) {
+        next.events = next.events.slice(-12).map(trimTraceEvent);
+      }
+      return next;
+    }),
+  };
+}
+
+function trimTraceEvent(event) {
+  const next = {
+    ...event,
+    payload: { ...(event.payload || {}) },
+  };
+  for (const key of ["text", "input_partial", "partial_json"]) {
+    if (typeof next.payload[key] === "string" && next.payload[key].length > 80_000) {
+      next.payload[key] = next.payload[key].slice(-80_000);
+    }
+  }
+  return next;
 }
 
 function transcriptMessageForPending(pending) {

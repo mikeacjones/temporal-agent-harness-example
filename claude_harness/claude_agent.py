@@ -50,6 +50,11 @@ CLAUDE_HEARTBEAT_INTERVAL_SECONDS = 5
 FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 DEFAULT_THINKING_BUDGET_TOKENS = 4_096
 MIN_THINKING_BUDGET_TOKENS = 1_024
+PROVIDER_REFUSAL_FALLBACK = (
+    "Claude refused this turn. Anthropic did not return a provider-generated "
+    "refusal message, so the app stopped this agent run instead of retrying "
+    "the same request."
+)
 
 
 @dataclass(frozen=True)
@@ -201,6 +206,7 @@ class ClaudeAgent:
                 await self._flush_interrupt_context()
                 continue
 
+            response = _response_with_visible_refusal(response)
             response_message = cast(MessageParam, response.message)
             tool_use_blocks = _tool_use_blocks(response_message)
             await self._context.record_assistant_message(response_message)
@@ -215,6 +221,7 @@ class ClaudeAgent:
                     turns=turn,
                     guard_action=response.guard_action,
                     guard_reason=response.guard_reason,
+                    stop_details=response.stop_details,
                 )
 
             if not tool_use_blocks:
@@ -228,6 +235,7 @@ class ClaudeAgent:
                     turns=turn,
                     guard_action=response.guard_action,
                     guard_reason=response.guard_reason,
+                    stop_details=response.stop_details,
                 )
 
             tool_execution = await self._execute_requested_tools(tool_use_blocks)
@@ -250,6 +258,7 @@ class ClaudeAgent:
                     ),
                     guard_action=response.guard_action,
                     guard_reason=response.guard_reason,
+                    stop_details=response.stop_details,
                 )
 
         return ClaudeAgentResult(
@@ -583,6 +592,7 @@ class ClaudeAgentResult:
     guard_action: str | None = None
     guard_reason: str | None = None
     effective_user_prompt: str | None = None
+    stop_details: dict[str, Any] | None = None
 
     @property
     def needs_continue_as_new(self) -> bool:
@@ -616,6 +626,7 @@ class ClaudeResponse:
     usage: dict[str, Any]
     guard_action: str | None = None
     guard_reason: str | None = None
+    stop_details: dict[str, Any] | None = None
 
 
 @dataclass
@@ -665,6 +676,7 @@ def _claude_response_to_dict(response: ClaudeResponse) -> dict[str, Any]:
         "usage": _copy_mapping(response.usage),
         "guard_action": response.guard_action,
         "guard_reason": response.guard_reason,
+        "stop_details": _copy_optional_mapping(response.stop_details),
     }
 
 
@@ -678,6 +690,7 @@ def _claude_response_from_dict(response: dict[str, Any]) -> ClaudeResponse:
         usage=_copy_mapping(response.get("usage", {})),
         guard_action=cast(str | None, response.get("guard_action")),
         guard_reason=cast(str | None, response.get("guard_reason")),
+        stop_details=_copy_optional_mapping(response.get("stop_details")),
     )
 
 
@@ -744,6 +757,7 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
         stop_reason=response.stop_reason,
         stop_sequence=response.stop_sequence,
         usage=response.usage.to_dict(),
+        stop_details=_optional_object_to_dict(getattr(response, "stop_details", None)),
     )
 
 
@@ -825,7 +839,16 @@ async def _stream_claude_message(
             "model": response.model,
             "sequence": stream_sequence,
             "stop_reason": response.stop_reason,
-            "text": _text_from_content_blocks(response.content),
+            "stop_details": _optional_object_to_dict(
+                getattr(response, "stop_details", None)
+            ),
+            "text": _response_display_text(
+                response.stop_reason,
+                response.content,
+                stop_details=_optional_object_to_dict(
+                    getattr(response, "stop_details", None)
+                ),
+            ),
             "usage": response.usage.to_dict(),
         },
         kind="claude_complete",
@@ -927,6 +950,15 @@ async def _emit_claude_raw_stream_event(
                 )
             return
 
+        if delta_type == "refusal_delta":
+            text = delta.get("refusal")
+            if isinstance(text, str) and text:
+                await stream.emit(
+                    {"sequence": stream_sequence, "text": text},
+                    kind="claude_text_delta",
+                )
+            return
+
         if delta_type == "thinking_delta":
             thinking = delta.get("thinking")
             if isinstance(thinking, str) and thinking:
@@ -1001,11 +1033,7 @@ def _message_text(message: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
+        return "".join(_text_from_block_dict(block) for block in content)
     return ""
 
 
@@ -1092,15 +1120,86 @@ def _object_to_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _optional_object_to_dict(value: Any) -> dict[str, Any] | None:
+    result = _object_to_dict(value)
+    return result or None
+
+
+def _response_with_visible_refusal(response: ClaudeResponse) -> ClaudeResponse:
+    if not _needs_refusal_fallback(response):
+        return response
+
+    return replace(
+        response,
+        message={
+            "role": response.message.get("role", "assistant"),
+            "content": _refusal_fallback_text(response.stop_details),
+        },
+    )
+
+
+def _needs_refusal_fallback(response: ClaudeResponse) -> bool:
+    if response.stop_reason != "refusal":
+        return False
+    if response.guard_action is not None:
+        return False
+    return not _message_text(response.message).strip()
+
+
+def _response_display_text(
+    stop_reason: ClaudeStopReason | None,
+    content: Any,
+    *,
+    stop_details: dict[str, Any] | None,
+) -> str:
+    text = _text_from_content_blocks(content).strip()
+    if text:
+        return text
+    if stop_reason == "refusal":
+        return _refusal_fallback_text(stop_details)
+    return ""
+
+
+def _refusal_fallback_text(stop_details: dict[str, Any] | None = None) -> str:
+    details = _refusal_details_text(stop_details)
+    if not details:
+        return PROVIDER_REFUSAL_FALLBACK
+    return f"{PROVIDER_REFUSAL_FALLBACK}\n\n{details}"
+
+
+def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
+    if not stop_details:
+        return ""
+    parts: list[str] = []
+    category = stop_details.get("category")
+    if isinstance(category, str) and category:
+        parts.append(f"Refusal category: {category}.")
+    explanation = stop_details.get("explanation")
+    if isinstance(explanation, str) and explanation:
+        parts.append(explanation)
+    return " ".join(parts)
+
+
 def _text_from_content_blocks(content: Any) -> str:
     text_parts: list[str] = []
     for block in content:
         block_dict = _block_to_dict(block)
-        if block_dict.get("type") == "text":
-            text = block_dict.get("text")
-            if isinstance(text, str):
-                text_parts.append(text)
+        text = _text_from_block_dict(block_dict)
+        if text:
+            text_parts.append(text)
     return "\n".join(text_parts)
+
+
+def _text_from_block_dict(block: Any) -> str:
+    if not isinstance(block, dict):
+        return ""
+    if block.get("type") == "text":
+        text = block.get("text")
+        return text if isinstance(text, str) else ""
+    if block.get("type") == "refusal":
+        refusal = block.get("refusal")
+        return refusal if isinstance(refusal, str) else ""
+    return ""
 
 
 def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:

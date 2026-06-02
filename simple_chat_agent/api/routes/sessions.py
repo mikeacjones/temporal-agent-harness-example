@@ -460,6 +460,20 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             },
         )
 
+    @router.get("/api/sessions/{workflow_id}/stream/events")
+    async def stream_events(
+        workflow_id: str,
+        request: Request,
+        cursor: str | None = Query(None),
+        limit: int = Query(1000, ge=1, le=5000),
+    ) -> dict[str, Any]:
+        await deps.require_conversation_owner(request, workflow_id)
+        return deps.stream_broker().replay(
+            workflow_id,
+            cursor=cursor,
+            limit=limit,
+        )
+
     @router.delete("/api/sessions/{workflow_id}")
     async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
         user = await deps.require_conversation_owner(request, workflow_id)

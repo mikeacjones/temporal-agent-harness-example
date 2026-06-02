@@ -40,6 +40,7 @@ def thinking_config_from_request(
             enabled=True,
             mode="adaptive",
             effort=request.effort,
+            display="summarized",
         )
     if max_tokens <= MIN_THINKING_BUDGET_TOKENS:
         raise HTTPException(
@@ -54,6 +55,7 @@ def thinking_config_from_request(
         enabled=True,
         mode="enabled",
         budget_tokens=budget_tokens,
+        display="summarized",
     )
 
 
