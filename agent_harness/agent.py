@@ -130,6 +130,10 @@ class Agent:
         self._pending_interrupts.append(message)
         self._interrupt_requested = True
 
+    @property
+    def interrupt_requested(self) -> bool:
+        return self._interrupt_requested
+
     async def run(
         self,
         user_prompt: str | None = None,
@@ -449,7 +453,13 @@ class Agent:
             and workflow.info().is_continue_as_new_suggested()
         )
 
-    async def _execute_tool(self, tool_name: str, **kwargs: Any) -> ToolResult:
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         if self._tool_names is not None and tool_name not in self._tool_names:
             return ToolResult(
                 payload={"error": f"Tool is not available to this agent: {tool_name}"},
@@ -459,6 +469,7 @@ class Agent:
             tool_name,
             kwargs,
             stream_id=self._stream_id,
+            tool_call_id=tool_call_id,
             activity_options=self._activity_options,
         )
 
@@ -512,7 +523,11 @@ class Agent:
         tool_use_id = cast(str, block["id"])
 
         try:
-            result = await self._execute_tool(tool_name, **tool_input)
+            result = await self._execute_tool(
+                tool_name,
+                tool_call_id=tool_use_id,
+                **tool_input,
+            )
         except Exception as err:
             result = ToolResult(
                 payload={"error": str(err), "type": type(err).__name__},

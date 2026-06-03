@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any
 
 from agent_harness.mcp import HttpMcpProvider
 from agent_harness.mcp_types import HttpMcpServerConfig
 from agent_harness.tools import ToolResult, ToolSet
 
-from .approval import MutatingToolApprovalProvider
+from .approval import ApprovalDecision, MutatingToolApprovalProvider
 from .attachments import AttachmentProvider, READ_ATTACHMENT_TOOL
 from .artifacts import ArtifactProvider, CREATE_ARTIFACT_TOOL
 from .fetch_url import fetch_url
@@ -20,7 +20,6 @@ from .research import (
 )
 from .subagent import CREATE_SUBAGENT_TOOL, SubagentProvider
 
-ApprovalDecision = Literal["allow", "always_allow", "deny"]
 ApprovalRequest = Callable[[str, dict[str, Any]], Awaitable[ApprovalDecision]]
 
 FETCH_URL_TOOL = "fetch_url"

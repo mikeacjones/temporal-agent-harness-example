@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from typing import Any, cast
 
@@ -18,6 +20,7 @@ with workflow.unsafe.imports_passed_through():
         ApprovalDecision,
         ChildToolApprovalRequest,
         MutatingToolApprovalProvider,
+        TOOL_APPROVAL_TIMEOUT,
     )
     from simple_chat_agent.worker.tools.artifacts import ArtifactProvider
     from simple_chat_agent.worker.tools.fetch_url import fetch_url
@@ -160,7 +163,7 @@ class SubagentWorkflow:
         approval_id: str,
         decision: str,
     ) -> None:
-        if decision in ("allow", "always_allow", "deny"):
+        if decision in ("allow", "always_allow", "deny", "expired", "cancelled"):
             self._approval_decisions[approval_id] = cast(ApprovalDecision, decision)
 
     @workflow.run
@@ -223,9 +226,20 @@ class SubagentWorkflow:
                 tool_args=dict(tool_args),
             ),
         )
-        await workflow.wait_condition(
-            lambda: approval_id in self._approval_decisions
-        )
+        try:
+            await workflow.wait_condition(
+                lambda: approval_id in self._approval_decisions,
+                timeout=TOOL_APPROVAL_TIMEOUT,
+                timeout_summary=f"delegated-approval:{approval_id}",
+            )
+        except asyncio.TimeoutError:
+            with suppress(Exception):
+                await parent.signal(
+                    "expire_child_approval",
+                    workflow.info().workflow_id,
+                    approval_id,
+                )
+            return "expired"
         return self._approval_decisions.pop(approval_id)
 
 

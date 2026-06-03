@@ -338,8 +338,17 @@ async def _query_state(workflow_id: str) -> SimpleChatState:
     return await _handle(workflow_id).query(SimpleChatWorkflow.state)
 
 
-async def _query_snapshot(workflow_id: str, *, limit: int) -> SimpleChatSnapshot:
-    return await _handle(workflow_id).query(SimpleChatWorkflow.snapshot, limit)
+async def _query_snapshot(
+    workflow_id: str,
+    *,
+    limit: int,
+    max_bytes: int,
+) -> SimpleChatSnapshot:
+    return await _handle(workflow_id).query(
+        SimpleChatWorkflow.snapshot,
+        limit,
+        max_bytes,
+    )
 
 
 async def _query_transcript_page(
@@ -347,11 +356,13 @@ async def _query_transcript_page(
     *,
     before: int | None,
     limit: int,
+    max_bytes: int,
 ) -> TranscriptPage:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_page,
         before,
         limit,
+        max_bytes,
     )
 
 
@@ -359,10 +370,12 @@ async def _query_transcript_deltas_since(
     workflow_id: str,
     *,
     after_revision: int,
+    max_bytes: int,
 ) -> TranscriptDeltaResult:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_deltas_since,
         after_revision,
+        max_bytes,
     )
 
 

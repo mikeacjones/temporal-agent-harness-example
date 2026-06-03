@@ -37,7 +37,9 @@ LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
         "or sys.stderr.write(); that output streams back to the user while the "
         "code is still running. Runtime, output, permissions, and retries are "
         "bounded by the sandbox. The sandbox ceases to exist when the tool finishes, "
-        "as well as any files written to disk. Treat this as purely ephemeral."
+        "as well as any files written to disk. Treat this as purely ephemeral. "
+        "External side effects performed by user code are not made idempotent by "
+        "the harness."
     ),
     tool_type=ToolType.MUTATING,
     pre_guards=["mutating_tool_approval"],

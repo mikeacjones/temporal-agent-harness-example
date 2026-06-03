@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -30,6 +31,7 @@ with workflow.unsafe.imports_passed_through():
     from simple_chat_agent.worker.tools.approval import (
         ApprovalDecision,
         ChildToolApprovalRequest,
+        TOOL_APPROVAL_TIMEOUT,
     )
     from simple_chat_agent.worker.good_place_guards import (
         good_place_post_guard,
@@ -40,6 +42,14 @@ with workflow.unsafe.imports_passed_through():
 ChatRole = Literal["user", "assistant", "system"]
 DEFAULT_MAX_TOKENS = 32_000
 TRANSCRIPT_DELTA_BUFFER_LIMIT = 80
+TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES = 512_000
+TRANSCRIPT_QUERY_MIN_MAX_BYTES = 16_384
+TRANSCRIPT_QUERY_HARD_MAX_BYTES = 1_000_000
+TRANSCRIPT_QUERY_BASE_OVERHEAD_BYTES = 2_048
+TRANSCRIPT_QUERY_MESSAGE_OVERHEAD_BYTES = 512
+TRANSCRIPT_TRUNCATION_NOTICE = (
+    "\n\n[Transcript message truncated to keep the workflow query response bounded.]"
+)
 CHAT_WORKFLOW_RUN_TTL = timedelta(days=15)
 
 
@@ -68,6 +78,9 @@ class TranscriptDeltaResult:
     pending_messages: int = 0
     active_message_index: int | None = None
     state_revision: int = 0
+    limited: bool = False
+    byte_limit: int = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
+    estimated_bytes: int = 0
 
 
 @dataclass
@@ -84,6 +97,7 @@ class PendingApproval:
     tool_args: dict
     summary: str
     memory_key: str
+    expires_at: str | None = None
     requesting_workflow_id: str | None = None
     requesting_approval_id: str | None = None
 
@@ -142,6 +156,9 @@ class TranscriptPage:
     end: int
     total: int
     transcript_revision: int
+    limited: bool = False
+    byte_limit: int = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
+    estimated_bytes: int = 0
 
 
 @dataclass
@@ -196,6 +213,7 @@ class SimpleChatWorkflow:
     @workflow.signal
     async def delete(self) -> None:
         self._delete_requested = True
+        self._record_state_change()
 
     @workflow.signal
     async def steer(
@@ -303,6 +321,21 @@ class SimpleChatWorkflow:
         self._approval_decisions[approval_id] = cast(ApprovalDecision, decision)
 
     @workflow.signal
+    async def expire_child_approval(
+        self,
+        child_workflow_id: str,
+        child_approval_id: str,
+    ) -> None:
+        for approval_id, approval in list(self._pending_approvals.items()):
+            if (
+                approval.requesting_workflow_id == child_workflow_id
+                and approval.requesting_approval_id == child_approval_id
+            ):
+                self._pending_approvals.pop(approval_id, None)
+                self._record_state_change()
+                return
+
+    @workflow.signal
     async def request_child_approval(
         self,
         request: ChildToolApprovalRequest,
@@ -332,6 +365,7 @@ class SimpleChatWorkflow:
             tool_args=dict(request.tool_args),
             summary=f"Subagent requested: {summary}",
             memory_key=memory_key,
+            expires_at=_approval_expires_at(),
             requesting_workflow_id=request.child_workflow_id,
             requesting_approval_id=request.child_approval_id,
         )
@@ -339,13 +373,21 @@ class SimpleChatWorkflow:
 
     @workflow.query
     def state(self) -> SimpleChatState:
-        return self._state(include_transcript=True)
+        return self._state(include_transcript=False)
 
     @workflow.query
-    def snapshot(self, limit: int = 60) -> SimpleChatSnapshot:
+    def snapshot(
+        self,
+        limit: int = 60,
+        max_bytes: int = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+    ) -> SimpleChatSnapshot:
         return SimpleChatSnapshot(
             state=self._state(include_transcript=False),
-            transcript_page=self._transcript_page(before=None, limit=limit),
+            transcript_page=self._transcript_page(
+                before=None,
+                limit=limit,
+                max_bytes=max_bytes,
+            ),
         )
 
     @workflow.query
@@ -353,17 +395,28 @@ class SimpleChatWorkflow:
         self,
         before: int | None = None,
         limit: int = 60,
+        max_bytes: int = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
     ) -> TranscriptPage:
-        return self._transcript_page(before=before, limit=limit)
+        return self._transcript_page(
+            before=before,
+            limit=limit,
+            max_bytes=max_bytes,
+        )
 
     @workflow.query
-    def transcript_deltas_since(self, after_revision: int = 0) -> TranscriptDeltaResult:
+    def transcript_deltas_since(
+        self,
+        after_revision: int = 0,
+        max_bytes: int = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+    ) -> TranscriptDeltaResult:
         after_revision = max(0, int(after_revision or 0))
+        byte_limit = _transcript_byte_limit(max_bytes)
         if after_revision >= self._transcript_revision:
             return self._transcript_delta_result(
                 after_revision=after_revision,
                 deltas=[],
                 needs_snapshot=False,
+                byte_limit=byte_limit,
             )
 
         if not self._transcript_deltas:
@@ -371,6 +424,7 @@ class SimpleChatWorkflow:
                 after_revision=after_revision,
                 deltas=[],
                 needs_snapshot=True,
+                byte_limit=byte_limit,
             )
 
         oldest_revision = self._transcript_deltas[0].revision
@@ -379,16 +433,30 @@ class SimpleChatWorkflow:
                 after_revision=after_revision,
                 deltas=[],
                 needs_snapshot=True,
+                byte_limit=byte_limit,
+            )
+
+        deltas = [
+            delta
+            for delta in self._transcript_deltas
+            if delta.revision > after_revision
+        ]
+        delta_bytes = _transcript_deltas_query_bytes(deltas)
+        if delta_bytes > byte_limit:
+            return self._transcript_delta_result(
+                after_revision=after_revision,
+                deltas=[],
+                needs_snapshot=True,
+                byte_limit=byte_limit,
+                limited=True,
+                estimated_bytes=byte_limit,
             )
 
         return self._transcript_delta_result(
             after_revision=after_revision,
-            deltas=[
-                delta
-                for delta in self._transcript_deltas
-                if delta.revision > after_revision
-            ],
+            deltas=deltas,
             needs_snapshot=False,
+            byte_limit=byte_limit,
         )
 
     def _state(self, *, include_transcript: bool) -> SimpleChatState:
@@ -414,27 +482,53 @@ class SimpleChatWorkflow:
             transcript_revision=self._transcript_revision,
         )
 
-    @workflow.query
-    def transcript(self) -> list[ChatMessage]:
-        return self._rendered_transcript()
-
     def _transcript_page(
         self,
         *,
         before: int | None,
         limit: int,
+        max_bytes: int,
     ) -> TranscriptPage:
         transcript = self._rendered_transcript()
         total = len(transcript)
         page_limit = max(1, min(int(limit or 60), 200))
+        byte_limit = _transcript_byte_limit(max_bytes)
         end = total if before is None else max(0, min(int(before), total))
-        start = max(0, end - page_limit)
+        lower_bound = max(0, end - page_limit)
+        messages: list[ChatMessage] = []
+        estimated_bytes = TRANSCRIPT_QUERY_BASE_OVERHEAD_BYTES
+        limited = False
+        start = end
+        for index in range(end - 1, lower_bound - 1, -1):
+            message = transcript[index]
+            message_bytes = _chat_message_query_bytes(message)
+            if estimated_bytes + message_bytes <= byte_limit:
+                messages.insert(0, message)
+                estimated_bytes += message_bytes
+                start = index
+                continue
+            limited = True
+            if not messages:
+                available = max(
+                    0,
+                    byte_limit
+                    - estimated_bytes
+                    - TRANSCRIPT_QUERY_MESSAGE_OVERHEAD_BYTES,
+                )
+                truncated = _truncate_chat_message_for_query(message, available)
+                messages.insert(0, truncated)
+                estimated_bytes += _chat_message_query_bytes(truncated)
+                start = index
+            break
         return TranscriptPage(
-            messages=list(transcript[start:end]),
+            messages=messages,
             start=start,
             end=end,
             total=total,
             transcript_revision=self._transcript_revision,
+            limited=limited,
+            byte_limit=byte_limit,
+            estimated_bytes=min(estimated_bytes, byte_limit),
         )
 
     def _transcript_delta_result(
@@ -443,7 +537,12 @@ class SimpleChatWorkflow:
         after_revision: int,
         deltas: list[TranscriptDelta],
         needs_snapshot: bool,
+        byte_limit: int,
+        limited: bool = False,
+        estimated_bytes: int | None = None,
     ) -> TranscriptDeltaResult:
+        if estimated_bytes is None:
+            estimated_bytes = _transcript_deltas_query_bytes(deltas)
         return TranscriptDeltaResult(
             from_revision=after_revision,
             to_revision=self._transcript_revision,
@@ -454,6 +553,9 @@ class SimpleChatWorkflow:
             pending_messages=len(self._pending_messages),
             active_message_index=self._active_message_index,
             state_revision=self._state_revision,
+            limited=limited,
+            byte_limit=byte_limit,
+            estimated_bytes=min(estimated_bytes, byte_limit),
         )
 
     @workflow.run
@@ -699,13 +801,24 @@ class SimpleChatWorkflow:
             tool_args=dict(tool_args),
             summary=_approval_summary(tool_name, tool_args),
             memory_key=memory_key,
+            expires_at=_approval_expires_at(),
         )
         self._record_state_change()
 
-        await workflow.wait_condition(
-            lambda: approval_id in self._approval_decisions
-        )
-        decision = self._approval_decisions.pop(approval_id)
+        try:
+            await workflow.wait_condition(
+                lambda: approval_id in self._approval_decisions
+                or self._approval_wait_cancelled(),
+                timeout=TOOL_APPROVAL_TIMEOUT,
+                timeout_summary=f"approval:{approval_id}",
+            )
+        except asyncio.TimeoutError:
+            decision: ApprovalDecision = "expired"
+        else:
+            if approval_id in self._approval_decisions:
+                decision = self._approval_decisions.pop(approval_id)
+            else:
+                decision = "cancelled"
         self._pending_approvals.pop(approval_id, None)
         self._record_state_change()
 
@@ -713,6 +826,11 @@ class SimpleChatWorkflow:
             self._approval_memory.add(memory_key)
 
         return decision
+
+    def _approval_wait_cancelled(self) -> bool:
+        return self._delete_requested or (
+            self._agent is not None and self._agent.interrupt_requested
+        )
 
     async def _signal_child_approval(
         self,
@@ -905,6 +1023,75 @@ def _chat_message_for_queue(message: QueuedChatMessage) -> ChatMessage:
     )
 
 
+def _transcript_byte_limit(max_bytes: int) -> int:
+    try:
+        requested = int(max_bytes)
+    except (TypeError, ValueError):
+        requested = TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
+    return max(
+        TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+        min(requested, TRANSCRIPT_QUERY_HARD_MAX_BYTES),
+    )
+
+
+def _transcript_deltas_query_bytes(deltas: list[TranscriptDelta]) -> int:
+    total = TRANSCRIPT_QUERY_BASE_OVERHEAD_BYTES
+    for delta in deltas:
+        total += TRANSCRIPT_QUERY_MESSAGE_OVERHEAD_BYTES
+        total += _text_bytes(str(delta.revision))
+        total += _text_bytes(str(delta.index))
+        total += _chat_message_query_bytes(delta.message)
+    return total
+
+
+def _chat_message_query_bytes(message: ChatMessage) -> int:
+    total = TRANSCRIPT_QUERY_MESSAGE_OVERHEAD_BYTES
+    total += _text_bytes(message.role)
+    total += _text_bytes(message.content)
+    for attachment in message.attachments:
+        total += TRANSCRIPT_QUERY_MESSAGE_OVERHEAD_BYTES
+        total += _text_bytes(attachment.attachment_id)
+        total += _text_bytes(attachment.name)
+        total += _text_bytes(attachment.mime_type)
+        total += _text_bytes(str(attachment.size_bytes))
+        total += _text_bytes(attachment.content_kind)
+        total += _text_bytes(attachment.source)
+        total += _text_bytes(attachment.text_preview)
+        total += _text_bytes(str(attachment.text_chars or ""))
+        total += _text_bytes(attachment.expires_at)
+        for key, value in attachment.metadata.items():
+            total += _text_bytes(str(key))
+            total += _text_bytes(str(value))
+    return total
+
+
+def _truncate_chat_message_for_query(
+    message: ChatMessage,
+    available_content_bytes: int,
+) -> ChatMessage:
+    notice_bytes = _text_bytes(TRANSCRIPT_TRUNCATION_NOTICE)
+    content_budget = max(0, available_content_bytes - notice_bytes)
+    return ChatMessage(
+        role=message.role,
+        content=_truncate_text_bytes(message.content, content_budget)
+        + TRANSCRIPT_TRUNCATION_NOTICE,
+        attachments=list(message.attachments),
+    )
+
+
+def _truncate_text_bytes(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    if _text_bytes(text) <= max_bytes:
+        return text
+    encoded = text.encode("utf-8")[:max_bytes]
+    return encoded.decode("utf-8", errors="ignore")
+
+
+def _text_bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
 def _assistant_text(message: dict[str, Any]) -> str:
     content = message["content"]
     if isinstance(content, str):
@@ -978,3 +1165,7 @@ def _approval_summary(tool_name: str, tool_args: dict[str, Any]) -> str:
             return f"Create artifact: {name.strip()}"
         return "Create artifact"
     return f"Run mutating tool: {tool_name}"
+
+
+def _approval_expires_at() -> str:
+    return (workflow.now() + TOOL_APPROVAL_TIMEOUT).isoformat()

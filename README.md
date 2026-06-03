@@ -127,6 +127,38 @@ await ctx.activity(_update_customer, step="update")
 
 This keeps the activity type generic while making Temporal history useful to humans.
 
+## Tool Idempotency
+
+Temporal Activities may be retried when a worker crashes, a network write fails,
+or a completion is lost. The harness can give a tool a stable
+`ctx.idempotency_key(...)` derived from the provider's durable tool-call id, but
+the tool author owns how that key is enforced. Mutating tools should pass the key
+to the system they mutate, use it as an upsert key in application storage, or
+disable retries when the side effect cannot be made safe.
+
+```python
+@tool(
+    name="export_report",
+    description="Export a customer report.",
+    tool_type=ToolType.MUTATING,
+    pre_guards=["mutating_tool_approval"],
+)
+async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
+    idempotency_key = ctx.idempotency_key(report_id)
+    result = await ctx.activity(
+        _export_report_activity,
+        args={
+            "report_id": report_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return ToolResult(payload=result, error=False)
+```
+
+Read-only tools usually do not need this. Tools that call arbitrary user code or
+third-party APIs without an idempotency primitive should say so in their tool
+description or use a conservative retry policy.
+
 ## Registration
 
 Tools and guards are defined with decorators and then added to a `ToolSet`. Standalone functions can be registered directly:

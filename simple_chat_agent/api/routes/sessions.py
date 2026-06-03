@@ -32,7 +32,6 @@ from simple_chat_agent.api.serialization import (
     set_transcript_headers,
     snapshot_to_dict,
     state_patch_to_dict,
-    state_to_dict,
     transcript_delta_result_to_dict,
     transcript_page_to_dict,
 )
@@ -63,6 +62,9 @@ from simple_chat_agent.worker.user_chats_workflow import (
     UserChatsWorkflow,
 )
 from simple_chat_agent.worker.workflow import SimpleChatWorkflow
+from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
+from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_HARD_MAX_BYTES
+from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_MIN_MAX_BYTES
 
 
 @dataclass(frozen=True)
@@ -163,33 +165,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             ),
         }
 
-    @router.get("/api/sessions/{workflow_id}/state")
-    async def get_state(
-        request: Request,
-        workflow_id: str,
-        response: Response,
-    ) -> dict[str, Any]:
-        user = await deps.require_conversation_owner(request, workflow_id)
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Stream-Cursor"] = deps.stream_broker().cursor(workflow_id)
-        try:
-            state = await deps.query_state(workflow_id)
-        except Exception as err:
-            if not deps.is_temporal_not_found(err):
-                raise
-            await deps.forget_conversation(user.user_id, workflow_id, user.username)
-            raise HTTPException(
-                status_code=404,
-                detail="Workflow execution not found. Start a new chat.",
-            ) from err
-        return state_to_dict(
-            state,
-            artifacts=deps.store().list_artifacts(
-                user_id=user.user_id,
-                workflow_id=workflow_id,
-            ),
-        )
-
     @router.get("/api/sessions/{workflow_id}/state/patch")
     async def get_state_patch(
         request: Request,
@@ -228,6 +203,11 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         workflow_id: str,
         response: Response,
         limit: int = Query(default=60, ge=1, le=200),
+        max_bytes: int = Query(
+            default=TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+            ge=TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+            le=TRANSCRIPT_QUERY_HARD_MAX_BYTES,
+        ),
     ) -> dict[str, Any]:
         timings: list[tuple[str, float]] = []
         started = time.perf_counter()
@@ -238,7 +218,11 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         response.headers["X-Stream-Cursor"] = deps.stream_broker().cursor(workflow_id)
         query_started = time.perf_counter()
         try:
-            snapshot = await deps.query_snapshot(workflow_id, limit=limit)
+            snapshot = await deps.query_snapshot(
+                workflow_id,
+                limit=limit,
+                max_bytes=max_bytes,
+            )
         except Exception as err:
             if not deps.is_temporal_not_found(err):
                 raise
@@ -268,6 +252,11 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         response: Response,
         before: int | None = Query(default=None, ge=0),
         limit: int = Query(default=60, ge=1, le=200),
+        max_bytes: int = Query(
+            default=TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+            ge=TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+            le=TRANSCRIPT_QUERY_HARD_MAX_BYTES,
+        ),
     ) -> dict[str, Any]:
         timings: list[tuple[str, float]] = []
         started = time.perf_counter()
@@ -281,6 +270,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 workflow_id,
                 before=before,
                 limit=limit,
+                max_bytes=max_bytes,
             )
         except Exception as err:
             if not deps.is_temporal_not_found(err):
@@ -297,6 +287,9 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         response.headers["X-Transcript-Start"] = str(body["start"])
         response.headers["X-Transcript-End"] = str(body["end"])
         response.headers["X-Transcript-Total"] = str(body["total"])
+        response.headers["X-Transcript-Limited"] = str(body["limited"]).lower()
+        response.headers["X-Transcript-Byte-Limit"] = str(body["byte_limit"])
+        response.headers["X-Transcript-Estimated-Bytes"] = str(body["estimated_bytes"])
         return body
 
     @router.get("/api/sessions/{workflow_id}/messages/deltas")
@@ -305,6 +298,11 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         workflow_id: str,
         response: Response,
         after_revision: int = Query(default=0, ge=0),
+        max_bytes: int = Query(
+            default=TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+            ge=TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+            le=TRANSCRIPT_QUERY_HARD_MAX_BYTES,
+        ),
     ) -> dict[str, Any]:
         timings: list[tuple[str, float]] = []
         started = time.perf_counter()
@@ -317,6 +315,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             result = await deps.query_transcript_deltas_since(
                 workflow_id,
                 after_revision=after_revision,
+                max_bytes=max_bytes,
             )
         except Exception as err:
             if not deps.is_temporal_not_found(err):
@@ -332,6 +331,9 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         response.headers["Server-Timing"] = server_timing(timings)
         response.headers["X-Transcript-Revision"] = str(body["to_revision"])
         response.headers["X-Transcript-Total"] = str(body["transcript_length"])
+        response.headers["X-Transcript-Limited"] = str(body["limited"]).lower()
+        response.headers["X-Transcript-Byte-Limit"] = str(body["byte_limit"])
+        response.headers["X-Transcript-Estimated-Bytes"] = str(body["estimated_bytes"])
         return body
 
     @router.post("/api/sessions/{workflow_id}/chat")

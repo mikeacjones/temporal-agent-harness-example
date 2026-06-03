@@ -221,15 +221,19 @@ The browser opens an SSE connection to:
 GET /api/sessions/{workflow_id}/events
 ```
 
-The FastAPI app sends two kinds of events:
+The FastAPI app uses the SSE stream as the live sideband and reconciles durable
+state only when needed:
 
-- `state`: durable workflow state, read by polling the `SimpleChatWorkflow.state`
-  query. This includes transcript, status, pending approvals, tool availability,
-  and artifacts.
 - `stream`: non-durable sideband stream events. Local dev reads the JSONL stream
   file written by `JsonlStreamSink`; deployment receives the same events through
   the API-owned `/internal/stream` endpoint. This is used for Claude token
   deltas, streamed tool input construction, and tool activity visibility.
+- Durable state loads through `/api/sessions/{workflow_id}/snapshot`, older
+  messages through `/messages`, settled-message deltas through `/messages/deltas`,
+  and small workflow-state patches through `/state/patch`.
+- Transcript snapshot/page/delta queries are count- and byte-bounded. If delta
+  reconciliation would exceed the byte budget, the API asks the browser to load a
+  bounded snapshot instead of returning an oversized query result.
 
 The workflow does not push directly to the browser.
 

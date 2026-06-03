@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -95,6 +97,7 @@ class ToolContext:
     tool_name: str
     _tools: "ToolSet"
     stream_id: str | None = None
+    tool_call_id: str | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
@@ -104,6 +107,16 @@ class ToolContext:
 
     def tool_schemas(self, names: Iterable[str] | None = None) -> list[ToolParam]:
         return self._tools.tool_schemas(names)
+
+    def idempotency_key(self, *parts: object) -> str:
+        components = [
+            self.stream_id or "stream:none",
+            self.tool_name,
+            self.tool_call_id or "tool-call:none",
+        ]
+        components.extend(_idempotency_part(part) for part in parts)
+        digest = hashlib.sha256("\x1f".join(components).encode("utf-8")).hexdigest()
+        return f"{self.tool_name}:{digest[:32]}"
 
     async def activity(
         self,
@@ -333,6 +346,7 @@ class ToolSet:
         args: dict[str, Any] | None = None,
         *,
         stream_id: str | None = None,
+        tool_call_id: str | None = None,
         activity_options: ActivityOptions | None = None,
     ) -> ToolResult:
         tool = self.get_tool(name)
@@ -361,6 +375,7 @@ class ToolSet:
             tool_name=name,
             _tools=self,
             stream_id=stream_id,
+            tool_call_id=tool_call_id,
             activity_options=resolved_activity_options,
         )
         if tool.args_mode == "raw":
@@ -532,6 +547,20 @@ def _input_schema_for_tool(fn: ToolFn) -> dict[str, Any]:
     field_definitions = cast(dict[str, Any | tuple[Any, Any]], model_fields)
     model = create_model(f"{fn.__name__}_ToolInput", **field_definitions)
     return model.model_json_schema()
+
+
+def _idempotency_part(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except TypeError:
+        return str(value)
 
 
 @temporal_activity.defn(name=RUN_TOOL_ACTIVITY_NAME)
