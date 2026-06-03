@@ -253,7 +253,29 @@ export function applyTranscriptDeltasInState(previous, result) {
   }
 
   const toRevision = Number(result.to_revision || workflowState.transcript_revision || 0);
+  const nextStateRevision = Math.max(
+    Number(workflowState.state_revision || 0),
+    Number(result.state_revision || 0),
+  );
+  const stateOnlyChanged =
+    nextStateRevision > Number(workflowState.state_revision || 0) ||
+    (result.status && result.status !== workflowState.status) ||
+    Number(result.pending_messages ?? workflowState.pending_messages ?? 0) !==
+      Number(workflowState.pending_messages ?? 0) ||
+    (result.active_message_index ?? null) !==
+      (workflowState.active_message_index ?? null);
   if (toRevision <= Number(workflowState.transcript_revision || 0)) {
+    if (stateOnlyChanged) {
+      return updateWorkflowStateInState(previous, {
+        ...workflowState,
+        status: result.status || workflowState.status,
+        pending_messages: Number(
+          result.pending_messages ?? workflowState.pending_messages ?? 0,
+        ),
+        active_message_index: result.active_message_index ?? null,
+        state_revision: nextStateRevision,
+      });
+    }
     return previous;
   }
 
@@ -275,10 +297,7 @@ export function applyTranscriptDeltasInState(previous, result) {
     transcript_total: transcriptTotal,
     transcript_length: transcriptTotal,
     transcript_revision: toRevision,
-    state_revision: Math.max(
-      Number(workflowState.state_revision || 0),
-      Number(result.state_revision || 0),
-    ),
+    state_revision: nextStateRevision,
   });
 }
 

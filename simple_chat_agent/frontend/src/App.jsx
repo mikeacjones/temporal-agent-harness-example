@@ -39,6 +39,7 @@ import {
 const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:";
 const TURN_TRACE_CACHE_LIMIT = 12;
 const STREAM_SESSION_CACHE_PREFIX = "simpleChatStreamSession:";
+const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [300, 450, 700, 1000, 1400, 2000];
 
 function turnTraceCacheKey(workflowId) {
   return `${TURN_TRACE_CACHE_PREFIX}${workflowId}`;
@@ -46,6 +47,13 @@ function turnTraceCacheKey(workflowId) {
 
 function streamSessionCacheKey(workflowId) {
   return `${STREAM_SESSION_CACHE_PREFIX}${workflowId}`;
+}
+
+function transcriptDeltaResultStillLive(result) {
+  if (!result) return true;
+  if (result.status === "responding" || result.status === "starting") return true;
+  if (Number(result.pending_messages || 0) > 0) return true;
+  return result.active_message_index !== null && result.active_message_index !== undefined;
 }
 
 function loadCachedTurnTraces(workflowId) {
@@ -361,7 +369,11 @@ export default function App() {
   function scheduleSettledTranscriptRefresh(workflowId, options = {}) {
     clearSettledTranscriptRefresh();
     const attempt = options.attempt || 0;
-    const delay = options.delay ?? 300;
+    const delay =
+      options.delay ??
+      SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS[
+        Math.min(attempt, SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS.length - 1)
+      ];
     settledTranscriptTimerRef.current = setTimeout(() => {
       settledTranscriptTimerRef.current = null;
       if (document.hidden || stateRef.current.workflowId !== workflowId) return;
@@ -754,12 +766,16 @@ export default function App() {
         : previous,
     );
 
-    const advanced = Number(body.to_revision || 0) > afterRevision;
-    if (!advanced && (options.attempt || 0) < 2) {
+    const stillLive = transcriptDeltaResultStillLive(body);
+    const attempt = options.attempt || 0;
+    if (stillLive && attempt < SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS.length - 1) {
       scheduleSettledTranscriptRefresh(workflowId, {
-        attempt: (options.attempt || 0) + 1,
-        delay: 450,
+        attempt: attempt + 1,
       });
+      return;
+    }
+    if (stillLive && attempt >= SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS.length - 1) {
+      reconcileWorkflow(workflowId);
     }
   }
 
