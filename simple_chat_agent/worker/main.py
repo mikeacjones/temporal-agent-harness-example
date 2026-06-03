@@ -15,7 +15,7 @@ from agent_harness.mcp import (
 )
 from agent_harness.streaming import configure_stream_sink
 from agent_harness.tools import run_tool_activity
-from agent_harness.providers.claude import call_claude
+from agent_harness.providers.claude import call_agent_api
 from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.worker.demo_workspace_activities import (
     configure_demo_workspace,
@@ -74,7 +74,7 @@ async def main() -> None:
             DemoWorkspaceWorkflow,
         ],
         activities=[
-            call_claude,
+            call_agent_api,
             run_tool_activity,
             run_guard_activity,
             provision_demo_workspace,

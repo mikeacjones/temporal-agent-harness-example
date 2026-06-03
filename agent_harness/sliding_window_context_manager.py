@@ -15,8 +15,10 @@ from .messages import (
     AgentBlock,
     AgentMessage,
     AgentRole,
+    CONTEXT_COMPACTION_MARKER,
     ToolResultBlock,
     block_to_dict,
+    context_compaction_marker_block,
     message,
     normalize_message,
     text_block,
@@ -72,10 +74,28 @@ class SlidingWindowContextManager:
 
         self._messages = [_message_from_snapshot(message) for message in messages]
 
-    def snapshot(self) -> ContextSnapshot:
+    def full_context_snapshot(self) -> ContextSnapshot:
         return {
             "version": 2,
             "messages": [_message_to_snapshot(message) for message in self._messages],
+        }
+
+    async def continuation_context_snapshot(
+        self,
+        token_budget: ContextTokenBudget | None = None,
+    ) -> ContextSnapshot:
+        full_messages = _without_context_compaction_markers(
+            _drop_incomplete_tool_exchanges(self._messages)
+        )
+        messages = await self.messages_for_model(token_budget)
+        messages = _with_context_compaction_marker(
+            full_messages=full_messages,
+            compacted_messages=messages,
+            preserve_initial_user_message=self.preserve_initial_user_message,
+        )
+        return {
+            "version": 2,
+            "messages": [_message_to_snapshot(message) for message in messages],
         }
 
     async def messages_for_model(
@@ -183,6 +203,47 @@ def _drop_incomplete_tool_exchanges(
         index += 1
 
     return selected
+
+
+def _with_context_compaction_marker(
+    *,
+    full_messages: list[AgentMessage],
+    compacted_messages: list[AgentMessage],
+    preserve_initial_user_message: bool,
+) -> list[AgentMessage]:
+    compacted = _without_context_compaction_markers(compacted_messages)
+    dropped_messages = len(full_messages) - len(compacted)
+    if dropped_messages <= 0:
+        return compacted_messages
+
+    marker = message(
+        "user",
+        [
+            context_compaction_marker_block(
+                dropped_messages=dropped_messages,
+            )
+        ],
+    )
+    insert_index = 0
+    if (
+        preserve_initial_user_message
+        and full_messages
+        and compacted
+        and _message_to_snapshot(full_messages[0]) == _message_to_snapshot(compacted[0])
+    ):
+        insert_index = 1
+
+    return [*compacted[:insert_index], marker, *compacted[insert_index:]]
+
+
+def _without_context_compaction_markers(
+    messages: list[AgentMessage],
+) -> list[AgentMessage]:
+    return [
+        message
+        for message in messages
+        if not _message_has_block_type(message, CONTEXT_COMPACTION_MARKER)
+    ]
 
 
 def _user_message_content(
@@ -571,9 +632,6 @@ def _cleared_tool_result_block(block: dict[str, Any]) -> dict[str, Any]:
             "cleared": True,
             "reason": "Older tool result omitted from model context.",
             "tool_use_id": tool_use_id,
-            "tool_result_ref": None
-            if tool_use_id is None
-            else f"tool_result:{tool_use_id}",
             "original_chars": _content_length(block.get("content")),
         }
     )

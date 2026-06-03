@@ -10,6 +10,13 @@ AgentBlock = dict[str, Any]
 ToolUseBlock = dict[str, Any]
 ToolResultBlock = dict[str, Any]
 
+CONTEXT_COMPACTION_MARKER = "context_compaction_marker"
+CONTEXT_COMPACTION_MARKER_TEXT = (
+    "Older conversation existed here, but it was dropped during context "
+    "compaction. The retained conversation below is the bounded context that "
+    "remains available."
+)
+
 
 def message(role: AgentRole, content: str | list[AgentBlock]) -> AgentMessage:
     return {"role": role, "content": copy.deepcopy(content)}
@@ -21,6 +28,21 @@ def text_message(role: AgentRole, text: str) -> AgentMessage:
 
 def text_block(text: str) -> AgentBlock:
     return {"type": "text", "text": text}
+
+
+def context_compaction_marker_block(
+    *,
+    dropped_messages: int | None = None,
+    reason: str = "older_messages_dropped",
+) -> AgentBlock:
+    block: AgentBlock = {
+        "type": CONTEXT_COMPACTION_MARKER,
+        "text": CONTEXT_COMPACTION_MARKER_TEXT,
+        "reason": reason,
+    }
+    if dropped_messages is not None:
+        block["dropped_messages"] = max(0, int(dropped_messages))
+    return block
 
 
 def tool_use_block(
@@ -156,6 +178,9 @@ def _text_from_block(value: Any) -> str:
     if block.get("type") == "refusal":
         refusal = block.get("refusal")
         return refusal if isinstance(refusal, str) else ""
+    if block.get("type") == CONTEXT_COMPACTION_MARKER:
+        text = block.get("text")
+        return text if isinstance(text, str) else CONTEXT_COMPACTION_MARKER_TEXT
     return ""
 
 

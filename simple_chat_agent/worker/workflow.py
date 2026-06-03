@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
@@ -9,8 +10,18 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from agent_harness.attachments import AttachmentRef
     from agent_harness.agent import AgentResult, AgentState, SteeringMode
-    from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+    from agent_harness.context_manager import (
+        DEFAULT_MAX_CONTEXT_TOKENS,
+        ContextSnapshot,
+    )
     from agent_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.messages import (
+        CONTEXT_COMPACTION_MARKER,
+        message_text,
+        normalize_message,
+        tool_use_blocks,
+        visible_user_message_text,
+    )
     from agent_harness.providers.claude import (
         ClaudeAgent,
         ClaudeThinkingConfig,
@@ -92,7 +103,7 @@ class SimpleChatInput:
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     agent_state: AgentState | None = None
-    transcript: list[ChatMessage] = field(default_factory=list)
+    agent_context_state: AgentState | None = None
     pending_messages: list[QueuedChatMessage] = field(default_factory=list)
     active_message_index: int | None = None
     approval_memory: list[str] = field(default_factory=list)
@@ -143,10 +154,11 @@ class SimpleChatSnapshot:
 class SimpleChatWorkflow:
     def __init__(self) -> None:
         self._pending_messages: list[QueuedChatMessage] = []
-        self._transcript: list[ChatMessage] = []
         self._status = "starting"
         self._agent: ClaudeAgent | None = None
+        self._agent_context_state: AgentState | None = None
         self._active_message_index: int | None = None
+        self._active_message: QueuedChatMessage | None = None
         self._user_ref: str | None = None
         self._conversation_id: str | None = None
         self._model: str | None = None
@@ -175,7 +187,10 @@ class SimpleChatWorkflow:
     ) -> None:
         self._touch()
         transcript_index = self._enqueue_chat(message, attachments=attachments)
-        self._record_transcript_change(transcript_index)
+        self._record_transcript_change(
+            transcript_index,
+            _chat_message_for_queue(self._pending_messages[-1]),
+        )
         self._record_state_change()
 
     @workflow.signal
@@ -192,57 +207,46 @@ class SimpleChatWorkflow:
         self._touch()
         if attachments:
             transcript_index = self._enqueue_chat(message, attachments=attachments)
-            self._record_transcript_change(transcript_index)
+            self._record_transcript_change(
+                transcript_index,
+                _chat_message_for_queue(self._pending_messages[-1]),
+            )
             self._record_state_change()
             return
         if mode not in ("immediate", "after_next_tool_result"):
-            self._transcript.append(
-                ChatMessage(role="system", content=f"Unknown steering mode: {mode}")
-            )
-            self._record_transcript_change(len(self._transcript) - 1)
+            self._record_system_message(f"Unknown steering mode: {mode}")
             return
 
         if self._agent is None:
-            self._transcript.append(
-                ChatMessage(
-                    role="system",
-                    content="Agent is not ready yet; steering was ignored.",
-                )
+            self._record_system_message(
+                "Agent is not ready yet; steering was ignored."
             )
-            self._record_transcript_change(len(self._transcript) - 1)
             return
 
         self._agent.steer(message, mode=cast(SteeringMode, mode))
         label = (
             "after the next tool result"
             if mode == "after_next_tool_result"
-            else "before the next Claude call"
+            else "before the next provider call"
         )
-        self._transcript.append(
-            ChatMessage(
-                role="system",
-                content=f"Steering queued {label}: {message}",
-            )
-        )
-        self._record_transcript_change(len(self._transcript) - 1)
+        self._record_system_message(f"Steering queued {label}: {message}")
 
     @workflow.signal
     async def interrupt(self, message: str) -> None:
         self._touch()
         if self._agent is None or self._status != "responding":
             transcript_index = self._enqueue_chat(message)
-            self._record_transcript_change(transcript_index)
+            self._record_transcript_change(
+                transcript_index,
+                _chat_message_for_queue(self._pending_messages[-1]),
+            )
             self._record_state_change()
             return
 
         self._agent.interrupt(message)
-        self._transcript.append(
-            ChatMessage(
-                role="system",
-                content=f"Interrupt sent; Claude will continue with: {message}",
-            )
+        self._record_system_message(
+            f"Interrupt sent; provider will continue with: {message}"
         )
-        self._record_transcript_change(len(self._transcript) - 1)
 
     @workflow.signal
     async def update_tool_connections(
@@ -258,17 +262,11 @@ class SimpleChatWorkflow:
             self._mcp_servers = list(mcp_servers)
         github_status = "connected" if github_connection_id else "disconnected"
         mcp_status = f"{len(self._mcp_servers)} MCP server(s)"
-        self._transcript.append(
-            ChatMessage(
-                role="system",
-                content=(
-                    f"Tool availability updated. GitHub is {github_status}; "
-                    f"{mcp_status} configured."
-                ),
-            )
+        self._record_system_message(
+            f"Tool availability updated. GitHub is {github_status}; "
+            f"{mcp_status} configured."
         )
         self._record_state_change()
-        self._record_transcript_change(len(self._transcript) - 1)
 
     @workflow.signal
     async def resolve_approval(
@@ -278,23 +276,13 @@ class SimpleChatWorkflow:
     ) -> None:
         self._touch()
         if decision not in ("allow", "always_allow", "deny"):
-            self._transcript.append(
-                ChatMessage(
-                    role="system",
-                    content=f"Unknown approval decision: {decision}",
-                )
-            )
-            self._record_transcript_change(len(self._transcript) - 1)
+            self._record_system_message(f"Unknown approval decision: {decision}")
             return
         approval = self._pending_approvals.get(approval_id)
         if approval is None:
-            self._transcript.append(
-                ChatMessage(
-                    role="system",
-                    content=f"Approval is no longer pending: {approval_id}",
-                )
+            self._record_system_message(
+                f"Approval is no longer pending: {approval_id}"
             )
-            self._record_transcript_change(len(self._transcript) - 1)
             return
 
         if (
@@ -404,6 +392,7 @@ class SimpleChatWorkflow:
         )
 
     def _state(self, *, include_transcript: bool) -> SimpleChatState:
+        transcript = self._rendered_transcript()
         return SimpleChatState(
             status=self._status,
             pending_messages=len(self._pending_messages),
@@ -419,15 +408,15 @@ class SimpleChatWorkflow:
             queued_message_indices=[
                 message.transcript_index for message in self._pending_messages
             ],
-            transcript=list(self._transcript) if include_transcript else [],
-            transcript_length=len(self._transcript),
+            transcript=list(transcript) if include_transcript else [],
+            transcript_length=len(transcript),
             state_revision=self._state_revision,
             transcript_revision=self._transcript_revision,
         )
 
     @workflow.query
     def transcript(self) -> list[ChatMessage]:
-        return list(self._transcript)
+        return self._rendered_transcript()
 
     def _transcript_page(
         self,
@@ -435,12 +424,13 @@ class SimpleChatWorkflow:
         before: int | None,
         limit: int,
     ) -> TranscriptPage:
-        total = len(self._transcript)
+        transcript = self._rendered_transcript()
+        total = len(transcript)
         page_limit = max(1, min(int(limit or 60), 200))
         end = total if before is None else max(0, min(int(before), total))
         start = max(0, end - page_limit)
         return TranscriptPage(
-            messages=list(self._transcript[start:end]),
+            messages=list(transcript[start:end]),
             start=start,
             end=end,
             total=total,
@@ -459,7 +449,7 @@ class SimpleChatWorkflow:
             to_revision=self._transcript_revision,
             deltas=deltas,
             needs_snapshot=needs_snapshot,
-            transcript_length=len(self._transcript),
+            transcript_length=len(self._rendered_transcript()),
             status=self._status,
             pending_messages=len(self._pending_messages),
             active_message_index=self._active_message_index,
@@ -475,12 +465,13 @@ class SimpleChatWorkflow:
             self._touched_this_run = True
         else:
             self._touched_this_run = self._last_touched_at > self._run_started_at
-        self._transcript = list(chat_input.transcript)
         self._pending_messages = list(chat_input.pending_messages)
         if self._pending_messages or chat_input.agent_state is not None:
             self._last_touched_at = self._run_started_at
             self._touched_this_run = True
         self._active_message_index = chat_input.active_message_index
+        self._active_message = None
+        self._agent_context_state = chat_input.agent_context_state or chat_input.agent_state
         self._approval_memory = set(chat_input.approval_memory)
         self._approval_counter = chat_input.approval_counter
         self._state_revision = chat_input.state_revision
@@ -521,6 +512,8 @@ class SimpleChatWorkflow:
             pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,
             post_llm_guards=[good_place_post_guard] if chat_input.good_place_censor else None,
         )
+        if chat_input.agent_context_state is not None and chat_input.agent_state is None:
+            self._agent.restore_idle_state(chat_input.agent_context_state)
         self._status = "idle"
         self._record_state_change()
         resume_agent_state = chat_input.agent_state
@@ -530,7 +523,7 @@ class SimpleChatWorkflow:
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
                         workflow.continue_as_new(
-                            self._continue_as_new_input(chat_input, None)
+                            await self._continue_as_new_input(chat_input, None)
                         )
                     return
                 await workflow.wait_condition(
@@ -542,7 +535,7 @@ class SimpleChatWorkflow:
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
                         workflow.continue_as_new(
-                            self._continue_as_new_input(chat_input, None)
+                            await self._continue_as_new_input(chat_input, None)
                         )
                     return
                 if not self._pending_messages:
@@ -551,6 +544,7 @@ class SimpleChatWorkflow:
                 message = queued_message.content
                 attachments = queued_message.attachments
                 self._active_message_index = queued_message.transcript_index
+                self._active_message = queued_message
             else:
                 message = None
                 attachments = []
@@ -566,7 +560,7 @@ class SimpleChatWorkflow:
                 resume_agent_state = None
                 if result.needs_continue_as_new:
                     workflow.continue_as_new(
-                        self._continue_as_new_input(
+                        await self._continue_as_new_input(
                             chat_input,
                             result.continuation_state,
                         )
@@ -577,30 +571,25 @@ class SimpleChatWorkflow:
                 ):
                     effective = await self._agent.effective_user_prompt()
                     if effective is not None:
-                        original = self._transcript[self._active_message_index]
-                        self._transcript[self._active_message_index] = ChatMessage(
-                            role=original.role,
-                            content=effective,
-                            attachments=list(original.attachments),
+                        self._record_transcript_change(
+                            self._active_message_index,
+                            ChatMessage(
+                                role="user",
+                                content=effective,
+                                attachments=list(
+                                    self._active_message.attachments
+                                    if self._active_message is not None
+                                    else []
+                                ),
+                            ),
                         )
-                        self._record_transcript_change(self._active_message_index)
-                self._transcript.append(
-                    ChatMessage(
-                        role="assistant",
-                        content=_assistant_text(result.message),
-                    )
-                )
-                self._record_transcript_change(len(self._transcript) - 1)
+                self._agent_context_state = await self._agent.compacted_state()
+                self._record_latest_rendered_message_change()
             except Exception as err:
-                self._transcript.append(
-                    ChatMessage(
-                        role="system",
-                        content=f"{type(err).__name__}: {err}",
-                    )
-                )
-                self._record_transcript_change(len(self._transcript) - 1)
+                self._record_system_message(f"{type(err).__name__}: {err}")
             finally:
                 self._active_message_index = None
+                self._active_message = None
                 self._status = "idle"
                 self._record_state_change()
 
@@ -619,6 +608,45 @@ class SimpleChatWorkflow:
         remaining = (self._run_started_at + CHAT_WORKFLOW_RUN_TTL) - workflow.now()
         return max(remaining, timedelta())
 
+    def _rendered_transcript(self) -> list[ChatMessage]:
+        snapshot = self._context_snapshot()
+        messages = snapshot.get("messages")
+        if not isinstance(messages, list):
+            transcript: list[ChatMessage] = []
+        else:
+            transcript = [
+                rendered
+                for message in messages
+                if (rendered := _chat_message_from_agent_message(message)) is not None
+            ]
+
+        if self._active_message is not None:
+            _overlay_transcript_message(
+                transcript,
+                self._active_message.transcript_index,
+                _chat_message_for_queue(self._active_message),
+            )
+        for pending in self._pending_messages:
+            _overlay_transcript_message(
+                transcript,
+                pending.transcript_index,
+                _chat_message_for_queue(pending),
+            )
+        return transcript
+
+    def _context_snapshot(self) -> ContextSnapshot:
+        if self._agent is not None:
+            snapshot = self._agent.context_snapshot()
+            messages = snapshot.get("messages")
+            if isinstance(messages, list) and messages:
+                return snapshot
+        if self._agent_context_state is not None:
+            return self._agent_context_state.context_snapshot
+        return {"version": 2, "messages": []}
+
+    def _next_transcript_index(self) -> int:
+        return len(self._rendered_transcript())
+
     def _enqueue_chat(
         self,
         message: str,
@@ -626,10 +654,7 @@ class SimpleChatWorkflow:
         attachments: list[AttachmentRef] | None = None,
     ) -> int:
         attachment_refs = list(attachments or [])
-        transcript_index = len(self._transcript)
-        self._transcript.append(
-            ChatMessage(role="user", content=message, attachments=attachment_refs)
-        )
+        transcript_index = self._next_transcript_index()
         self._pending_messages.append(
             QueuedChatMessage(
                 content=message,
@@ -702,29 +727,27 @@ class SimpleChatWorkflow:
                 args=[approval_id, decision],
             )
         except Exception as err:
-            self._transcript.append(
-                ChatMessage(
-                    role="system",
-                    content=(
-                        "Could not deliver approval decision to subagent "
-                        f"{workflow_id}: {type(err).__name__}: {err}"
-                    ),
-                )
+            self._record_system_message(
+                "Could not deliver approval decision to subagent "
+                f"{workflow_id}: {type(err).__name__}: {err}"
             )
-            self._record_transcript_change(len(self._transcript) - 1)
 
     def _record_state_change(self) -> None:
         self._state_revision += 1
 
-    def _record_transcript_change(self, index: int | None = None) -> None:
+    def _record_transcript_change(
+        self,
+        index: int | None = None,
+        message: ChatMessage | None = None,
+    ) -> None:
         self._transcript_revision += 1
-        if index is None or index < 0 or index >= len(self._transcript):
+        if index is None or index < 0 or message is None:
             return
         self._transcript_deltas.append(
             TranscriptDelta(
                 revision=self._transcript_revision,
                 index=index,
-                message=self._transcript[index],
+                message=message,
             )
         )
         if len(self._transcript_deltas) > TRANSCRIPT_DELTA_BUFFER_LIMIT:
@@ -732,11 +755,28 @@ class SimpleChatWorkflow:
                 -TRANSCRIPT_DELTA_BUFFER_LIMIT:
             ]
 
-    def _continue_as_new_input(
+    def _record_system_message(self, content: str) -> None:
+        index = self._next_transcript_index()
+        self._record_transcript_change(
+            index,
+            ChatMessage(role="system", content=content),
+        )
+
+    def _record_latest_rendered_message_change(self) -> None:
+        transcript = self._rendered_transcript()
+        if not transcript:
+            self._record_transcript_change()
+            return
+        self._record_transcript_change(len(transcript) - 1, transcript[-1])
+
+    async def _continue_as_new_input(
         self,
         chat_input: SimpleChatInput,
         agent_state: AgentState | None,
     ) -> SimpleChatInput:
+        agent_context_state = None
+        if agent_state is None and self._agent is not None:
+            agent_context_state = await self._agent.compacted_state()
         return SimpleChatInput(
             user_ref=self._user_ref or chat_input.user_ref,
             conversation_id=self._conversation_id or chat_input.conversation_id,
@@ -751,21 +791,118 @@ class SimpleChatWorkflow:
             github_connection_id=self._github_connection_id,
             mcp_servers=list(self._mcp_servers),
             agent_state=agent_state,
-            transcript=list(self._transcript),
+            agent_context_state=agent_context_state,
             pending_messages=list(self._pending_messages),
             active_message_index=self._active_message_index,
             approval_memory=sorted(self._approval_memory),
             approval_counter=self._approval_counter,
             good_place_censor=chat_input.good_place_censor,
             state_revision=self._state_revision,
-            transcript_revision=self._transcript_revision,
-            transcript_deltas=list(self._transcript_deltas),
+            transcript_revision=self._transcript_revision + 1,
+            transcript_deltas=[],
             last_touched_at=(
                 self._last_touched_at.isoformat()
                 if self._last_touched_at is not None
                 else chat_input.last_touched_at
             ),
         )
+
+
+_ATTACHMENT_LINE_RE = re.compile(
+    r"^\s*\d+\.\s+(?P<name>.*?)\s+\("
+    r"attachment_id=(?P<attachment_id>[^,)]*),\s+"
+    r"mime_type=(?P<mime_type>[^,)]*),\s+"
+    r"kind=(?P<content_kind>[^,)]*),\s+"
+    r"size_bytes=(?P<size_bytes>\d+)\)"
+)
+
+
+def _chat_message_from_agent_message(value: Any) -> ChatMessage | None:
+    try:
+        agent_message = normalize_message(value)
+    except ValueError:
+        return None
+
+    content = agent_message["content"]
+    if isinstance(content, list) and any(
+        _block_dict(block).get("type") == CONTEXT_COMPACTION_MARKER
+        for block in content
+    ):
+        text = message_text(agent_message).strip()
+        return ChatMessage(role="system", content=text) if text else None
+
+    if agent_message["role"] == "user":
+        text = visible_user_message_text(agent_message).strip()
+        attachments = _attachments_from_agent_message(agent_message)
+        if not text and not attachments:
+            return None
+        return ChatMessage(role="user", content=text, attachments=attachments)
+
+    if tool_use_blocks(agent_message):
+        return None
+
+    text = _assistant_text(agent_message).strip()
+    if not text:
+        return None
+    return ChatMessage(role="assistant", content=text)
+
+
+def _attachments_from_agent_message(message: dict[str, Any]) -> list[AttachmentRef]:
+    content = message.get("content")
+    if isinstance(content, str):
+        return _attachments_from_text(content)
+    if not isinstance(content, list):
+        return []
+
+    attachments: list[AttachmentRef] = []
+    for block in content:
+        text = _block_text(_block_dict(block))
+        if text.lstrip().startswith("<attachments>"):
+            attachments.extend(_attachments_from_text(text))
+    return attachments
+
+
+def _attachments_from_text(text: str) -> list[AttachmentRef]:
+    if "<attachments>" not in text:
+        return []
+
+    attachments: list[AttachmentRef] = []
+    for line in text.splitlines():
+        match = _ATTACHMENT_LINE_RE.match(line)
+        if not match:
+            continue
+        groups = match.groupdict()
+        attachments.append(
+            AttachmentRef(
+                attachment_id=groups["attachment_id"],
+                name=groups["name"],
+                mime_type=groups["mime_type"],
+                size_bytes=int(groups["size_bytes"]),
+                content_kind=cast(Any, groups["content_kind"]),
+            )
+        )
+    return attachments
+
+
+def _overlay_transcript_message(
+    transcript: list[ChatMessage],
+    index: int,
+    message: ChatMessage,
+) -> None:
+    if index < 0:
+        return
+    if index < len(transcript):
+        transcript[index] = message
+        return
+    transcript.append(message)
+
+
+def _chat_message_for_queue(message: QueuedChatMessage) -> ChatMessage:
+    return ChatMessage(
+        role="user",
+        content=message.content,
+        attachments=list(message.attachments),
+    )
 
 
 def _assistant_text(message: dict[str, Any]) -> str:

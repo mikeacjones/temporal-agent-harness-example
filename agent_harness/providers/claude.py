@@ -27,6 +27,8 @@ from ..llm_guards import LlmGuardExecution, LlmGuardFn
 from ..messages import (
     AgentBlock,
     AgentMessage,
+    CONTEXT_COMPACTION_MARKER,
+    CONTEXT_COMPACTION_MARKER_TEXT,
     ToolUseBlock,
     message as agent_message,
     message_text,
@@ -115,7 +117,7 @@ class ClaudeProvider(AgentProvider):
 
     @property
     def activity(self) -> Any:
-        return call_claude
+        return call_agent_api
 
     @property
     def activity_options(self) -> ActivityOptions:
@@ -332,8 +334,8 @@ def _claude_response_from_guard_execution(
     return _claude_response_from_dict(response)
 
 
-@activity.defn
-async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
+@activity.defn(name="call_agent_api")
+async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
     create_params: dict[str, Any] = {
         "model": request.model,
         "max_tokens": request.max_tokens,
@@ -680,6 +682,11 @@ def _agent_block_to_claude_block(block: AgentBlock) -> dict[str, Any] | None:
     block_type = block.get("type")
     if block_type == "text":
         return {"type": "text", "text": str(block.get("text") or "")}
+    if block_type == CONTEXT_COMPACTION_MARKER:
+        return {
+            "type": "text",
+            "text": str(block.get("text") or CONTEXT_COMPACTION_MARKER_TEXT),
+        }
     if block_type == "tool_use":
         return _agent_tool_use_to_claude_block(cast(ToolUseBlock, block))
     if block_type == "tool_result":

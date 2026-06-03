@@ -223,12 +223,15 @@ class Agent:
                 continue
 
             if self._should_return_continue_as_new():
+                continuation_budget = self._context_token_budget(tool_schemas)
                 return AgentResult(
                     message=response_message,
                     stop_reason=response.stop_reason,
                     turns=turn,
                     continuation_state=AgentState(
-                        context_snapshot=self._context.snapshot(),
+                        context_snapshot=await self._context.continuation_context_snapshot(
+                            continuation_budget,
+                        ),
                         turns=turn,
                         llm_guard_state=dict(self._llm_guard_state),
                     ),
@@ -261,21 +264,32 @@ class Agent:
             return None
         return visible_user_message_text(messages[index])
 
+    def restore_idle_state(self, state: AgentState) -> None:
+        self._context.restore(state.context_snapshot)
+        self._context_initialized = True
+        self._llm_guard_state = dict(state.llm_guard_state)
+
+    def context_snapshot(self) -> ContextSnapshot:
+        if not self._context_initialized:
+            return {"version": 2, "messages": []}
+        return self._context.full_context_snapshot()
+
+    async def compacted_state(self) -> AgentState:
+        tool_schemas = self._tools.tool_schemas(self._tool_names)
+        return AgentState(
+            context_snapshot=await self._context.continuation_context_snapshot(
+                self._context_token_budget(tool_schemas),
+            ),
+            turns=0,
+            llm_guard_state=dict(self._llm_guard_state),
+        )
+
     async def _call_provider(
         self, tool_schemas: list[dict[str, Any]]
     ) -> ProviderResponse | None:
         self._provider_call_sequence += 1
         tool_params = [dict(tool) for tool in tool_schemas]
-        context_budget = ContextTokenBudget(
-            max_context_tokens=self._max_context_tokens,
-            reserved_output_tokens=self._max_tokens,
-            reserved_input_tokens=self._provider.estimate_request_tokens(
-                system_prompt=self._system_prompt,
-                tools=tool_params,
-            ),
-            safety_margin_tokens=self._context_safety_margin_tokens,
-            chars_per_token=self._context_chars_per_token,
-        )
+        context_budget = self._context_token_budget(tool_params)
         # Guards see the FULL durable history (un-windowed) so they can inspect
         # and mutate the whole conversation.
         guard_request = self._provider.create_request(
@@ -352,6 +366,21 @@ class Agent:
             if self._interrupt_requested and is_cancelled_exception(err):
                 return None
             raise
+
+    def _context_token_budget(
+        self,
+        tool_schemas: list[dict[str, Any]],
+    ) -> ContextTokenBudget:
+        return ContextTokenBudget(
+            max_context_tokens=self._max_context_tokens,
+            reserved_output_tokens=self._max_tokens,
+            reserved_input_tokens=self._provider.estimate_request_tokens(
+                system_prompt=self._system_prompt,
+                tools=tool_schemas,
+            ),
+            safety_margin_tokens=self._context_safety_margin_tokens,
+            chars_per_token=self._context_chars_per_token,
+        )
 
     async def _discard_interrupted_provider_call(
         self, provider_handle: workflow.ActivityHandle[ProviderResponse]

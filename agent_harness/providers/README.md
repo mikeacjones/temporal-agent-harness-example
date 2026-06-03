@@ -58,7 +58,7 @@ A provider module normally contains:
 - Streaming translation helpers that emit provider events into `StreamContext`.
 
 The Claude implementation in `claude.py` follows this pattern with
-`ClaudeProvider`, `ClaudeRequest`, `ClaudeResponse`, `call_claude`, and the
+`ClaudeProvider`, `ClaudeRequest`, `ClaudeResponse`, `call_agent_api`, and the
 `ClaudeAgent` convenience wrapper.
 
 ## Message Conversion

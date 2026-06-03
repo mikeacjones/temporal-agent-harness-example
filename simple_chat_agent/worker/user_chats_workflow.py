@@ -19,7 +19,6 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.providers.claude import ClaudeThinkingConfig
     from simple_chat_agent import TASK_QUEUE
     from simple_chat_agent.worker.workflow import (
-        ChatMessage,
         QueuedChatMessage,
         SimpleChatInput,
         SimpleChatWorkflow,
@@ -200,11 +199,6 @@ class UserChatsWorkflow:
             if request.initial_message is not None
             else ""
         )
-        transcript = (
-            [ChatMessage(role="user", content=initial_message)]
-            if initial_message
-            else []
-        )
         pending_messages = (
             [QueuedChatMessage(content=initial_message, transcript_index=0)]
             if initial_message
@@ -225,7 +219,6 @@ class UserChatsWorkflow:
                 available_tool_names=list(request.available_tool_names),
                 github_connection_id=request.github_connection_id,
                 mcp_servers=list(request.mcp_servers),
-                transcript=transcript,
                 pending_messages=pending_messages,
                 good_place_censor=request.good_place_censor,
                 last_touched_at=workflow.now().isoformat(),
