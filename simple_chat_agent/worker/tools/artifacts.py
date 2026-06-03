@@ -101,6 +101,7 @@ async def _create_artifact_activity(
         return payload
 
     from simple_chat_agent.common.store import AppStore
+    from simple_chat_agent.common.store import artifact_expires_at
 
     artifact = AppStore().create_artifact(
         user_id=user_id,
@@ -120,6 +121,7 @@ async def _create_artifact_activity(
             "view_url": f"/api/artifacts/{artifact.artifact_id}",
             "download_url": f"/api/artifacts/{artifact.artifact_id}/download",
             "created_at": artifact.created_at,
+            "expires_at": artifact_expires_at(artifact),
         }
     }
     await stream.emit(payload["artifact"], kind="artifact_create_complete")

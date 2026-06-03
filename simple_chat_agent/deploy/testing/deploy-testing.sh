@@ -45,5 +45,7 @@ kubectl rollout status deployment/agent-harness-web-testing -n "${NAMESPACE}" --
 kubectl rollout status deployment/agent-harness-api-testing -n "${NAMESPACE}" --timeout=300s
 kubectl rollout status deployment/agent-harness-worker-testing -n "${NAMESPACE}" --timeout=300s
 
+"${ROOT}/simple_chat_agent/deploy/configure-s3-lifecycle.sh"
+
 echo ">> Done. Test stack on ${IMAGE}:${TAG}"
 echo ">> https://agent-harness-demo.testing.tmprl-demo.cloud"

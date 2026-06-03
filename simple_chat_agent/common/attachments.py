@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from agent_harness.attachments import AttachmentContentKind, AttachmentRef
 
-from .store import AppStore, ArtifactRecord
+from .store import AppStore, ArtifactRecord, artifact_expires_at
 
 USER_ATTACHMENT_SOURCE = "user_attachment"
 MAX_ATTACHMENT_BYTES = 10_000_000
@@ -123,6 +123,7 @@ def attachment_ref_from_artifact(artifact: ArtifactRecord) -> AttachmentRef:
             if metadata.get("text_chars") is not None
             else None
         ),
+        expires_at=artifact_expires_at(artifact),
         metadata=metadata,
     )
 
@@ -141,6 +142,7 @@ def attachment_dict(artifact: ArtifactRecord) -> dict[str, Any]:
         "source": ref.source,
         "text_preview": ref.text_preview,
         "text_chars": ref.text_chars,
+        "expires_at": ref.expires_at,
         "created_at": artifact.created_at,
         "metadata": ref.metadata,
         "view_url": f"/api/attachments/{ref.attachment_id}",

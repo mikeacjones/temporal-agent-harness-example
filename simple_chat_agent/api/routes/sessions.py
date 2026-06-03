@@ -52,7 +52,7 @@ from simple_chat_agent.common.attachments import (
     create_user_attachment,
     generated_artifacts,
 )
-from simple_chat_agent.common.store import AppStore, ArtifactRecord
+from simple_chat_agent.common.store import AppStore, ArtifactRecord, artifact_is_expired
 from simple_chat_agent.worker.tools import (
     configured_research_tool_names,
     tool_names_for_connections,
@@ -639,4 +639,6 @@ def _get_user_attachment(
     artifact = store.get_artifact(user_id=user_id, artifact_id=attachment_id)
     if artifact is None or not artifact_is_user_attachment(artifact):
         raise HTTPException(status_code=404, detail="Attachment not found")
+    if artifact_is_expired(artifact):
+        raise HTTPException(status_code=410, detail="Attachment has expired")
     return artifact

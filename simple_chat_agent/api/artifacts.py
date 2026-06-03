@@ -7,7 +7,7 @@ from urllib.parse import quote
 from fastapi import HTTPException
 from fastapi.responses import Response
 
-from simple_chat_agent.common.store import AppStore, ArtifactRecord
+from simple_chat_agent.common.store import AppStore, ArtifactRecord, artifact_is_expired
 
 
 def artifact_response(
@@ -16,6 +16,8 @@ def artifact_response(
     *,
     disposition: Literal["inline", "attachment"],
 ) -> Response:
+    if artifact_is_expired(artifact):
+        raise HTTPException(status_code=410, detail="Artifact has expired")
     try:
         content = store.read_artifact_bytes(artifact)
     except Exception as err:

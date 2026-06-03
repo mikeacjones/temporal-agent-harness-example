@@ -14,6 +14,7 @@ from simple_chat_agent.common.attachments import (
     sniff_attachment_text_kind,
     text_like_content_kind,
 )
+from simple_chat_agent.common.store import artifact_is_expired
 
 READ_ATTACHMENT_TOOL = "read_attachment"
 MAX_ATTACHMENT_READ_CHARS = 50_000
@@ -95,8 +96,38 @@ async def _read_attachment_activity(
         return payload
 
     attachment = attachment_dict(artifact)
+    if artifact_is_expired(artifact):
+        payload = {
+            "error": "Attachment has expired.",
+            "type": "AttachmentExpired",
+            "attachment": attachment,
+            "content_available": False,
+            "reason": (
+                "This attachment is past its retention window and may no longer "
+                "be available. Ask the user to upload it again if the content "
+                "is still needed."
+            ),
+        }
+        await stream.emit(payload, kind="attachment_read_error")
+        return payload
+
     content_kind = attachment.get("content_kind")
-    content_bytes = store.read_artifact_bytes(artifact)
+    try:
+        content_bytes = store.read_artifact_bytes(artifact)
+    except Exception as err:
+        payload = {
+            "error": "Attachment content is unavailable.",
+            "type": "AttachmentUnavailable",
+            "attachment": attachment,
+            "content_available": False,
+            "reason": (
+                "The attachment metadata exists, but the stored bytes could not "
+                "be read. It may have expired or been deleted."
+            ),
+            "detail": f"{type(err).__name__}: {err}",
+        }
+        await stream.emit(payload, kind="attachment_read_error")
+        return payload
     if not text_like_content_kind(str(content_kind) if content_kind else None):
         detected_kind, detected_mime = sniff_attachment_text_kind(
             name=artifact.name,

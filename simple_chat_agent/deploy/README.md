@@ -91,6 +91,11 @@ to a local on-disk store (used for local dev).
   Get/Put/Delete/List on the bucket only. No static AWS keys in the cluster.
 - **Key layout** (official `temporalio.contrib.aws.s3driver`):
   `v0/ns/<namespace>/wt/<workflow-type>/wi/<workflow-id>/ri/<run-id>/d/sha256/<hash>`.
+- **Lifecycle**: deploy scripts configure a broad 30-day S3 expiration rule for
+  claim-check payloads and artifact bytes. User and chat workflows checkpoint
+  or close on a 15-day run TTL, so no open run should depend on an object older
+  than the lifecycle horizon. Artifacts and attachments expose `expires_at` and
+  return clear expired/unavailable errors when read after retention.
 - **Purge on close**: deleting a chat purges its payloads via a prefix delete
   on `v0/ns/<namespace>/wt/SimpleChatWorkflow/wi/<workflow-id>/`
   (`web.py` `_forget_conversation` → `purge_workflow_payloads`).

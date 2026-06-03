@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
 from temporalio import workflow
@@ -28,6 +29,7 @@ with workflow.unsafe.imports_passed_through():
 ChatRole = Literal["user", "assistant", "system"]
 DEFAULT_MAX_TOKENS = 32_000
 TRANSCRIPT_DELTA_BUFFER_LIMIT = 80
+CHAT_WORKFLOW_RUN_TTL = timedelta(days=15)
 
 
 @dataclass
@@ -99,6 +101,7 @@ class SimpleChatInput:
     state_revision: int = 0
     transcript_revision: int = 0
     transcript_deltas: list[TranscriptDelta] = field(default_factory=list)
+    last_touched_at: str = ""
 
 
 @dataclass
@@ -160,6 +163,9 @@ class SimpleChatWorkflow:
         self._state_revision = 0
         self._transcript_revision = 0
         self._transcript_deltas: list[TranscriptDelta] = []
+        self._run_started_at: datetime | None = None
+        self._last_touched_at: datetime | None = None
+        self._touched_this_run = False
 
     @workflow.signal
     async def chat(
@@ -167,6 +173,7 @@ class SimpleChatWorkflow:
         message: str,
         attachments: list[AttachmentRef] | None = None,
     ) -> None:
+        self._touch()
         transcript_index = self._enqueue_chat(message, attachments=attachments)
         self._record_transcript_change(transcript_index)
         self._record_state_change()
@@ -182,6 +189,7 @@ class SimpleChatWorkflow:
         mode: str = "immediate",
         attachments: list[AttachmentRef] | None = None,
     ) -> None:
+        self._touch()
         if attachments:
             transcript_index = self._enqueue_chat(message, attachments=attachments)
             self._record_transcript_change(transcript_index)
@@ -220,6 +228,7 @@ class SimpleChatWorkflow:
 
     @workflow.signal
     async def interrupt(self, message: str) -> None:
+        self._touch()
         if self._agent is None or self._status != "responding":
             transcript_index = self._enqueue_chat(message)
             self._record_transcript_change(transcript_index)
@@ -242,6 +251,7 @@ class SimpleChatWorkflow:
         github_connection_id: str | None = None,
         mcp_servers: list[HttpMcpServerConfig] | None = None,
     ) -> None:
+        self._touch()
         self._available_tool_names = set(available_tool_names)
         self._github_connection_id = github_connection_id
         if mcp_servers is not None:
@@ -266,6 +276,7 @@ class SimpleChatWorkflow:
         approval_id: str,
         decision: str,
     ) -> None:
+        self._touch()
         if decision not in ("allow", "always_allow", "deny"):
             self._transcript.append(
                 ChatMessage(
@@ -457,8 +468,18 @@ class SimpleChatWorkflow:
 
     @workflow.run
     async def run(self, chat_input: SimpleChatInput) -> None:
+        self._run_started_at = workflow.now()
+        self._last_touched_at = _parse_datetime(chat_input.last_touched_at)
+        if self._last_touched_at is None:
+            self._last_touched_at = self._run_started_at
+            self._touched_this_run = True
+        else:
+            self._touched_this_run = self._last_touched_at > self._run_started_at
         self._transcript = list(chat_input.transcript)
         self._pending_messages = list(chat_input.pending_messages)
+        if self._pending_messages or chat_input.agent_state is not None:
+            self._last_touched_at = self._run_started_at
+            self._touched_this_run = True
         self._active_message_index = chat_input.active_message_index
         self._approval_memory = set(chat_input.approval_memory)
         self._approval_counter = chat_input.approval_counter
@@ -506,11 +527,26 @@ class SimpleChatWorkflow:
 
         while True:
             if resume_agent_state is None:
+                if self._checkpoint_due() and workflow.all_handlers_finished():
+                    if self._touched_this_run:
+                        workflow.continue_as_new(
+                            self._continue_as_new_input(chat_input, None)
+                        )
+                    return
                 await workflow.wait_condition(
-                    lambda: self._delete_requested or len(self._pending_messages) > 0
+                    lambda: self._delete_requested or len(self._pending_messages) > 0,
+                    timeout=self._time_until_checkpoint(),
                 )
                 if self._delete_requested:
                     return
+                if self._checkpoint_due() and workflow.all_handlers_finished():
+                    if self._touched_this_run:
+                        workflow.continue_as_new(
+                            self._continue_as_new_input(chat_input, None)
+                        )
+                    return
+                if not self._pending_messages:
+                    continue
                 queued_message = self._pending_messages.pop(0)
                 message = queued_message.content
                 attachments = queued_message.attachments
@@ -567,6 +603,21 @@ class SimpleChatWorkflow:
                 self._active_message_index = None
                 self._status = "idle"
                 self._record_state_change()
+
+    def _touch(self) -> None:
+        self._last_touched_at = workflow.now()
+        self._touched_this_run = True
+
+    def _checkpoint_due(self) -> bool:
+        if self._run_started_at is None:
+            return False
+        return workflow.now() >= self._run_started_at + CHAT_WORKFLOW_RUN_TTL
+
+    def _time_until_checkpoint(self) -> timedelta:
+        if self._run_started_at is None:
+            return CHAT_WORKFLOW_RUN_TTL
+        remaining = (self._run_started_at + CHAT_WORKFLOW_RUN_TTL) - workflow.now()
+        return max(remaining, timedelta())
 
     def _enqueue_chat(
         self,
@@ -692,6 +743,7 @@ class SimpleChatWorkflow:
             system_prompt=chat_input.system_prompt,
             model=chat_input.model,
             max_tokens=chat_input.max_tokens,
+            max_context_tokens=chat_input.max_context_tokens,
             thinking=chat_input.thinking,
             max_turns=chat_input.max_turns,
             stream_id=chat_input.stream_id,
@@ -708,6 +760,11 @@ class SimpleChatWorkflow:
             state_revision=self._state_revision,
             transcript_revision=self._transcript_revision,
             transcript_deltas=list(self._transcript_deltas),
+            last_touched_at=(
+                self._last_touched_at.isoformat()
+                if self._last_touched_at is not None
+                else chat_input.last_touched_at
+            ),
         )
 
 
@@ -742,6 +799,15 @@ def _block_dict(block: Any) -> dict[str, Any]:
     if hasattr(block, "to_dict"):
         return cast(dict[str, Any], block.to_dict())
     return {}
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _approval_memory_key(tool_name: str, tool_args: dict[str, Any]) -> str:
