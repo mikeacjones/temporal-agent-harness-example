@@ -91,9 +91,6 @@ to a local on-disk store (used for local dev).
   Get/Put/Delete/List on the bucket only. No static AWS keys in the cluster.
 - **Key layout** (official `temporalio.contrib.aws.s3driver`):
   `v0/ns/<namespace>/wt/<workflow-type>/wi/<workflow-id>/ri/<run-id>/d/sha256/<hash>`.
-- **Lifecycle**: `deploy/configure-s3-lifecycle.sh` upserts a bucket-wide
-  lifecycle rule that expires all objects after 30 days. This applies to
-  claim-check payloads and artifact bytes stored in the shared S3 bucket.
 - **Purge on close**: deleting a chat purges its payloads via a prefix delete
   on `v0/ns/<namespace>/wt/SimpleChatWorkflow/wi/<workflow-id>/`
   (`web.py` `_forget_conversation` → `purge_workflow_payloads`).
@@ -102,7 +99,7 @@ to a local on-disk store (used for local dev).
 
 | State | Backend | Notes |
 |-------|---------|-------|
-| Claim-check payloads and artifact bytes | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; bucket lifecycle expires objects after 30 days; chat delete purges known prefixes |
+| Claim-check payloads and artifact bytes | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; chat delete purges known prefixes |
 | GitHub/MCP OAuth tokens | DynamoDB (`SIMPLE_CHAT_DYNAMODB_TABLE`, table `…-oauth`) | survives redeploys; SSE-encrypted; accessed via IRSA |
 | Transient OAuth handshake state and local-dev stream/artifact files | local `emptyDir` | ephemeral; lost on restart |
 
