@@ -18,6 +18,7 @@ from .context_manager import (
     DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
     DEFAULT_MAX_CONTEXT_TOKENS,
 )
+from .errors import UserFacingToolError
 from .llm_guards import (
     LlmGuardAction,
     LlmGuardFn,
@@ -465,6 +466,11 @@ class Agent:
                 payload={"error": f"Tool is not available to this agent: {tool_name}"},
                 error=True,
             )
+        if tool_name not in self._tools.tool_names():
+            return ToolResult(
+                payload={"error": f"Unknown tool requested: {tool_name}"},
+                error=True,
+            )
         return await self._tools.execute_tool(
             tool_name,
             kwargs,
@@ -528,9 +534,9 @@ class Agent:
                 tool_call_id=tool_use_id,
                 **tool_input,
             )
-        except Exception as err:
+        except UserFacingToolError as err:
             result = ToolResult(
-                payload={"error": str(err), "type": type(err).__name__},
+                payload=err.to_tool_payload(),
                 error=True,
             )
 

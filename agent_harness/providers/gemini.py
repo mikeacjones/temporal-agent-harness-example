@@ -38,7 +38,7 @@ from ..messages import (
     tool_use_block,
 )
 from ..sliding_window_context_manager import estimate_token_count
-from ..streaming import StreamContext
+from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
 from .interface import AgentProvider, ProviderRequest, ProviderResponse
 
@@ -293,7 +293,8 @@ class _GeminiHeartbeatState:
 
     def payload(self, heartbeat_reason: str) -> dict[str, Any]:
         return {
-            "kind": "gemini_stream",
+            "kind": "agent_stream",
+            "provider": "gemini",
             "heartbeat_reason": heartbeat_reason,
             "sequence": self.sequence,
             "phase": self.phase,
@@ -469,19 +470,13 @@ async def _stream_gemini_message(
     stream_id: str | None,
     stream_sequence: int | None,
 ) -> _GeminiStreamState:
-    stream = StreamContext(stream_id=stream_id, tool_name="gemini")
+    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="gemini")
     stream_state = _GeminiStreamState(sequence=stream_sequence, model=model)
     heartbeat_state = _GeminiHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_gemini_stream(heartbeat_state))
 
-    # The web UI currently consumes this assistant-stream contract under
-    # claude-prefixed event names. Emit the same contract here so this provider
-    # can be dropped in without changing the app.
-    await stream.emit(
-        {"sequence": stream_sequence, "provider": "gemini"},
-        kind="claude_start",
-    )
+    await stream.agent_started(sequence=stream_sequence)
 
     try:
         response_stream = await client.models.generate_content_stream(
@@ -506,10 +501,7 @@ async def _stream_gemini_message(
                     next_chunk_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await next_chunk_task
-                    await stream.emit(
-                        {"sequence": stream_sequence, "provider": "gemini"},
-                        kind="claude_cancelled",
-                    )
+                    await stream.agent_cancelled(sequence=stream_sequence)
                     raise asyncio.CancelledError()
 
                 try:
@@ -534,18 +526,14 @@ async def _stream_gemini_message(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
 
-    await stream.emit(
-        {
-            "id": stream_state.response_id,
-            "model": stream_state.model or model,
-            "sequence": stream_sequence,
-            "provider": "gemini",
-            "stop_reason": stream_state.stop_reason,
-            "stop_details": stream_state.stop_details,
-            "text": "".join(stream_state.text_parts or []),
-            "usage": stream_state.usage or {},
-        },
-        kind="claude_complete",
+    await stream.agent_completed(
+        id=stream_state.response_id,
+        model=stream_state.model or model,
+        sequence=stream_sequence,
+        stop_reason=stream_state.stop_reason,
+        stop_details=stream_state.stop_details,
+        text="".join(stream_state.text_parts or []),
+        usage=stream_state.usage or {},
     )
     heartbeat_state.phase = "complete"
     heartbeat_state.stop_reason = stream_state.stop_reason
@@ -561,7 +549,7 @@ async def _heartbeat_gemini_stream(state: _GeminiHeartbeatState) -> None:
 
 async def _record_gemini_chunk(
     *,
-    stream: StreamContext,
+    stream: AgentStreamWriter,
     chunk: genai_types.GenerateContentResponse,
     state: _GeminiStreamState,
 ) -> None:
@@ -596,40 +584,26 @@ async def _record_gemini_chunk(
 
 async def _record_gemini_part(
     *,
-    stream: StreamContext,
+    stream: AgentStreamWriter,
     part: genai_types.Part,
     state: _GeminiStreamState,
 ) -> None:
     if part.text:
         if part.thought is True:
             if not state.thought_parts:
-                await stream.emit(
-                    {
-                        "sequence": state.sequence,
-                        "provider": "gemini",
-                    },
-                    kind="claude_thinking_start",
+                await stream.thinking_started(
+                    sequence=state.sequence,
+                    content_block_index=0,
                 )
             state.thought_parts.append(part.text)
-            await stream.emit(
-                {
-                    "sequence": state.sequence,
-                    "provider": "gemini",
-                    "thinking": part.text,
-                },
-                kind="claude_thinking_delta",
+            await stream.thinking_delta(
+                sequence=state.sequence,
+                thinking=part.text,
             )
             return
 
         state.text_parts.append(part.text)
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "gemini",
-                "text": part.text,
-            },
-            kind="claude_text_delta",
-        )
+        await stream.text_delta(sequence=state.sequence, text=part.text)
         return
 
     if part.function_call is not None:
@@ -639,29 +613,21 @@ async def _record_gemini_part(
         state.function_calls.append(normalized)
         function_index = len(state.function_calls) - 1
         input_value = _copy_mapping(normalized.get("args", {}))
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "gemini",
-                "content_block_index": function_index,
-                "tool_use_id": _gemini_tool_use_id(normalized, function_index),
-                "tool_name": normalized.get("name"),
-                "tool_type": "function_call",
-            },
-            kind="claude_tool_input_start",
+        await stream.tool_input_started(
+            sequence=state.sequence,
+            content_block_index=function_index,
+            tool_use_id=_gemini_tool_use_id(normalized, function_index),
+            tool_name=normalized.get("name"),
+            tool_type="function_call",
         )
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "gemini",
-                "content_block_index": function_index,
-                "tool_use_id": _gemini_tool_use_id(normalized, function_index),
-                "tool_name": normalized.get("name"),
-                "tool_type": "function_call",
-                "input": input_value,
-                "input_preview": _json_preview(input_value),
-            },
-            kind="claude_tool_input_complete",
+        await stream.tool_input_completed(
+            sequence=state.sequence,
+            content_block_index=function_index,
+            tool_use_id=_gemini_tool_use_id(normalized, function_index),
+            tool_name=normalized.get("name"),
+            tool_type="function_call",
+            input=input_value,
+            input_preview=_json_preview(input_value),
         )
 
 

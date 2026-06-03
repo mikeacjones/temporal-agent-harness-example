@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Awaitable, Protocol
 
 try:
@@ -21,6 +22,18 @@ class StreamEvent:
 class StreamSink(Protocol):
     def emit(self, event: StreamEvent) -> Awaitable[None] | None:
         pass
+
+
+class AgentStreamEventKind(StrEnum):
+    AGENT_START = "agent_start"
+    AGENT_TEXT_DELTA = "agent_text_delta"
+    AGENT_THINKING_START = "agent_thinking_start"
+    AGENT_THINKING_DELTA = "agent_thinking_delta"
+    AGENT_TOOL_INPUT_START = "agent_tool_input_start"
+    AGENT_TOOL_INPUT_DELTA = "agent_tool_input_delta"
+    AGENT_TOOL_INPUT_COMPLETE = "agent_tool_input_complete"
+    AGENT_COMPLETE = "agent_complete"
+    AGENT_CANCELLED = "agent_cancelled"
 
 
 @dataclass
@@ -52,6 +65,170 @@ class StreamContext:
         except Exception:
             if _raise_stream_errors:
                 raise
+
+
+@dataclass
+class AgentStreamWriter:
+    stream: StreamContext
+    provider: str
+
+    @classmethod
+    def for_provider(
+        cls,
+        *,
+        stream_id: str | None,
+        provider: str,
+        step: str | None = None,
+    ) -> "AgentStreamWriter":
+        return cls(
+            stream=StreamContext(
+                stream_id=stream_id,
+                tool_name="agent",
+                step=step,
+            ),
+            provider=provider,
+        )
+
+    async def agent_started(self, *, sequence: int | None) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_START,
+            {"sequence": sequence},
+        )
+
+    async def agent_cancelled(self, *, sequence: int | None) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_CANCELLED,
+            {"sequence": sequence},
+        )
+
+    async def agent_completed(
+        self,
+        *,
+        sequence: int | None,
+        id: str | None,
+        model: str | None,
+        stop_reason: str | None,
+        stop_details: dict[str, Any] | None,
+        text: str,
+        usage: dict[str, Any],
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_COMPLETE,
+            {
+                "id": id,
+                "model": model,
+                "sequence": sequence,
+                "stop_reason": stop_reason,
+                "stop_details": stop_details,
+                "text": text,
+                "usage": usage,
+            },
+        )
+
+    async def text_delta(self, *, sequence: int | None, text: str) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_TEXT_DELTA,
+            {"sequence": sequence, "text": text},
+        )
+
+    async def thinking_started(
+        self,
+        *,
+        sequence: int | None,
+        content_block_index: int,
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_THINKING_START,
+            {
+                "sequence": sequence,
+                "content_block_index": content_block_index,
+            },
+        )
+
+    async def thinking_delta(self, *, sequence: int | None, thinking: str) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_THINKING_DELTA,
+            {"sequence": sequence, "thinking": thinking},
+        )
+
+    async def tool_input_started(
+        self,
+        *,
+        sequence: int | None,
+        content_block_index: int,
+        tool_use_id: str | None,
+        tool_name: str | None,
+        tool_type: str | None,
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_TOOL_INPUT_START,
+            {
+                "sequence": sequence,
+                "content_block_index": content_block_index,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_type": tool_type,
+            },
+        )
+
+    async def tool_input_delta(
+        self,
+        *,
+        sequence: int | None,
+        content_block_index: int,
+        tool_use_id: str | None,
+        tool_name: str | None,
+        tool_type: str | None,
+        partial_json: str,
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA,
+            {
+                "sequence": sequence,
+                "content_block_index": content_block_index,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_type": tool_type,
+                "partial_json": partial_json,
+            },
+        )
+
+    async def tool_input_completed(
+        self,
+        *,
+        sequence: int | None,
+        content_block_index: int,
+        tool_use_id: str | None,
+        tool_name: str | None,
+        tool_type: str | None,
+        input: Any,
+        input_preview: str,
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE,
+            {
+                "sequence": sequence,
+                "content_block_index": content_block_index,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_type": tool_type,
+                "input": input,
+                "input_preview": input_preview,
+            },
+        )
+
+    async def _emit(
+        self,
+        kind: AgentStreamEventKind,
+        payload: dict[str, Any],
+    ) -> None:
+        await self.stream.emit(
+            {
+                "provider": self.provider,
+                **payload,
+            },
+            kind=kind.value,
+        )
 
 
 _stream_sink: StreamSink | None = None

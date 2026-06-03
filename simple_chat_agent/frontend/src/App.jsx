@@ -35,10 +35,11 @@ import {
   emptyArtifactViewer,
   initialState,
 } from "./state/initialState.js";
+import { AgentStreamEventKind } from "./state/streamEvents.js";
 
-const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:";
+const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:v2:";
 const TURN_TRACE_CACHE_LIMIT = 12;
-const STREAM_SESSION_CACHE_PREFIX = "simpleChatStreamSession:";
+const STREAM_SESSION_CACHE_PREFIX = "simpleChatStreamSession:v2:";
 const SETTLED_TRANSCRIPT_REFRESH_DELAYS_MS = [300, 450, 700, 1000, 1400, 2000];
 
 function turnTraceCacheKey(workflowId) {
@@ -105,8 +106,8 @@ function saveCachedStreamSession(workflowId, snapshot) {
       JSON.stringify({
         cursor: snapshot.cursor || "",
         streamTurn: trimCachedStreamTurn(snapshot.streamTurn),
-        currentClaudeSequence: snapshot.currentClaudeSequence ?? null,
-        ignoreClaudeUntilStart: Boolean(snapshot.ignoreClaudeUntilStart),
+        currentAgentSequence: snapshot.currentAgentSequence ?? null,
+        ignoreAgentUntilStart: Boolean(snapshot.ignoreAgentUntilStart),
         updatedAt: new Date().toISOString(),
       }),
     );
@@ -191,8 +192,8 @@ export default function App() {
       saveCachedStreamSession(state.workflowId, {
         cursor: streamCursorRef.current,
         streamTurn: state.streamTurn,
-        currentClaudeSequence: state.currentClaudeSequence,
-        ignoreClaudeUntilStart: state.ignoreClaudeUntilStart,
+        currentAgentSequence: state.currentAgentSequence,
+        ignoreAgentUntilStart: state.ignoreAgentUntilStart,
       });
     } else {
       clearCachedStreamSession(state.workflowId);
@@ -200,8 +201,8 @@ export default function App() {
   }, [
     state.workflowId,
     state.streamTurn,
-    state.currentClaudeSequence,
-    state.ignoreClaudeUntilStart,
+    state.currentAgentSequence,
+    state.ignoreAgentUntilStart,
   ]);
 
   useEffect(() => {
@@ -572,8 +573,8 @@ export default function App() {
       turnTraces: {},
       expandedTraceIndex: null,
       streamPanelCollapsed: false,
-      currentClaudeSequence: null,
-      ignoreClaudeUntilStart: false,
+      currentAgentSequence: null,
+      ignoreAgentUntilStart: false,
       localPending: [],
       composerAttachments: [],
       attachmentUploading: false,
@@ -612,8 +613,8 @@ export default function App() {
       turnTraces: loadCachedTurnTraces(conversation.workflow_id),
       expandedTraceIndex: null,
       streamPanelCollapsed: false,
-      currentClaudeSequence: cachedStreamSession.currentClaudeSequence ?? null,
-      ignoreClaudeUntilStart: Boolean(cachedStreamSession.ignoreClaudeUntilStart),
+      currentAgentSequence: cachedStreamSession.currentAgentSequence ?? null,
+      ignoreAgentUntilStart: Boolean(cachedStreamSession.ignoreAgentUntilStart),
       draftConversation: false,
       draftSystemPrompt: defaultSystemPrompt,
       resolvingApprovals: new Set(),
@@ -859,7 +860,7 @@ export default function App() {
       if (event.lastEventId) streamCursorRef.current = event.lastEventId;
       const streamEvent = JSON.parse(event.data);
       enqueueStreamEvent(workflowId, streamEvent);
-      if (streamEvent.kind === "claude_start") {
+      if (streamEvent.kind === AgentStreamEventKind.AGENT_START) {
         clearWorkflowStateRefresh();
       }
       if (streamEventNeedsSettledTranscriptDelta(streamEvent)) {
@@ -1204,7 +1205,7 @@ export default function App() {
       };
       if (action === "interrupt") {
         next = markStreamInterruptedInState(next);
-        next.ignoreClaudeUntilStart = true;
+        next.ignoreAgentUntilStart = true;
       }
       return next;
     });

@@ -1,3 +1,9 @@
+import {
+  AGENT_STREAM_EVENT_PREFIX,
+  AGENT_TOOL_INPUT_EVENT_PREFIX,
+  AgentStreamEventKind,
+} from "./streamEvents.js";
+
 export function updateWorkflowStateInState(previous, nextWorkflowState) {
   const normalized = normalizeWorkflowState(nextWorkflowState, previous.workflowState);
   const previousAssistantIndexes = assistantTranscriptIndexes(previous.workflowState);
@@ -387,11 +393,11 @@ export function handleStreamEventInState(previous, event) {
     ...previous,
     streamTurn: cloneStreamTurn(previous.streamTurn),
   };
-  const sequence = claudePayloadSequence(event);
+  const sequence = agentPayloadSequence(event);
 
-  if (event.kind === "claude_start") {
-    next.currentClaudeSequence = sequence;
-    next.ignoreClaudeUntilStart = false;
+  if (event.kind === AgentStreamEventKind.AGENT_START) {
+    next.currentAgentSequence = sequence;
+    next.ignoreAgentUntilStart = false;
     if (next.workflowState) {
       next.workflowState = { ...next.workflowState, status: "responding" };
     }
@@ -401,41 +407,44 @@ export function handleStreamEventInState(previous, event) {
     agentSegment.status = "streaming";
     turn.status = "streaming";
     turn.activeSequence = sequence;
-  } else if (event.kind === "claude_text_delta" && event.payload?.text) {
-    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeClaudeSequence(next, sequence);
-    adoptClaudeSequence(next, activeSequence);
+  } else if (event.kind === AgentStreamEventKind.AGENT_TEXT_DELTA && event.payload?.text) {
+    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeAgentSequence(next, sequence);
+    adoptAgentSequence(next, activeSequence);
     const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
     agentSegment.status = "streaming";
     agentSegment.text += event.payload.text;
     next.streamTurn.status = "streaming";
-  } else if (event.kind === "claude_thinking_start") {
-    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeClaudeSequence(next, sequence);
-    adoptClaudeSequence(next, activeSequence);
+  } else if (event.kind === AgentStreamEventKind.AGENT_THINKING_START) {
+    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeAgentSequence(next, sequence);
+    adoptAgentSequence(next, activeSequence);
     const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
     agentSegment.status = "streaming";
     next.streamTurn.status = "streaming";
-  } else if (event.kind === "claude_thinking_delta" && event.payload?.thinking) {
-    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeClaudeSequence(next, sequence);
-    adoptClaudeSequence(next, activeSequence);
+  } else if (
+    event.kind === AgentStreamEventKind.AGENT_THINKING_DELTA &&
+    event.payload?.thinking
+  ) {
+    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeAgentSequence(next, sequence);
+    adoptAgentSequence(next, activeSequence);
     const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
     agentSegment.status = "streaming";
     agentSegment.thinking += event.payload.thinking;
     next.streamTurn.status = "streaming";
-  } else if (event.kind === "claude_cancelled") {
-    if (shouldApplyClaudeStreamEvent(next, sequence)) {
+  } else if (event.kind === AgentStreamEventKind.AGENT_CANCELLED) {
+    if (shouldApplyAgentStreamEvent(next, sequence)) {
       return {
         ...markStreamInterruptedInState(next),
-        ignoreClaudeUntilStart: true,
+        ignoreAgentUntilStart: true,
       };
     }
-  } else if (event.kind === "claude_complete") {
-    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeClaudeSequence(next, sequence);
-    adoptClaudeSequence(next, activeSequence);
-    const terminal = isTerminalClaudeStop(event.payload || {});
+  } else if (event.kind === AgentStreamEventKind.AGENT_COMPLETE) {
+    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeAgentSequence(next, sequence);
+    adoptAgentSequence(next, activeSequence);
+    const terminal = isTerminalAgentStop(event.payload || {});
     const turn =
       streamTurnForSequence(next.streamTurn, activeSequence) ||
       ensureStreamTurn(next, activeSequence);
@@ -449,19 +458,19 @@ export function handleStreamEventInState(previous, event) {
       ensureToolSegment(turn, activeSequence);
       turn.status = "tooling";
     }
-    turn.lastClaudeCompletedAt = new Date().toISOString();
-  } else if (isClaudeToolEvent(event)) {
-    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeClaudeSequence(next, sequence);
-    adoptClaudeSequence(next, activeSequence);
+    turn.lastAgentCompletedAt = new Date().toISOString();
+  } else if (isAgentToolInputEvent(event)) {
+    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeAgentSequence(next, sequence);
+    adoptAgentSequence(next, activeSequence);
     const turn = ensureStreamTurn(next, activeSequence);
     appendStreamToolEvent(turn, event, activeSequence);
     if (turn.status !== "complete" && turn.status !== "interrupted") {
       turn.status = "tooling";
     }
-  } else if (!event.kind?.startsWith("claude_")) {
-    const turn = ensureStreamTurn(next, next.currentClaudeSequence);
-    appendStreamToolEvent(turn, event, next.currentClaudeSequence);
+  } else if (!event.kind?.startsWith(AGENT_STREAM_EVENT_PREFIX)) {
+    const turn = ensureStreamTurn(next, next.currentAgentSequence);
+    appendStreamToolEvent(turn, event, next.currentAgentSequence);
     if (turn.status !== "complete" && turn.status !== "interrupted") {
       turn.status = "tooling";
     }
@@ -469,34 +478,40 @@ export function handleStreamEventInState(previous, event) {
   return next;
 }
 
-function claudePayloadSequence(event) {
+function agentPayloadSequence(event) {
   const sequence = event.payload?.sequence;
   return sequence === undefined ? null : sequence;
 }
 
-function activeClaudeSequence(state, eventSequence) {
-  return eventSequence ?? state.currentClaudeSequence ?? state.streamTurn?.activeSequence ?? null;
+function activeAgentSequence(state, eventSequence) {
+  return eventSequence ?? state.currentAgentSequence ?? state.streamTurn?.activeSequence ?? null;
 }
 
-function adoptClaudeSequence(state, sequence) {
-  if (state.currentClaudeSequence !== null && state.currentClaudeSequence !== undefined) return;
+function adoptAgentSequence(state, sequence) {
+  if (state.currentAgentSequence !== null && state.currentAgentSequence !== undefined) return;
   if (sequence === null || sequence === undefined) return;
-  state.currentClaudeSequence = sequence;
+  state.currentAgentSequence = sequence;
 }
 
-function shouldApplyClaudeStreamEvent(state, eventSequence) {
-  if (state.ignoreClaudeUntilStart) return false;
-  if (state.currentClaudeSequence === null || state.currentClaudeSequence === undefined) return true;
+function shouldApplyAgentStreamEvent(state, eventSequence) {
+  if (state.ignoreAgentUntilStart) return false;
+  if (state.currentAgentSequence === null || state.currentAgentSequence === undefined) return true;
   if (eventSequence === null || eventSequence === undefined) return true;
-  return eventSequence === state.currentClaudeSequence;
+  return eventSequence === state.currentAgentSequence;
 }
 
 export function streamEventNeedsSettledTranscriptDelta(event) {
-  return event.kind === "claude_complete" && isTerminalClaudeStop(event.payload || {});
+  return (
+    event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+    isTerminalAgentStop(event.payload || {})
+  );
 }
 
 export function streamEventNeedsWorkflowStateRefresh(event) {
-  return event.kind === "claude_complete" && event.payload?.stop_reason === "tool_use";
+  return (
+    event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+    event.payload?.stop_reason === "tool_use"
+  );
 }
 
 function applyWorkflowProjectionEventInState(previous, event) {
@@ -604,7 +619,7 @@ function createStreamTurn(sequence) {
     segments: [],
     startedAt: new Date().toISOString(),
     completedAt: null,
-    lastClaudeCompletedAt: null,
+    lastAgentCompletedAt: null,
     interrupted: false,
   };
 }
@@ -700,8 +715,8 @@ function appendStreamToolEvent(turn, event, sequence) {
   toolSegment.events = mergeStreamToolEvent(toolSegment.events || [], event);
 }
 
-function isClaudeToolEvent(event) {
-  return event.kind?.startsWith("claude_tool_input_");
+function isAgentToolInputEvent(event) {
+  return event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX);
 }
 
 function mergeStreamToolEvent(events, event) {
@@ -713,7 +728,7 @@ function mergeStreamToolEvent(events, event) {
     return mergePythonSandboxProgressEvent(events, event).slice(-5);
   }
 
-  if (!event.kind?.startsWith("claude_tool_input_")) {
+  if (!event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX)) {
     return [...events, event].slice(-5);
   }
 
@@ -721,7 +736,7 @@ function mergeStreamToolEvent(events, event) {
   const nextEvents = [...events];
   const existingIndex = nextEvents.findIndex(
     (candidate) =>
-      candidate.kind?.startsWith("claude_tool_input_") &&
+      candidate.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX) &&
       streamToolInputKey(candidate) === key,
   );
   const existing = existingIndex >= 0 ? nextEvents[existingIndex] : null;
@@ -816,10 +831,10 @@ function mergeToolInputEvent(existing, event, key) {
   const nextPayload = { ...existingPayload, ...payload };
   const existingPartial = String(existingPayload.input_partial || "");
 
-  if (event.kind === "claude_tool_input_delta") {
+  if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA) {
     nextPayload.input_partial = existingPartial + String(payload.partial_json || "");
     nextPayload.status = "streaming input";
-  } else if (event.kind === "claude_tool_input_complete") {
+  } else if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) {
     nextPayload.input_partial = existingPartial;
     nextPayload.status = "input complete";
   } else {
@@ -859,8 +874,8 @@ function markStreamCommittedInState(state, options = {}) {
     ...state,
     turnTraces,
     streamTurn: null,
-    currentClaudeSequence: null,
-    ignoreClaudeUntilStart: false,
+    currentAgentSequence: null,
+    ignoreAgentUntilStart: false,
   };
 }
 
@@ -899,8 +914,8 @@ function turnTracesFromStreamEvents(events, workflowState) {
     localPending: [],
     resolvingApprovals: new Set(),
     streamTurn: null,
-    currentClaudeSequence: null,
-    ignoreClaudeUntilStart: false,
+    currentAgentSequence: null,
+    ignoreAgentUntilStart: false,
     turnTraces: {},
   };
   const completedTurns = [];
@@ -908,16 +923,16 @@ function turnTracesFromStreamEvents(events, workflowState) {
   for (const event of events) {
     replayState = handleStreamEventInState(replayState, event);
     if (
-      event.kind === "claude_complete" &&
-      isTerminalClaudeStop(event.payload || {}) &&
+      event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+      isTerminalAgentStop(event.payload || {}) &&
       replayState.streamTurn
     ) {
       completedTurns.push(trimTraceTurn(cloneStreamTurn(replayState.streamTurn)));
       replayState = {
         ...replayState,
         streamTurn: null,
-        currentClaudeSequence: null,
-        ignoreClaudeUntilStart: false,
+        currentAgentSequence: null,
+        ignoreAgentUntilStart: false,
       };
     }
   }
@@ -987,7 +1002,7 @@ export function markStreamInterruptedInState(state) {
   return {
     ...state,
     streamTurn: null,
-    currentClaudeSequence: null,
+    currentAgentSequence: null,
   };
 }
 
@@ -998,7 +1013,7 @@ function hasLiveWorkflowActivity(state, workflowState = state.workflowState) {
   return state.localPending.length > 0;
 }
 
-function isTerminalClaudeStop(payload) {
+function isTerminalAgentStop(payload) {
   return payload.stop_reason && payload.stop_reason !== "tool_use";
 }
 

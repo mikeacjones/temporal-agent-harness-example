@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         DEFAULT_MAX_CONTEXT_TOKENS,
         ContextSnapshot,
     )
+    from agent_harness.errors import UserFacingAgentError
     from agent_harness.mcp_types import HttpMcpServerConfig
     from agent_harness.messages import (
         CONTEXT_COMPACTION_MARKER,
@@ -687,8 +688,8 @@ class SimpleChatWorkflow:
                         )
                 self._agent_context_state = await self._agent.compacted_state()
                 self._record_latest_rendered_message_change()
-            except Exception as err:
-                self._record_system_message(f"{type(err).__name__}: {err}")
+            except UserFacingAgentError as err:
+                self._record_system_message(err.message)
             finally:
                 self._active_message_index = None
                 self._active_message = None

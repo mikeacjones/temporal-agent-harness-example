@@ -35,7 +35,7 @@ from ..messages import (
     tool_use_block,
 )
 from ..sliding_window_context_manager import estimate_token_count
-from ..streaming import StreamContext
+from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
 from .interface import AgentProvider, ProviderRequest, ProviderResponse
 
@@ -290,7 +290,8 @@ class _ChatGPTHeartbeatState:
 
     def payload(self, heartbeat_reason: str) -> dict[str, Any]:
         return {
-            "kind": "chatgpt_stream",
+            "kind": "agent_stream",
+            "provider": "chatgpt",
             "heartbeat_reason": heartbeat_reason,
             "sequence": self.sequence,
             "phase": self.phase,
@@ -450,19 +451,13 @@ async def _stream_chatgpt_response(
     stream_id: str | None,
     stream_sequence: int | None,
 ) -> _ChatGPTStreamState:
-    stream = StreamContext(stream_id=stream_id, tool_name="chatgpt")
+    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="chatgpt")
     stream_state = _ChatGPTStreamState(sequence=stream_sequence)
     heartbeat_state = _ChatGPTHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_chatgpt_stream(heartbeat_state))
 
-    # The web UI currently consumes this assistant-stream contract under
-    # claude-prefixed event names. Emit the same contract here so this provider
-    # can be dropped in without changing the app.
-    await stream.emit(
-        {"sequence": stream_sequence, "provider": "chatgpt"},
-        kind="claude_start",
-    )
+    await stream.agent_started(sequence=stream_sequence)
 
     try:
         response_stream = await client.responses.create(**create_params)
@@ -484,10 +479,7 @@ async def _stream_chatgpt_response(
                     next_event_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await next_event_task
-                    await stream.emit(
-                        {"sequence": stream_sequence, "provider": "chatgpt"},
-                        kind="claude_cancelled",
-                    )
+                    await stream.agent_cancelled(sequence=stream_sequence)
                     raise asyncio.CancelledError()
 
                 try:
@@ -513,18 +505,14 @@ async def _stream_chatgpt_response(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
 
-    await stream.emit(
-        {
-            "id": stream_state.response_id,
-            "model": stream_state.model,
-            "sequence": stream_sequence,
-            "provider": "chatgpt",
-            "stop_reason": stream_state.stop_reason,
-            "stop_details": stream_state.stop_details,
-            "text": "".join(stream_state.text_parts or []),
-            "usage": stream_state.usage or {},
-        },
-        kind="claude_complete",
+    await stream.agent_completed(
+        id=stream_state.response_id,
+        model=stream_state.model,
+        sequence=stream_sequence,
+        stop_reason=stream_state.stop_reason,
+        stop_details=stream_state.stop_details,
+        text="".join(stream_state.text_parts or []),
+        usage=stream_state.usage or {},
     )
     heartbeat_state.phase = "complete"
     heartbeat_state.stop_reason = stream_state.stop_reason
@@ -540,7 +528,7 @@ async def _heartbeat_chatgpt_stream(state: _ChatGPTHeartbeatState) -> None:
 
 async def _record_chatgpt_stream_event(
     *,
-    stream: StreamContext,
+    stream: AgentStreamWriter,
     event: Any,
     state: _ChatGPTStreamState,
     tool_input_blocks: dict[str, _ToolInputStreamState],
@@ -550,28 +538,14 @@ async def _record_chatgpt_stream_event(
         text = cast(str | None, getattr(event, "delta", None))
         if text:
             state.text_parts.append(text)
-            await stream.emit(
-                {
-                    "sequence": state.sequence,
-                    "provider": "chatgpt",
-                    "text": text,
-                },
-                kind="claude_text_delta",
-            )
+            await stream.text_delta(sequence=state.sequence, text=text)
         return
 
     if event_type == "response.refusal.delta":
         text = cast(str | None, getattr(event, "delta", None))
         if text:
             state.text_parts.append(text)
-            await stream.emit(
-                {
-                    "sequence": state.sequence,
-                    "provider": "chatgpt",
-                    "text": text,
-                },
-                kind="claude_text_delta",
-            )
+            await stream.text_delta(sequence=state.sequence, text=text)
         return
 
     if event_type in (
@@ -581,19 +555,12 @@ async def _record_chatgpt_stream_event(
         thinking = cast(str | None, getattr(event, "delta", None))
         if thinking:
             if not state.reasoning_parts:
-                await stream.emit(
-                    {"sequence": state.sequence, "provider": "chatgpt"},
-                    kind="claude_thinking_start",
+                await stream.thinking_started(
+                    sequence=state.sequence,
+                    content_block_index=0,
                 )
             state.reasoning_parts.append(thinking)
-            await stream.emit(
-                {
-                    "sequence": state.sequence,
-                    "provider": "chatgpt",
-                    "thinking": thinking,
-                },
-                kind="claude_thinking_delta",
-            )
+            await stream.thinking_delta(sequence=state.sequence, thinking=thinking)
         return
 
     if event_type == "response.output_item.added":
@@ -612,16 +579,12 @@ async def _record_chatgpt_stream_event(
         )
         tool_input_blocks[state_key] = tool_state
         tool_input_blocks[str(output_index)] = tool_state
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "chatgpt",
-                "content_block_index": output_index,
-                "tool_use_id": tool_state.tool_use_id,
-                "tool_name": tool_state.tool_name,
-                "tool_type": "function_call",
-            },
-            kind="claude_tool_input_start",
+        await stream.tool_input_started(
+            sequence=state.sequence,
+            content_block_index=output_index,
+            tool_use_id=tool_state.tool_use_id,
+            tool_name=tool_state.tool_name,
+            tool_type="function_call",
         )
         return
 
@@ -638,17 +601,13 @@ async def _record_chatgpt_stream_event(
         if not partial_json:
             return
         tool_state.partial_json += partial_json
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "chatgpt",
-                "content_block_index": tool_state.output_index,
-                "tool_use_id": tool_state.tool_use_id,
-                "tool_name": tool_state.tool_name,
-                "tool_type": "function_call",
-                "partial_json": partial_json,
-            },
-            kind="claude_tool_input_delta",
+        await stream.tool_input_delta(
+            sequence=state.sequence,
+            content_block_index=tool_state.output_index,
+            tool_use_id=tool_state.tool_use_id,
+            tool_name=tool_state.tool_name,
+            tool_type="function_call",
+            partial_json=partial_json,
         )
         return
 
@@ -669,18 +628,14 @@ async def _record_chatgpt_stream_event(
         if arguments is not None:
             tool_state.partial_json = arguments
         input_value = _json_object(tool_state.partial_json)
-        await stream.emit(
-            {
-                "sequence": state.sequence,
-                "provider": "chatgpt",
-                "content_block_index": tool_state.output_index,
-                "tool_use_id": tool_state.tool_use_id,
-                "tool_name": tool_state.tool_name,
-                "tool_type": "function_call",
-                "input": input_value,
-                "input_preview": _json_preview(input_value),
-            },
-            kind="claude_tool_input_complete",
+        await stream.tool_input_completed(
+            sequence=state.sequence,
+            content_block_index=tool_state.output_index,
+            tool_use_id=tool_state.tool_use_id,
+            tool_name=tool_state.tool_name,
+            tool_type="function_call",
+            input=input_value,
+            input_preview=_json_preview(input_value),
         )
         return
 

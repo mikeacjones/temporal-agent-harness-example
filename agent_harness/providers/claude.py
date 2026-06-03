@@ -38,7 +38,7 @@ from ..messages import (
     tool_use_block,
 )
 from ..sliding_window_context_manager import estimate_token_count
-from ..streaming import StreamContext
+from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
 from .interface import AgentProvider, ProviderRequest, ProviderResponse
 
@@ -393,11 +393,11 @@ async def _stream_claude_message(
     stream_id: str | None,
     stream_sequence: int | None,
 ) -> Any:
-    stream = StreamContext(stream_id=stream_id, tool_name="claude")
+    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="claude")
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))
-    await stream.emit({"sequence": stream_sequence}, kind="claude_start")
+    await stream.agent_started(sequence=stream_sequence)
 
     try:
         async with client.messages.stream(
@@ -422,10 +422,7 @@ async def _stream_claude_message(
                         next_event_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await next_event_task
-                        await stream.emit(
-                            {"sequence": stream_sequence},
-                            kind="claude_cancelled",
-                        )
+                        await stream.agent_cancelled(sequence=stream_sequence)
                         raise asyncio.CancelledError()
 
                     try:
@@ -452,25 +449,19 @@ async def _stream_claude_message(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
 
-    await stream.emit(
-        {
-            "id": response.id,
-            "model": response.model,
-            "sequence": stream_sequence,
-            "stop_reason": response.stop_reason,
-            "stop_details": _optional_object_to_dict(
-                getattr(response, "stop_details", None)
-            ),
-            "text": _response_display_text(
-                response.stop_reason,
-                response.content,
-                stop_details=_optional_object_to_dict(
-                    getattr(response, "stop_details", None)
-                ),
-            ),
-            "usage": response.usage.to_dict(),
-        },
-        kind="claude_complete",
+    stop_details = _optional_object_to_dict(getattr(response, "stop_details", None))
+    await stream.agent_completed(
+        id=response.id,
+        model=response.model,
+        sequence=stream_sequence,
+        stop_reason=response.stop_reason,
+        stop_details=stop_details,
+        text=_response_display_text(
+            response.stop_reason,
+            response.content,
+            stop_details=stop_details,
+        ),
+        usage=response.usage.to_dict(),
     )
     heartbeat_state.phase = "complete"
     heartbeat_state.stop_reason = cast(str | None, response.stop_reason)
@@ -492,7 +483,8 @@ class _ClaudeHeartbeatState:
 
     def payload(self, heartbeat_reason: str) -> dict[str, Any]:
         return {
-            "kind": "claude_stream",
+            "kind": "agent_stream",
+            "provider": "claude",
             "heartbeat_reason": heartbeat_reason,
             "sequence": self.sequence,
             "phase": self.phase,
@@ -516,7 +508,7 @@ def _streaming_extra_headers(create_params: dict[str, Any]) -> dict[str, str] | 
 
 async def _emit_claude_raw_stream_event(
     *,
-    stream: StreamContext,
+    stream: AgentStreamWriter,
     event: Any,
     stream_sequence: int | None,
     tool_input_blocks: dict[int, _ToolInputStreamState],
@@ -528,12 +520,9 @@ async def _emit_claude_raw_stream_event(
         block = _object_to_dict(getattr(event, "content_block", None))
         block_type = block.get("type")
         if block_type == "thinking":
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                },
-                kind="claude_thinking_start",
+            await stream.thinking_started(
+                sequence=stream_sequence,
+                content_block_index=block_index,
             )
             return
 
@@ -545,15 +534,12 @@ async def _emit_claude_raw_stream_event(
                 tool_type=cast(str | None, block_type),
             )
             tool_input_blocks[block_index] = state
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                    "tool_use_id": state.tool_use_id,
-                    "tool_name": state.tool_name,
-                    "tool_type": state.tool_type,
-                },
-                kind="claude_tool_input_start",
+            await stream.tool_input_started(
+                sequence=stream_sequence,
+                content_block_index=block_index,
+                tool_use_id=state.tool_use_id,
+                tool_name=state.tool_name,
+                tool_type=state.tool_type,
             )
         return
 
@@ -563,27 +549,21 @@ async def _emit_claude_raw_stream_event(
         if delta_type == "text_delta":
             text = delta.get("text")
             if isinstance(text, str) and text:
-                await stream.emit(
-                    {"sequence": stream_sequence, "text": text},
-                    kind="claude_text_delta",
-                )
+                await stream.text_delta(sequence=stream_sequence, text=text)
             return
 
         if delta_type == "refusal_delta":
             text = delta.get("refusal")
             if isinstance(text, str) and text:
-                await stream.emit(
-                    {"sequence": stream_sequence, "text": text},
-                    kind="claude_text_delta",
-                )
+                await stream.text_delta(sequence=stream_sequence, text=text)
             return
 
         if delta_type == "thinking_delta":
             thinking = delta.get("thinking")
             if isinstance(thinking, str) and thinking:
-                await stream.emit(
-                    {"sequence": stream_sequence, "thinking": thinking},
-                    kind="claude_thinking_delta",
+                await stream.thinking_delta(
+                    sequence=stream_sequence,
+                    thinking=thinking,
                 )
             return
 
@@ -595,16 +575,13 @@ async def _emit_claude_raw_stream_event(
                 return
 
             state.partial_json += partial_json
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                    "tool_use_id": state.tool_use_id,
-                    "tool_name": state.tool_name,
-                    "tool_type": state.tool_type,
-                    "partial_json": partial_json,
-                },
-                kind="claude_tool_input_delta",
+            await stream.tool_input_delta(
+                sequence=stream_sequence,
+                content_block_index=block_index,
+                tool_use_id=state.tool_use_id,
+                tool_name=state.tool_name,
+                tool_type=state.tool_type,
+                partial_json=partial_json,
             )
         return
 
@@ -616,17 +593,14 @@ async def _emit_claude_raw_stream_event(
 
         block = _object_to_dict(getattr(event, "content_block", None))
         input_value = block.get("input", state.partial_json)
-        await stream.emit(
-            {
-                "sequence": stream_sequence,
-                "content_block_index": block_index,
-                "tool_use_id": state.tool_use_id,
-                "tool_name": state.tool_name,
-                "tool_type": state.tool_type,
-                "input": input_value,
-                "input_preview": _json_preview(input_value),
-            },
-            kind="claude_tool_input_complete",
+        await stream.tool_input_completed(
+            sequence=stream_sequence,
+            content_block_index=block_index,
+            tool_use_id=state.tool_use_id,
+            tool_name=state.tool_name,
+            tool_type=state.tool_type,
+            input=input_value,
+            input_preview=_json_preview(input_value),
         )
 
 

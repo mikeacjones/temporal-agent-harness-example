@@ -159,6 +159,14 @@ Read-only tools usually do not need this. Tools that call arbitrary user code or
 third-party APIs without an idempotency primitive should say so in their tool
 description or use a conservative retry policy.
 
+## Tool Failure Semantics
+
+Expected tool failures should be returned as data, either by returning
+`ToolResult(payload={...}, error=True)` or by raising `UserFacingToolError`.
+Unexpected exceptions are treated as bugs and are allowed to propagate so
+Temporal can surface them during replay/retry instead of hiding them in model
+context.
+
 ## Registration
 
 Tools and guards are defined with decorators and then added to a `ToolSet`. Standalone functions can be registered directly:
