@@ -3,89 +3,24 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Protocol, cast
+from typing import Any, Mapping, cast
 
-from anthropic.types import MessageParam, ToolResultBlockParam
-
-ContextSnapshot = dict[str, Any]
-DEFAULT_MAX_CONTEXT_TOKENS = 200_000
-DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 4_000
-DEFAULT_CHARS_PER_TOKEN = 4.0
-
-
-class ContextManager(Protocol):
-    async def initialize(self, user_prompt: str) -> None:
-        pass
-
-    async def record_user_message(self, user_prompt: str) -> None:
-        pass
-
-    def restore(self, snapshot: ContextSnapshot) -> None:
-        pass
-
-    def snapshot(self) -> ContextSnapshot:
-        pass
-
-    async def messages_for_model(
-        self,
-        token_budget: ContextTokenBudget | None = None,
-    ) -> list[MessageParam]:
-        pass
-
-    async def full_messages(self) -> list[dict[str, Any]]:
-        pass
-
-    async def replace_messages(self, messages: list[dict[str, Any]]) -> None:
-        pass
-
-    def message_count(self) -> int:
-        pass
-
-    async def record_assistant_message(self, message: MessageParam) -> None:
-        pass
-
-    async def record_tool_results(
-        self, tool_results: list[ToolResultBlockParam]
-    ) -> None:
-        pass
-
-
-ContextManagerFactory = Callable[[], ContextManager]
-
-
-@dataclass(frozen=True)
-class ContextTokenBudget:
-    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
-    reserved_output_tokens: int = 4_096
-    reserved_input_tokens: int = 0
-    safety_margin_tokens: int = DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
-    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN
-
-    def __post_init__(self) -> None:
-        if self.max_context_tokens < 1:
-            raise ValueError("max_context_tokens must be at least 1")
-        if self.reserved_output_tokens < 0:
-            raise ValueError("reserved_output_tokens cannot be negative")
-        if self.reserved_input_tokens < 0:
-            raise ValueError("reserved_input_tokens cannot be negative")
-        if self.safety_margin_tokens < 0:
-            raise ValueError("safety_margin_tokens cannot be negative")
-        if self.chars_per_token <= 0:
-            raise ValueError("chars_per_token must be greater than 0")
-        if self.input_token_budget < 1:
-            raise ValueError(
-                "Context token budget leaves no room for messages; reduce "
-                "max_tokens, reserved input, or safety margin"
-            )
-
-    @property
-    def input_token_budget(self) -> int:
-        return (
-            self.max_context_tokens
-            - self.reserved_output_tokens
-            - self.reserved_input_tokens
-            - self.safety_margin_tokens
-        )
+from .attachments import AttachmentRef, attachment_manifest_text
+from .context_manager import (
+    ContextSnapshot,
+    ContextTokenBudget,
+    DEFAULT_CHARS_PER_TOKEN,
+)
+from .messages import (
+    AgentBlock,
+    AgentMessage,
+    AgentRole,
+    ToolResultBlock,
+    block_to_dict,
+    message,
+    normalize_message,
+    text_block,
+)
 
 
 @dataclass
@@ -98,7 +33,7 @@ class SlidingWindowContextManager:
     # the most recent one (the old aggressive behavior).
     clear_old_tool_results: bool = False
     max_tool_result_chars: int | None = None
-    _messages: list[MessageParam] = field(default_factory=list, init=False)
+    _messages: list[AgentMessage] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         if self.max_recent_messages < 2:
@@ -109,16 +44,26 @@ class SlidingWindowContextManager:
         ):
             raise ValueError("max_tool_result_chars must be at least 1")
 
-    async def initialize(self, user_prompt: str) -> None:
+    async def initialize(
+        self,
+        user_prompt: str,
+        attachments: list[AttachmentRef] | None = None,
+    ) -> None:
         self._messages = []
-        await self.record_user_message(user_prompt)
+        await self.record_user_message(user_prompt, attachments=attachments)
 
-    async def record_user_message(self, user_prompt: str) -> None:
-        self._messages.append(MessageParam(role="user", content=user_prompt))
+    async def record_user_message(
+        self,
+        user_prompt: str,
+        attachments: list[AttachmentRef] | None = None,
+    ) -> None:
+        self._messages.append(
+            message("user", _user_message_content(user_prompt, attachments or []))
+        )
 
     def restore(self, snapshot: ContextSnapshot) -> None:
         version = snapshot.get("version")
-        if version != 1:
+        if version != 2:
             raise ValueError(f"Unsupported context snapshot version: {version}")
 
         messages = snapshot.get("messages")
@@ -129,14 +74,14 @@ class SlidingWindowContextManager:
 
     def snapshot(self) -> ContextSnapshot:
         return {
-            "version": 1,
+            "version": 2,
             "messages": [_message_to_snapshot(message) for message in self._messages],
         }
 
     async def messages_for_model(
         self,
         token_budget: ContextTokenBudget | None = None,
-    ) -> list[MessageParam]:
+    ) -> list[AgentMessage]:
         selected = self._selected_messages()
         latest_tool_result_index = _latest_tool_result_index(selected)
         messages = [
@@ -175,20 +120,22 @@ class SlidingWindowContextManager:
     def message_count(self) -> int:
         return len(self._messages)
 
-    async def record_assistant_message(self, message: MessageParam) -> None:
+    async def record_assistant_message(self, message: AgentMessage) -> None:
         self._messages.append(_normalize_message(message))
 
     async def record_tool_results(
-        self, tool_results: list[ToolResultBlockParam]
+        self, tool_results: list[ToolResultBlock]
     ) -> None:
         if not tool_results:
             return
 
         self._messages.append(
-            _normalize_message(MessageParam(role="user", content=tool_results))
+            _normalize_message(
+                message("user", [block_to_dict(block) for block in tool_results])
+            )
         )
 
-    def _selected_messages(self) -> list[MessageParam]:
+    def _selected_messages(self) -> list[AgentMessage]:
         if len(self._messages) <= self.max_recent_messages:
             return _drop_incomplete_tool_exchanges(self._messages)
 
@@ -202,9 +149,9 @@ class SlidingWindowContextManager:
 
 
 def _drop_incomplete_tool_exchanges(
-    messages: list[MessageParam],
-) -> list[MessageParam]:
-    selected: list[MessageParam] = []
+    messages: list[AgentMessage],
+) -> list[AgentMessage]:
+    selected: list[AgentMessage] = []
     index = 0
 
     while index < len(messages):
@@ -238,23 +185,38 @@ def _drop_incomplete_tool_exchanges(
     return selected
 
 
+def _user_message_content(
+    user_prompt: str,
+    attachments: list[AttachmentRef],
+) -> str | list[AgentBlock]:
+    manifest = attachment_manifest_text(attachments)
+    if not manifest:
+        return user_prompt
+
+    blocks: list[AgentBlock] = []
+    if user_prompt:
+        blocks.append(text_block(user_prompt))
+    blocks.append(text_block(manifest))
+    return blocks
+
+
 def _has_tool_results_for(
-    message: MessageParam,
+    message: AgentMessage,
     tool_use_ids: set[str],
 ) -> bool:
     return tool_use_ids.issubset(_tool_result_ids(message))
 
 
-def _tool_use_ids(message: MessageParam) -> set[str]:
+def _tool_use_ids(message: AgentMessage) -> set[str]:
     return _block_ids(message, "tool_use", "id")
 
 
-def _tool_result_ids(message: MessageParam) -> set[str]:
+def _tool_result_ids(message: AgentMessage) -> set[str]:
     return _block_ids(message, "tool_result", "tool_use_id")
 
 
 def _block_ids(
-    message: MessageParam,
+    message: AgentMessage,
     block_type: str,
     id_key: str,
 ) -> set[str]:
@@ -273,7 +235,7 @@ def _block_ids(
     return ids
 
 
-def _without_tool_use_blocks(message: MessageParam) -> MessageParam | None:
+def _without_tool_use_blocks(message: AgentMessage) -> AgentMessage | None:
     content = message["content"]
     if isinstance(content, str):
         return message
@@ -286,10 +248,10 @@ def _without_tool_use_blocks(message: MessageParam) -> MessageParam | None:
     if not blocks:
         return None
 
-    return MessageParam(role=message["role"], content=blocks)
+    return _message_for_role(message, blocks)
 
 
-def _latest_tool_result_index(messages: list[MessageParam]) -> int | None:
+def _latest_tool_result_index(messages: list[AgentMessage]) -> int | None:
     for index in range(len(messages) - 1, -1, -1):
         if _message_has_block_type(messages[index], "tool_result"):
             return index
@@ -298,16 +260,16 @@ def _latest_tool_result_index(messages: list[MessageParam]) -> int | None:
 
 
 def _fit_messages_to_token_budget(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
     token_budget: ContextTokenBudget,
     *,
     preserve_first_message: bool,
-) -> list[MessageParam]:
+) -> list[AgentMessage]:
     if _estimated_tokens(messages, token_budget) <= token_budget.input_token_budget:
         return messages
 
     groups = _message_groups(messages)
-    prefix: list[list[MessageParam]] = []
+    prefix: list[list[AgentMessage]] = []
     if preserve_first_message and groups:
         prefix = [groups.pop(0)]
 
@@ -325,8 +287,8 @@ def _fit_messages_to_token_budget(
     return _truncate_text_to_budget(compacted, token_budget)
 
 
-def _message_groups(messages: list[MessageParam]) -> list[list[MessageParam]]:
-    groups: list[list[MessageParam]] = []
+def _message_groups(messages: list[AgentMessage]) -> list[list[AgentMessage]]:
+    groups: list[list[AgentMessage]] = []
     index = 0
 
     while index < len(messages):
@@ -346,15 +308,15 @@ def _message_groups(messages: list[MessageParam]) -> list[list[MessageParam]]:
 
 
 def _flatten_message_groups(
-    groups: list[list[MessageParam]],
-) -> list[MessageParam]:
+    groups: list[list[AgentMessage]],
+) -> list[AgentMessage]:
     return [message for group in groups for message in group]
 
 
 def _truncate_tool_results_to_budget(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
     token_budget: ContextTokenBudget,
-) -> list[MessageParam]:
+) -> list[AgentMessage]:
     compacted = [_normalize_message(message) for message in messages]
 
     while _estimated_tokens(compacted, token_budget) > token_budget.input_token_budget:
@@ -386,9 +348,9 @@ def _truncate_tool_results_to_budget(
 
 
 def _truncate_text_to_budget(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
     token_budget: ContextTokenBudget,
-) -> list[MessageParam]:
+) -> list[AgentMessage]:
     compacted = [_normalize_message(message) for message in messages]
 
     while _estimated_tokens(compacted, token_budget) > token_budget.input_token_budget:
@@ -415,9 +377,9 @@ def _truncate_text_to_budget(
             return compacted
 
         if block_index is None:
-            compacted[message_index] = MessageParam(
-                role=compacted[message_index]["role"],
-                content=truncated_text,
+            compacted[message_index] = _message_for_role(
+                compacted[message_index],
+                truncated_text,
             )
         else:
             _set_block_content(compacted[message_index], block_index, truncated_text)
@@ -426,7 +388,7 @@ def _truncate_text_to_budget(
 
 
 def _largest_tool_result_location(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
 ) -> tuple[int, int, str] | None:
     largest: tuple[int, int, str] | None = None
 
@@ -448,7 +410,7 @@ def _largest_tool_result_location(
 
 
 def _largest_text_location(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
 ) -> tuple[int, int | None, str] | None:
     largest: tuple[int, int | None, str] | None = None
 
@@ -473,7 +435,7 @@ def _largest_text_location(
 
 
 def _set_block_content(
-    message: MessageParam,
+    message: AgentMessage,
     block_index: int,
     content: str,
 ) -> None:
@@ -530,7 +492,7 @@ def estimate_token_count(
 
 
 def _estimated_tokens(
-    messages: list[MessageParam],
+    messages: list[AgentMessage],
     token_budget: ContextTokenBudget,
 ) -> int:
     return estimate_token_count(
@@ -540,14 +502,14 @@ def _estimated_tokens(
 
 
 def _message_for_model(
-    message: MessageParam,
+    message: AgentMessage,
     *,
     clear_tool_results: bool,
     max_tool_result_chars: int | None,
-) -> MessageParam:
+) -> AgentMessage:
     content = message["content"]
     if isinstance(content, str):
-        return MessageParam(role=message["role"], content=content)
+        return _message_for_role(message, content)
 
     blocks = [
         _block_for_model(
@@ -557,7 +519,17 @@ def _message_for_model(
         )
         for block in content
     ]
-    return MessageParam(role=message["role"], content=blocks)
+    return _message_for_role(message, blocks)
+
+
+def _message_for_role(
+    source: AgentMessage,
+    content: str | list[AgentBlock],
+) -> AgentMessage:
+    role = source.get("role")
+    if role not in ("user", "assistant"):
+        raise ValueError(f"Invalid agent message role: {role}")
+    return message(cast(AgentRole, role), content)
 
 
 def _block_for_model(
@@ -616,11 +588,11 @@ def _content_length(content: Any) -> int | None:
     return None
 
 
-def _normalize_message(message: MessageParam) -> MessageParam:
+def _normalize_message(message: AgentMessage) -> AgentMessage:
     return _message_from_snapshot(_message_to_snapshot(message))
 
 
-def _message_to_snapshot(message: MessageParam) -> dict[str, Any]:
+def _message_to_snapshot(message: AgentMessage) -> dict[str, Any]:
     content = message["content"]
     if isinstance(content, str):
         snapshot_content: str | list[Any] = content
@@ -633,7 +605,7 @@ def _message_to_snapshot(message: MessageParam) -> dict[str, Any]:
     }
 
 
-def _message_from_snapshot(message: Any) -> MessageParam:
+def _message_from_snapshot(message: Any) -> AgentMessage:
     if not isinstance(message, dict):
         raise ValueError("Context snapshot message must be a dict")
 
@@ -645,21 +617,21 @@ def _message_from_snapshot(message: Any) -> MessageParam:
     if not isinstance(content, str) and not isinstance(content, list):
         raise ValueError("Context snapshot content must be a string or list")
 
-    return MessageParam(role=role, content=content)
+    return normalize_message({"role": role, "content": content})
 
 
 def _block_to_snapshot(block: Any) -> dict[str, Any]:
     block_dict = _block_as_mapping(block)
-    return {key: value for key, value in block_dict.items()}
+    return block_to_dict(block_dict)
 
 
 def _copy_block(block: Any) -> Any:
     if isinstance(block, dict):
-        return dict(cast(Mapping[str, Any], block))
+        return block_to_dict(cast(Mapping[str, Any], block))
     return block
 
 
-def _message_has_block_type(message: MessageParam, block_type: str) -> bool:
+def _message_has_block_type(message: AgentMessage, block_type: str) -> bool:
     content = message["content"]
     if isinstance(content, str):
         return False

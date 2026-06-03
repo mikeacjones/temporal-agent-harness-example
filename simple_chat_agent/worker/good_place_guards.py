@@ -7,7 +7,7 @@ results into the context manager.
 """
 from __future__ import annotations
 
-from claude_harness.llm_guards import LlmGuardContext, LlmGuardResult
+from agent_harness.llm_guards import LlmGuardContext, LlmGuardResult
 
 from simple_chat_agent.worker.good_place import censor_content
 

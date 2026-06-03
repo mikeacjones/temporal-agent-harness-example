@@ -4,7 +4,7 @@ import os
 
 from fastapi import HTTPException
 
-from claude_harness.claude_agent import (
+from agent_harness.providers.claude import (
     MIN_THINKING_BUDGET_TOKENS,
     ClaudeThinkingConfig,
     ClaudeThinkingMode,

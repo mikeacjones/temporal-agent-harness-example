@@ -6,14 +6,13 @@ from typing import Any, Literal, cast
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.mcp_types import HttpMcpServerConfig
-    from claude_harness.claude_agent import (
+    from agent_harness.attachments import AttachmentRef
+    from agent_harness.agent import AgentResult, AgentState, SteeringMode
+    from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+    from agent_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.providers.claude import (
         ClaudeAgent,
-        ClaudeAgentResult,
-        ClaudeAgentState,
         ClaudeThinkingConfig,
-        DEFAULT_MAX_CONTEXT_TOKENS,
-        SteeringMode,
     )
     from simple_chat_agent.worker.tools import build_tools, tool_names_for_connections
     from simple_chat_agent.worker.tools.approval import (
@@ -35,6 +34,7 @@ TRANSCRIPT_DELTA_BUFFER_LIMIT = 80
 class ChatMessage:
     role: ChatRole
     content: str
+    attachments: list[AttachmentRef] = field(default_factory=list)
 
 
 @dataclass
@@ -61,13 +61,14 @@ class TranscriptDeltaResult:
 class QueuedChatMessage:
     content: str
     transcript_index: int
+    attachments: list[AttachmentRef] = field(default_factory=list)
 
 
 @dataclass
 class PendingApproval:
     approval_id: str
     tool_name: str
-    tool_args: dict[str, Any]
+    tool_args: dict
     summary: str
     memory_key: str
     requesting_workflow_id: str | None = None
@@ -88,7 +89,7 @@ class SimpleChatInput:
     available_tool_names: list[str] = field(default_factory=list)
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
-    agent_state: ClaudeAgentState | None = None
+    agent_state: AgentState | None = None
     transcript: list[ChatMessage] = field(default_factory=list)
     pending_messages: list[QueuedChatMessage] = field(default_factory=list)
     active_message_index: int | None = None
@@ -161,8 +162,12 @@ class SimpleChatWorkflow:
         self._transcript_deltas: list[TranscriptDelta] = []
 
     @workflow.signal
-    async def chat(self, message: str) -> None:
-        transcript_index = self._enqueue_chat(message)
+    async def chat(
+        self,
+        message: str,
+        attachments: list[AttachmentRef] | None = None,
+    ) -> None:
+        transcript_index = self._enqueue_chat(message, attachments=attachments)
         self._record_transcript_change(transcript_index)
         self._record_state_change()
 
@@ -171,7 +176,17 @@ class SimpleChatWorkflow:
         self._delete_requested = True
 
     @workflow.signal
-    async def steer(self, message: str, mode: str = "immediate") -> None:
+    async def steer(
+        self,
+        message: str,
+        mode: str = "immediate",
+        attachments: list[AttachmentRef] | None = None,
+    ) -> None:
+        if attachments:
+            transcript_index = self._enqueue_chat(message, attachments=attachments)
+            self._record_transcript_change(transcript_index)
+            self._record_state_change()
+            return
         if mode not in ("immediate", "after_next_tool_result"):
             self._transcript.append(
                 ChatMessage(role="system", content=f"Unknown steering mode: {mode}")
@@ -498,14 +513,17 @@ class SimpleChatWorkflow:
                     return
                 queued_message = self._pending_messages.pop(0)
                 message = queued_message.content
+                attachments = queued_message.attachments
                 self._active_message_index = queued_message.transcript_index
             else:
                 message = None
+                attachments = []
             self._status = "responding"
             self._record_state_change()
             try:
                 result = await self._run_agent_turn(
                     message=message,
+                    attachments=attachments,
                     state=resume_agent_state,
                     max_turns=chat_input.max_turns,
                 )
@@ -527,6 +545,7 @@ class SimpleChatWorkflow:
                         self._transcript[self._active_message_index] = ChatMessage(
                             role=original.role,
                             content=effective,
+                            attachments=list(original.attachments),
                         )
                         self._record_transcript_change(self._active_message_index)
                 self._transcript.append(
@@ -549,13 +568,22 @@ class SimpleChatWorkflow:
                 self._status = "idle"
                 self._record_state_change()
 
-    def _enqueue_chat(self, message: str) -> int:
+    def _enqueue_chat(
+        self,
+        message: str,
+        *,
+        attachments: list[AttachmentRef] | None = None,
+    ) -> int:
+        attachment_refs = list(attachments or [])
         transcript_index = len(self._transcript)
-        self._transcript.append(ChatMessage(role="user", content=message))
+        self._transcript.append(
+            ChatMessage(role="user", content=message, attachments=attachment_refs)
+        )
         self._pending_messages.append(
             QueuedChatMessage(
                 content=message,
                 transcript_index=transcript_index,
+                attachments=attachment_refs,
             )
         )
         return transcript_index
@@ -564,14 +592,19 @@ class SimpleChatWorkflow:
         self,
         *,
         message: str | None,
-        state: ClaudeAgentState | None,
+        attachments: list[AttachmentRef] | None,
+        state: AgentState | None,
         max_turns: int,
-    ) -> ClaudeAgentResult:
+    ) -> AgentResult:
         if self._agent is None:
             raise RuntimeError("Agent has not been initialized")
         if state is not None:
             return await self._agent.run(state=state, max_turns=max_turns)
-        return await self._agent.run(message, max_turns=max_turns)
+        return await self._agent.run(
+            message,
+            attachments=list(attachments or []),
+            max_turns=max_turns,
+        )
 
     async def _request_tool_approval(
         self,
@@ -651,7 +684,7 @@ class SimpleChatWorkflow:
     def _continue_as_new_input(
         self,
         chat_input: SimpleChatInput,
-        agent_state: ClaudeAgentState | None,
+        agent_state: AgentState | None,
     ) -> SimpleChatInput:
         return SimpleChatInput(
             user_ref=self._user_ref or chat_input.user_ref,

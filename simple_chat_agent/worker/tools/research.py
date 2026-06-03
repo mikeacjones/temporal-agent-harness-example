@@ -8,9 +8,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from claude_harness.streaming import StreamContext
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.streaming import StreamContext
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 
 
 SEARCH_WEB_TOOL = "search_web"

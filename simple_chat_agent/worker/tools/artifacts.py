@@ -5,9 +5,9 @@ import re
 from collections.abc import Callable
 from typing import Any, Literal
 
-from claude_harness.streaming import StreamContext
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.streaming import StreamContext
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 
 CREATE_ARTIFACT_TOOL = "create_artifact"
 MAX_ARTIFACT_BYTES = 2_000_000

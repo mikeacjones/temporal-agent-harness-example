@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from claude_harness.streaming import StreamEvent, StreamSink
+from agent_harness.streaming import StreamEvent, StreamSink
 
 STREAM_DIR = Path(".simple_chat_streams")
 

@@ -7,7 +7,7 @@ from uuid import uuid4
 from simple_chat_agent.api.auth import AuthenticatedUser
 from simple_chat_agent.common.mcp_auth import mcp_oauth_provider
 from simple_chat_agent.common.store import AppStore
-from claude_harness.mcp_types import HttpMcpServerConfig
+from agent_harness.mcp_types import HttpMcpServerConfig
 
 
 def mcp_server_url_candidates(server_url: str) -> list[str]:

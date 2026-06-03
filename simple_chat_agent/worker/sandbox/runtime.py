@@ -10,7 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from claude_harness.streaming import StreamContext
+from agent_harness.streaming import StreamContext
 
 MAX_CODE_CHARS = 100_000
 LAMBDA_MAX_TIMEOUT_SECONDS = 15 * 60

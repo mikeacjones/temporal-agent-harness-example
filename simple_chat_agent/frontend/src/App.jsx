@@ -563,6 +563,9 @@ export default function App() {
       currentClaudeSequence: null,
       ignoreClaudeUntilStart: false,
       localPending: [],
+      composerAttachments: [],
+      attachmentUploading: false,
+      attachmentError: "",
       resolvingApprovals: new Set(),
       draftConversation: true,
       draftSystemPrompt: defaultSystemPrompt,
@@ -603,6 +606,9 @@ export default function App() {
       draftSystemPrompt: defaultSystemPrompt,
       resolvingApprovals: new Set(),
       localPending: options.preserveLocalPending ? previous.localPending : [],
+      composerAttachments: [],
+      attachmentUploading: false,
+      attachmentError: "",
       artifactViewer: emptyArtifactViewer,
       statusNotice: "",
     }));
@@ -941,6 +947,156 @@ export default function App() {
     return body;
   }
 
+  async function ensureConversationForAttachments() {
+    const current = stateRef.current;
+    if (current.workflowId) return current.workflowId;
+    const body = await createConversation(null);
+    return body?.workflow_id || null;
+  }
+
+  async function uploadAttachmentFiles(files) {
+    const uploadFiles = Array.from(files || []).filter(Boolean);
+    if (!uploadFiles.length) return;
+    setState((previous) => ({
+      ...previous,
+      attachmentUploading: true,
+      attachmentError: "",
+    }));
+    try {
+      const workflowId = await ensureConversationForAttachments();
+      if (!workflowId) return;
+      for (const file of uploadFiles) {
+        const formData = new FormData();
+        formData.append("file", file);
+        const response = await fetch(`/api/sessions/${workflowId}/attachments`, {
+          method: "POST",
+          body: formData,
+        });
+        if (response.status === 401) {
+          showLogin();
+          return;
+        }
+        if (response.status === 404) {
+          await handleMissingWorkflow();
+          return;
+        }
+        if (!response.ok) throw new Error(await responseErrorText(response));
+        const body = await response.json();
+        if (body.attachment) addComposerAttachment(body.attachment);
+      }
+      touchDemoWorkspaceCountdown();
+    } catch (error) {
+      setState((previous) => ({
+        ...previous,
+        attachmentError: String(error),
+      }));
+    } finally {
+      setState((previous) => ({
+        ...previous,
+        attachmentUploading: false,
+      }));
+    }
+  }
+
+  async function createPasteAttachment(text) {
+    const content = String(text || "");
+    if (!content) return;
+    setState((previous) => ({
+      ...previous,
+      attachmentUploading: true,
+      attachmentError: "",
+    }));
+    try {
+      const workflowId = await ensureConversationForAttachments();
+      if (!workflowId) return;
+      const response = await fetch(`/api/sessions/${workflowId}/attachments/text`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          name: "pasted-text.txt",
+          content,
+          mime_type: "text/plain",
+        }),
+      });
+      if (response.status === 401) {
+        showLogin();
+        return;
+      }
+      if (response.status === 404) {
+        await handleMissingWorkflow();
+        return;
+      }
+      if (!response.ok) throw new Error(await responseErrorText(response));
+      const body = await response.json();
+      if (body.attachment) addComposerAttachment(body.attachment);
+      touchDemoWorkspaceCountdown();
+    } catch (error) {
+      setState((previous) => ({
+        ...previous,
+        attachmentError: String(error),
+      }));
+    } finally {
+      setState((previous) => ({
+        ...previous,
+        attachmentUploading: false,
+      }));
+    }
+  }
+
+  function addComposerAttachment(attachment) {
+    const attachmentId = attachment.attachment_id || attachment.artifact_id;
+    if (!attachmentId) return;
+    setState((previous) => {
+      const composerAttachments = previous.composerAttachments || [];
+      if (
+        composerAttachments.some(
+          (existing) =>
+            (existing.attachment_id || existing.artifact_id) === attachmentId,
+        )
+      ) {
+        return previous;
+      }
+      const workflowState = previous.workflowState
+        ? {
+            ...previous.workflowState,
+            attachments: appendUniqueAttachment(
+              previous.workflowState.attachments || [],
+              attachment,
+            ),
+          }
+        : previous.workflowState;
+      return {
+        ...previous,
+        workflowState,
+        composerAttachments: [...composerAttachments, attachment],
+      };
+    });
+  }
+
+  function removeComposerAttachment(attachmentId) {
+    setState((previous) => ({
+      ...previous,
+      composerAttachments: (previous.composerAttachments || []).filter(
+        (attachment) =>
+          (attachment.attachment_id || attachment.artifact_id) !== attachmentId,
+      ),
+    }));
+  }
+
+  function appendUniqueAttachment(attachments, attachment) {
+    const attachmentId = attachment.attachment_id || attachment.artifact_id;
+    if (!attachmentId) return attachments;
+    if (
+      attachments.some(
+        (existing) =>
+          (existing.attachment_id || existing.artifact_id) === attachmentId,
+      )
+    ) {
+      return attachments;
+    }
+    return [...attachments, attachment];
+  }
+
   function newConversationRequest() {
     const current = stateRef.current;
     const config = current.config || {};
@@ -977,36 +1133,54 @@ export default function App() {
 
   async function sendDefault() {
     const busy = stateRef.current.workflowState?.status === "responding";
-    await sendAction(busy ? "steer" : "chat", busy ? "you steering" : "you", "sending");
+    const hasAttachments = (stateRef.current.composerAttachments || []).length > 0;
+    await sendAction(
+      busy && !hasAttachments ? "steer" : "chat",
+      busy && !hasAttachments ? "you steering" : "you",
+      "sending",
+    );
   }
 
   async function sendAction(action, label, phase) {
     let content = messageRef.current.trim();
+    const attachments =
+      action === "interrupt" ? [] : [...(stateRef.current.composerAttachments || [])];
     if (!content && action === "interrupt") {
       content = "Stop the current response.";
     }
-    if (!content) return;
+    if (!content && !attachments.length) return;
 
-    const current = stateRef.current;
+    let current = stateRef.current;
     if (!current.workflowId) {
       if (action === "interrupt" || action === "steer" || action === "after-tool") return;
-      clearComposerInput();
-      const pending = createPendingMessage(label, content, phase, current);
-      setState((previous) => ({
-        ...previous,
-        localPending: [...previous.localPending, pending],
-      }));
-      try {
-        await createConversation(content, { preserveLocalPending: true });
-        markPendingDelivered(pending.id);
-      } catch (error) {
-        markPendingFailed(pending.id, error);
+      if (attachments.length) {
+        const workflowId = await ensureConversationForAttachments();
+        if (!workflowId) return;
+        current = { ...stateRef.current, workflowId };
+      } else {
+        clearComposerInput();
+        const pending = createPendingMessage(label, content, phase, current);
+        setState((previous) => ({
+          ...previous,
+          localPending: [...previous.localPending, pending],
+        }));
+        try {
+          await createConversation(content, { preserveLocalPending: true });
+          markPendingDelivered(pending.id);
+        } catch (error) {
+          markPendingFailed(pending.id, error);
+        }
+        return;
       }
-      return;
     }
 
     clearComposerInput();
-    const pending = createPendingMessage(label, content, phase, current);
+    setState((previous) => ({
+      ...previous,
+      composerAttachments: [],
+      attachmentError: "",
+    }));
+    const pending = createPendingMessage(label, content, phase, current, attachments);
     setState((previous) => {
       let next = {
         ...previous,
@@ -1020,17 +1194,25 @@ export default function App() {
     });
 
     try {
+      const attachment_ids = attachments
+        .map((attachment) => attachment.attachment_id || attachment.artifact_id)
+        .filter(Boolean);
       if (action === "chat") {
-        await post(`/api/sessions/${current.workflowId}/chat`, { message: content });
+        await post(`/api/sessions/${current.workflowId}/chat`, {
+          message: content,
+          attachment_ids,
+        });
       } else if (action === "steer") {
         await post(`/api/sessions/${current.workflowId}/steer`, {
           message: content,
           mode: "immediate",
+          attachment_ids,
         });
       } else if (action === "after-tool") {
         await post(`/api/sessions/${current.workflowId}/steer`, {
           message: content,
           mode: "after_next_tool_result",
+          attachment_ids,
         });
       } else if (action === "interrupt") {
         await post(`/api/sessions/${current.workflowId}/interrupt`, { message: content });
@@ -1813,9 +1995,15 @@ export default function App() {
         <ArtifactsPanel artifacts={artifacts} onOpen={openArtifactViewer} />
         <Composer
           temporalUiUrl={state.temporalUiUrl}
+          attachments={state.composerAttachments}
+          attachmentUploading={state.attachmentUploading}
+          attachmentError={state.attachmentError}
           onMessageChange={updateComposerMessage}
           onSend={sendDefault}
           onInterrupt={() => sendAction("interrupt", "you interrupt", "sending")}
+          onFilesSelected={uploadAttachmentFiles}
+          onPasteAttachment={createPasteAttachment}
+          onRemoveAttachment={removeComposerAttachment}
           resetToken={composerResetToken}
         />
         <ToolsWindow

@@ -2,7 +2,7 @@
 # containers; they differ only by the command they run (see deploy/ manifests).
 #
 # IMPORTANT: build with the *repo root* as the context (the image needs
-# pyproject.toml, uv.lock, and claude_harness/ from there), e.g.:
+# pyproject.toml, uv.lock, and agent_harness/ from there), e.g.:
 #   docker build -f simple_chat_agent/Dockerfile .
 #
 # Built for linux/amd64 to match the EKS node architecture.

@@ -13,11 +13,9 @@ from temporalio.common import (
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.claude_agent import (
-        ClaudeThinkingConfig,
-        DEFAULT_MAX_CONTEXT_TOKENS,
-    )
-    from claude_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+    from agent_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.providers.claude import ClaudeThinkingConfig
     from simple_chat_agent import TASK_QUEUE
     from simple_chat_agent.worker.workflow import (
         ChatMessage,

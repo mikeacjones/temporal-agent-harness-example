@@ -6,6 +6,10 @@ from typing import Any
 
 from fastapi import Response
 
+from simple_chat_agent.common.attachments import (
+    attachment_dicts,
+    generated_artifacts,
+)
 from simple_chat_agent.common.store import ArtifactRecord
 from simple_chat_agent.worker.workflow import (
     SimpleChatSnapshot,
@@ -27,7 +31,8 @@ def state_to_dict(
         raise TypeError(f"Unsupported state type: {type(state).__name__}")
 
     if artifacts is not None:
-        state_dict["artifacts"] = artifact_dicts(artifacts)
+        state_dict["artifacts"] = artifact_dicts(generated_artifacts(artifacts))
+        state_dict["attachments"] = attachment_dicts(artifacts)
     return state_dict
 
 

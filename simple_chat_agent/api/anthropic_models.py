@@ -9,7 +9,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from claude_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
 
 
 FALLBACK_MODEL_OPTIONS = [

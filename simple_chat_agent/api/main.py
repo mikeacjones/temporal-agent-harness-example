@@ -21,15 +21,15 @@ from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.service import RPCError, RPCStatusCode
 
-from claude_harness.claude_agent import (
+from agent_harness.providers.claude import (
     DEFAULT_THINKING_BUDGET_TOKENS,
     MIN_THINKING_BUDGET_TOKENS,
 )
-from claude_harness.mcp import (
+from agent_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
-from claude_harness.mcp_types import HttpMcpServerConfig
+from agent_harness.mcp_types import HttpMcpServerConfig
 from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.api.auth import (
     DEFAULT_SESSION_SECONDS,

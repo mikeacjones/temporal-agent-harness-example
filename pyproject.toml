@@ -12,6 +12,7 @@ dependencies = [
     "mcp>=1.27.1",
     "prompt-toolkit>=3.0.52",
     "pydantic>=2.13.4",
+    "python-multipart>=0.0.29",
     "pyjwt[crypto]>=2.12.1",
     "temporalio>=1.27.2",
     "trafilatura>=2.0.0",

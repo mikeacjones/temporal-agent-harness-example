@@ -8,8 +8,8 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from claude_harness.mcp import discover_http_mcp_tools, public_mcp_tool_name
-from claude_harness.mcp_types import HttpMcpServerConfig
+from agent_harness.mcp import discover_http_mcp_tools, public_mcp_tool_name
+from agent_harness.mcp_types import HttpMcpServerConfig
 from simple_chat_agent.api.auth import AuthenticatedUser
 from simple_chat_agent.api.github_oauth import (
     GITHUB_PROVIDER,

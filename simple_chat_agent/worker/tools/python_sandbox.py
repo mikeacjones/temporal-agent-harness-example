@@ -9,9 +9,9 @@ from typing import Any
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
-from claude_harness.streaming import StreamContext
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.streaming import StreamContext
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 from simple_chat_agent.worker.sandbox.runtime import (
     DEFAULT_TIMEOUT_SECONDS,
     LAMBDA_MAX_TIMEOUT_SECONDS,

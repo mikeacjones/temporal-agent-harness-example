@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from .tools import ToolResult
 
 GuardFn = Callable[..., Any]
-RUN_GUARD_ACTIVITY_NAME = "claude_harness.run_guard_activity"
+RUN_GUARD_ACTIVITY_NAME = "agent_harness.run_guard_activity"
 
 
 class GuardTiming(StrEnum):
@@ -45,8 +45,8 @@ class GuardPolicy:
 class GuardResult:
     passed: bool
     reason: str | None = None
-    llm_payload: dict[str, Any] | None = None
-    internal_payload: dict[str, Any] | None = None
+    llm_payload: dict | None = None
+    internal_payload: dict | None = None
 
 
 @dataclass
@@ -54,7 +54,7 @@ class GuardContext:
     guard_name: str
     tool_name: str
     tool_type: ToolType
-    tool_args: dict[str, Any]
+    tool_args: dict
     tool_result: ToolResult | None = None
     stream_id: str | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
@@ -131,7 +131,7 @@ class GuardContext:
 @dataclass
 class GuardActivityRequest:
     function_ref: str
-    args: dict[str, Any]
+    args: dict
     guard_name: str | None = None
     step: str | None = None
     stream_id: str | None = None
@@ -146,7 +146,7 @@ class GuardDef:
 
 @dataclass
 class GuardFailure:
-    payload: dict[str, Any]
+    payload: dict
 
 
 class GuardSet:
@@ -185,7 +185,7 @@ class GuardSet:
         except KeyError as err:
             raise ValueError(
                 f"Guard {guard.__name__} is not registered; decorate it with "
-                "claude_harness.tools.guard and register it before using it in a tool"
+                "agent_harness.tools.guard and register it before using it in a tool"
             ) from err
 
     def get_guard(self, name: str) -> GuardDef:

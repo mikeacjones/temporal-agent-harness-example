@@ -37,11 +37,11 @@ class LlmGuardAction(StrEnum):
 @dataclass
 class LlmGuardResult:
     action: LlmGuardAction = LlmGuardAction.CONTINUE
-    request: dict[str, Any] | None = None
-    response: dict[str, Any] | None = None
-    message: str | dict[str, Any] | None = None
+    request: dict | None = None
+    response: dict | None = None
+    message: str | dict | None = None
     reason: str | None = None
-    state: dict[str, Any] | None = None
+    state: dict | None = None
 
     @classmethod
     def allow(
@@ -95,9 +95,9 @@ class LlmGuardResult:
 class LlmGuardContext:
     guard_name: str
     timing: LlmGuardTiming
-    request: dict[str, Any]
-    response: dict[str, Any] | None = None
-    state: dict[str, Any] = field(default_factory=dict)
+    request: dict
+    response: dict | None = None
+    state: dict = field(default_factory=dict)
     stream_id: str | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
@@ -174,9 +174,9 @@ class LlmGuardContext:
 
 @dataclass
 class LlmGuardExecution:
-    request: dict[str, Any]
-    response: dict[str, Any] | None
-    state: dict[str, Any]
+    request: dict
+    response: dict | None
+    state: dict
     action: LlmGuardAction = LlmGuardAction.CONTINUE
     reason: str | None = None
 

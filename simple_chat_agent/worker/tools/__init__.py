@@ -4,11 +4,12 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
 from typing import Any, Literal
 
-from claude_harness.mcp import HttpMcpProvider
-from claude_harness.mcp_types import HttpMcpServerConfig
-from claude_harness.tools import ToolResult, ToolSet
+from agent_harness.mcp import HttpMcpProvider
+from agent_harness.mcp_types import HttpMcpServerConfig
+from agent_harness.tools import ToolResult, ToolSet
 
 from .approval import MutatingToolApprovalProvider
+from .attachments import AttachmentProvider, READ_ATTACHMENT_TOOL
 from .artifacts import ArtifactProvider, CREATE_ARTIFACT_TOOL
 from .fetch_url import fetch_url
 from .github import GitHubProvider
@@ -128,6 +129,12 @@ def build_tools(
     )
     tools.add_provider(MutatingToolApprovalProvider(request_mutating_tool_approval))
     tools.add_provider(
+        AttachmentProvider(
+            user_ref=user_ref,
+            workflow_id=workflow_id,
+        )
+    )
+    tools.add_provider(
         ArtifactProvider(
             user_ref=user_ref,
             conversation_id=conversation_id,
@@ -160,6 +167,7 @@ def tool_names_for_connections(
     names = [
         FETCH_URL_TOOL,
         PYTHON_SANDBOX_TOOL,
+        READ_ATTACHMENT_TOOL,
         CREATE_ARTIFACT_TOOL,
         CREATE_SUBAGENT_TOOL,
     ]

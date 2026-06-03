@@ -6,7 +6,7 @@ from dataclasses import asdict
 from typing import Any
 from urllib.request import Request, urlopen
 
-from claude_harness.streaming import StreamContext, StreamEvent, configure_stream_sink
+from agent_harness.streaming import StreamContext, StreamEvent, configure_stream_sink
 from simple_chat_agent.worker.sandbox.runtime import (
     MAX_TIMEOUT_SECONDS,
     SANDBOX_DEADLINE_BUFFER_SECONDS,

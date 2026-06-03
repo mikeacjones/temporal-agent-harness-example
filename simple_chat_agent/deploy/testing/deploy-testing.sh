@@ -13,6 +13,7 @@ REGION="us-west-1"
 ACCOUNT="429214323166"
 REPO="temporal-michaelj-agent-harness-demo"
 NAMESPACE="temporal-michaelj-agent-harness-demo"
+S3_BUCKET="michaelj-agent-harness-claimcheck-429214323166"
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 IMAGE="${REGISTRY}/${REPO}"
 TAG="testing-$(date +%Y%m%d-%H%M%S)"
@@ -36,6 +37,10 @@ echo ">> Deploying testing Python sandbox Lambda + IAM"
 echo ">> Applying testing manifests"
 kubectl apply -f simple_chat_agent/deploy/searxng.yaml
 kubectl apply -f simple_chat_agent/deploy/testing/
+
+echo ">> Ensuring S3 lifecycle expiration on ${S3_BUCKET}"
+S3_BUCKET="${S3_BUCKET}" S3_EXPIRATION_DAYS=30 AWS_REGION="${REGION}" \
+  "${ROOT}/simple_chat_agent/deploy/configure-s3-lifecycle.sh"
 
 echo ">> Setting images + rolling out the test stack"
 kubectl set image deployment/agent-harness-web-testing web="${IMAGE}:${TAG}" -n "${NAMESPACE}"

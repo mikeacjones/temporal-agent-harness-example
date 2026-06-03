@@ -2,6 +2,7 @@ import { ApprovalsPanel } from "./ApprovalsPanel.jsx";
 import { MarkdownContent } from "./MarkdownContent.jsx";
 import { StreamPanel } from "./StreamPanel.jsx";
 import { visibleMessageItems } from "../state/chatState.js";
+import { formatBytes } from "../utils/format.js";
 
 export function Messages({
   workflowState,
@@ -60,7 +61,8 @@ export function Messages({
             key={item.pending.id}
             kind="pending"
             label={item.pending.label}
-            content={`${item.pending.content} (${item.pending.phase})`}
+            content={`${item.pending.content || "Attached files"} (${item.pending.phase})`}
+            attachments={item.pending.attachments || []}
           />
         ) : (
           <MessageBubble
@@ -171,12 +173,33 @@ function MessageBubble({
 }) {
   if (message.role === "user") {
     if (workflowState.active_message_index === index) {
-      return <Bubble kind="pending" label="you -> agent" content={`${message.content} (delivered)`} />;
+      return (
+        <Bubble
+          kind="pending"
+          label="you -> agent"
+          content={`${message.content || "Attached files"} (delivered)`}
+          attachments={message.attachments || []}
+        />
+      );
     }
     if ((workflowState.queued_message_indices || []).includes(index)) {
-      return <Bubble kind="pending" label="you" content={`${message.content} (queued)`} />;
+      return (
+        <Bubble
+          kind="pending"
+          label="you"
+          content={`${message.content || "Attached files"} (queued)`}
+          attachments={message.attachments || []}
+        />
+      );
     }
-    return <Bubble kind="user" label="you" content={message.content} />;
+    return (
+      <Bubble
+        kind="user"
+        label="you"
+        content={message.content}
+        attachments={message.attachments || []}
+      />
+    );
   }
   if (message.role === "assistant") {
     return (
@@ -193,7 +216,15 @@ function MessageBubble({
   return <Bubble kind="system" label="system" content={message.content} />;
 }
 
-function Bubble({ kind, label, content, trace, traceExpanded, onToggleTrace }) {
+function Bubble({
+  kind,
+  label,
+  content,
+  attachments = [],
+  trace,
+  traceExpanded,
+  onToggleTrace,
+}) {
   const canShowTrace = kind === "assistant" && onToggleTrace;
   return (
     <div className={`bubble ${kind}${traceExpanded ? " detail-open" : ""}`}>
@@ -209,7 +240,30 @@ function Bubble({ kind, label, content, trace, traceExpanded, onToggleTrace }) {
           </button>
         ) : null}
       </div>
-      <MarkdownContent content={content} />
+      {content ? <MarkdownContent content={content} /> : null}
+      <AttachmentChips attachments={attachments} />
+    </div>
+  );
+}
+
+function AttachmentChips({ attachments }) {
+  if (!attachments?.length) return null;
+  return (
+    <div className="message-attachments">
+      {attachments.map((attachment) => (
+        <a
+          key={attachment.attachment_id || attachment.artifact_id}
+          className="message-attachment-chip"
+          href={attachment.view_url || `/api/attachments/${attachment.attachment_id}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <span>{attachment.name || "attachment"}</span>
+          <small>
+            {attachment.content_kind || "file"} | {formatBytes(attachment.size_bytes || 0)}
+          </small>
+        </a>
+      ))}
     </div>
   );
 }

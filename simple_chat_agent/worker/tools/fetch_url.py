@@ -7,9 +7,9 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from claude_harness.streaming import StreamContext
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.streaming import StreamContext
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 
 
 CHROME_USER_AGENT = (

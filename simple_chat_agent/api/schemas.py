@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from claude_harness.claude_agent import (
+from agent_harness.providers.claude import (
     DEFAULT_THINKING_BUDGET_TOKENS,
     ClaudeThinkingEffort,
     ClaudeThinkingMode,
@@ -31,10 +31,17 @@ class CreateSessionRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     message: str
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class SteerRequest(MessageRequest):
     mode: Literal["immediate", "after_next_tool_result"] = "immediate"
+
+
+class AttachmentTextRequest(BaseModel):
+    name: str = "pasted-text.txt"
+    content: str
+    mime_type: str = "text/plain"
 
 
 class ApprovalDecisionRequest(BaseModel):

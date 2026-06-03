@@ -1142,6 +1142,36 @@ main {
 .bubble.pending::after {
     background: var(--color-queued);
 }
+.message-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    margin-top: var(--space-sm);
+}
+.message-attachment-chip {
+    display: grid;
+    gap: 1px;
+    max-width: min(320px, 100%);
+    padding: var(--space-xs) var(--space-sm);
+    border: 1px solid rgba(128, 152, 249, 0.28);
+    border-radius: var(--radius-sm);
+    background: rgba(68, 76, 231, 0.08);
+    color: var(--color-text-primary);
+    text-decoration: none;
+}
+.message-attachment-chip:hover {
+    border-color: rgba(128, 152, 249, 0.6);
+    background: rgba(68, 76, 231, 0.16);
+}
+.message-attachment-chip span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.message-attachment-chip small {
+    color: var(--color-text-tertiary);
+    font-size: var(--font-size-xs);
+}
 .bubble-header {
     display: flex;
     align-items: center;
@@ -1715,6 +1745,69 @@ main {
     padding: var(--space-sm) var(--space-md);
     border-top: 1px solid var(--color-border);
     background: var(--color-bg-secondary);
+}
+.composer-input-shell {
+    min-width: 0;
+    display: grid;
+    gap: var(--space-xs);
+}
+.composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    align-items: center;
+}
+.composer-attachment-chip {
+    min-width: 0;
+    max-width: min(280px, 100%);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "name remove"
+        "meta remove";
+    gap: 1px var(--space-xs);
+    align-items: center;
+    padding: var(--space-xs) var(--space-xs) var(--space-xs) var(--space-sm);
+    border: 1px solid rgba(128, 152, 249, 0.28);
+    border-radius: var(--radius-sm);
+    background: rgba(68, 76, 231, 0.08);
+}
+.composer-attachment-chip span {
+    grid-area: name;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-text-primary);
+    font-size: var(--font-size-sm);
+}
+.composer-attachment-chip small {
+    grid-area: meta;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-text-tertiary);
+    font-size: var(--font-size-xs);
+}
+.composer-attachment-chip button {
+    grid-area: remove;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    padding: 0;
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
+}
+.composer-attachment-status,
+.composer-attachment-error {
+    font-size: var(--font-size-xs);
+    color: var(--color-text-tertiary);
+}
+.composer-attachment-error {
+    color: #ffb4aa;
+}
+.composer .icon-button {
+    padding: 0;
+    font-size: var(--font-size-lg);
 }
 textarea {
     width: 100%;
