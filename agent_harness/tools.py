@@ -19,15 +19,11 @@ from .activity_options import (
 )
 from .activity_router import ActivityFn, call_activity, function_ref, resolve_function_ref
 from .guards import (
-    GuardActivityRequest,
-    GuardContext,
     GuardDef,
     GuardFn,
     GuardSet,
     GuardPolicy,
-    GuardResult,
     GuardTiming,
-    run_guard_activity,
 )
 from .streaming import StreamContext
 from .tool_types import ToolType
@@ -35,11 +31,11 @@ from .tool_types import ToolType
 ToolFn = Callable[..., Awaitable["ToolResult"]]
 DynamicToolFn = Callable[["ToolContext", dict[str, Any]], Awaitable["ToolResult"]]
 GuardReference = GuardFn | str
-ToolParam = dict[str, Any]
+ToolParam = dict
 ToolArgsMode = Literal["signature", "raw"]
-RUN_TOOL_ACTIVITY_NAME = "claude_harness.run_tool_activity"
-_TOOL_METADATA_ATTR = "__claude_harness_tool__"
-_GUARD_METADATA_ATTR = "__claude_harness_guard__"
+RUN_TOOL_ACTIVITY_NAME = "agent_harness.run_tool_activity"
+_TOOL_METADATA_ATTR = "__agent_harness_tool__"
+_GUARD_METADATA_ATTR = "__agent_harness_guard__"
 
 
 @dataclass(frozen=True)
@@ -178,14 +174,14 @@ class ToolContext:
 
 @dataclass
 class ToolResult:
-    payload: dict[str, Any]
+    payload: dict
     error: bool
 
 
 @dataclass
 class ToolActivityRequest:
     function_ref: str
-    args: dict[str, Any]
+    args: dict
     tool_name: str | None = None
     step: str | None = None
     stream_id: str | None = None
@@ -266,7 +262,7 @@ class ToolSet:
             if metadata is None:
                 raise ValueError(
                     f"Tool {fn.__name__} is missing @tool metadata; decorate it "
-                    "with claude_harness.tools.tool before registering it"
+                    "with agent_harness.tools.tool before registering it"
                 )
 
             self._register_tool(
@@ -290,7 +286,7 @@ class ToolSet:
             if metadata is None:
                 raise ValueError(
                     f"Guard {fn.__name__} is missing @guard metadata; decorate it "
-                    "with claude_harness.tools.guard before registering it"
+                    "with agent_harness.tools.guard before registering it"
                 )
             self._register_guard(fn)
 
@@ -450,7 +446,7 @@ class ToolSet:
         if metadata is None:
             raise ValueError(
                 f"Guard {fn.__name__} is not registered; decorate it with "
-                "claude_harness.tools.guard before using it in a tool"
+                "agent_harness.tools.guard before using it in a tool"
             )
 
         registered_guard = self._guards.guard(

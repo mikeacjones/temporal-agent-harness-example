@@ -5,9 +5,9 @@ import re
 from collections.abc import Callable
 from typing import Any, Literal
 
-from claude_harness.streaming import StreamContext
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.streaming import StreamContext
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 
 CREATE_ARTIFACT_TOOL = "create_artifact"
 MAX_ARTIFACT_BYTES = 2_000_000
@@ -101,6 +101,7 @@ async def _create_artifact_activity(
         return payload
 
     from simple_chat_agent.common.store import AppStore
+    from simple_chat_agent.common.store import artifact_expires_at
 
     artifact = AppStore().create_artifact(
         user_id=user_id,
@@ -120,6 +121,7 @@ async def _create_artifact_activity(
             "view_url": f"/api/artifacts/{artifact.artifact_id}",
             "download_url": f"/api/artifacts/{artifact.artifact_id}/download",
             "created_at": artifact.created_at,
+            "expires_at": artifact_expires_at(artifact),
         }
     }
     await stream.emit(payload["artifact"], kind="artifact_create_complete")

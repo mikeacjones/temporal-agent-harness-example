@@ -73,6 +73,7 @@ export function applyWorkflowStatePatchInState(previous, patch) {
       (previous.workflowState.transcript || []).length,
     transcript_has_more_before: previous.workflowState.transcript_has_more_before || false,
     artifacts: previous.workflowState.artifacts || [],
+    attachments: previous.workflowState.attachments || [],
   });
 }
 
@@ -103,14 +104,17 @@ function normalizeWorkflowState(nextWorkflowState, previousWorkflowState = null)
     pending_approvals: nextWorkflowState.pending_approvals || [],
     queued_message_indices: nextWorkflowState.queued_message_indices || [],
     artifacts: nextWorkflowState.artifacts || previousWorkflowState?.artifacts || [],
+    attachments:
+      nextWorkflowState.attachments || previousWorkflowState?.attachments || [],
   };
 }
 
-export function createPendingMessage(label, content, phase, state) {
+export function createPendingMessage(label, content, phase, state, attachments = []) {
   return {
     id: crypto.randomUUID(),
     label,
     content,
+    attachments: [...attachments],
     phase,
     transcriptIndex: workflowTranscriptEnd(state.workflowState),
   };
@@ -953,7 +957,11 @@ function transcriptMessageForPending(pending) {
   const phase = String(pending.phase || "");
   if (phase.startsWith("failed")) return null;
   if (!String(pending.label || "").startsWith("you")) return null;
-  return { role: "user", content: pending.content };
+  return {
+    role: "user",
+    content: pending.content,
+    attachments: [...(pending.attachments || [])],
+  };
 }
 
 export function markStreamInterruptedInState(state) {
@@ -980,11 +988,30 @@ function isAcknowledged(pending, workflowState) {
 }
 
 function isPendingAcknowledgedByTranscript(pending, transcript) {
+  const pendingAttachmentIds = attachmentIds(pending.attachments || []);
   return transcript.some((message) => {
-    if (message.role === "user" && message.content === pending.content) return true;
+    if (
+      message.role === "user" &&
+      message.content === pending.content &&
+      attachmentIdsEqual(pendingAttachmentIds, attachmentIds(message.attachments || []))
+    ) {
+      return true;
+    }
     if (message.role === "system" && message.content.includes(pending.content)) return true;
     return false;
   });
+}
+
+function attachmentIds(attachments) {
+  return (attachments || [])
+    .map((attachment) => String(attachment.attachment_id || attachment.artifact_id || ""))
+    .filter(Boolean)
+    .sort();
+}
+
+function attachmentIdsEqual(left, right) {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
 }
 
 export function displayStatus(state) {

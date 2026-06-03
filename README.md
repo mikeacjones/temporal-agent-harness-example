@@ -2,7 +2,7 @@
 
 This repo is not trying to be a generic agent SDK.
 
-It is an example of how a team might build a small, opinionated Claude harness around its own operating model: durable execution, readable Temporal history, explicit tool categories, runtime guard enforcement, controlled model access, resumable context, and optional non-durable streaming.
+It is an example of how a team might build a small, opinionated agent harness around its own operating model: durable execution, readable Temporal history, explicit tool categories, runtime guard enforcement, controlled model access, resumable context, provider-specific model adapters, and optional non-durable streaming.
 
 The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
 
@@ -10,11 +10,11 @@ The interesting part is not "how to call an LLM." It is how the agent loop, tool
 
 ![Agent harness architecture](docs/agent-harness-simplified.png)
 
-The main design choice is to separate reusable harness behavior from application ownership. The harness should encode the agent platform rules a company wants every Claude agent to follow. The application still owns the workflow shape, product UX, authentication, tool availability, and business-specific policies.
+The main design choice is to separate reusable harness behavior from application ownership. The harness should encode the agent platform rules a company wants every agent to follow, while provider-specific modules handle details such as Claude request formats and streaming. The application still owns the workflow shape, product UX, authentication, tool availability, and business-specific policies.
 
 | Layer | Owns | Does Not Own |
 | --- | --- | --- |
-| `claude_harness` | Claude request/response activities, the agent loop, context management, tool and guard registration, guard enforcement, generic activity routing, activity summary conventions, continuation snapshots, interrupt/steering semantics, and a streaming protocol. | Product auth, OAuth flows, UI state, user/session persistence, business workflows, concrete streaming transports, or provider-specific app state. |
+| `agent_harness` | The provider-neutral agent loop, provider interfaces and adapters, context management, tool and guard registration, guard enforcement, generic activity routing, activity summary conventions, continuation snapshots, interrupt/steering semantics, and a streaming protocol. | Product auth, OAuth flows, UI state, user/session persistence, business workflows, concrete streaming transports, or provider-specific app state. |
 | Application workflow | Durable conversation orchestration, signal/query/update surface, agent construction, tool availability, approval state, continue-as-new policy, and how returned harness state is carried forward. | Direct network I/O, UI rendering, or provider login flows. |
 | Tools and guards | Business capabilities and policy. They run in workflow context, can call child workflows, wait on signals/timers, and use `ctx.activity(...)` for side effects. | Hidden side effects from workflow code. Durable side effects should go through activities or child workflows. |
 | Activities | Non-deterministic work: Claude calls, API calls, database writes, emails, OAuth-token-backed provider calls, and long-running side effects. | Agent policy decisions that need to replay deterministically. |
@@ -34,7 +34,7 @@ sequenceDiagram
     participant UI as UI / API Server
     participant Registry as User Chats Workflow
     participant WF as Application Agent Workflow
-    participant Harness as ClaudeAgent Harness
+    participant Harness as Agent Harness
     participant ClaudeAct as call_claude Activity
     participant Claude as Claude API
     participant Tool as Tool / Guard Workflow Code
@@ -66,7 +66,7 @@ sequenceDiagram
         Tool-->>Harness: ToolResult or guarded failure payload
         Harness->>ClaudeAct: Next Claude call with tool_result blocks
     else Final assistant response
-        Harness-->>WF: ClaudeAgentResult and continuation state
+        Harness-->>WF: AgentResult and continuation state
         WF-->>UI: Committed transcript via query/SSE
         UI-->>User: Render durable chat plus non-durable stream visibility
     end
@@ -89,8 +89,8 @@ sequenceDiagram
 The Claude call is an activity. Tool execution happens from workflow code. If a tool needs side effects, it calls through `ctx.activity(...)`, which routes through a generic activity while setting a useful Temporal summary.
 
 ```python
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, ToolSet, tool
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, ToolSet, tool
 
 
 @tool(
@@ -176,8 +176,8 @@ from datetime import timedelta
 
 from temporalio.common import RetryPolicy
 
-from claude_harness.activity_options import ActivityOptions
-from claude_harness.claude_agent import ClaudeAgent
+from agent_harness.activity_options import ActivityOptions
+from agent_harness.providers.claude import ClaudeAgent
 
 agent = ClaudeAgent(
     "You are an internal operations agent.",
@@ -265,7 +265,7 @@ The current policy discards partial assistant output. This matters when the UI s
 The harness defines a small streaming protocol but does not own a transport. Applications install a sink in the worker process:
 
 ```python
-from claude_harness.streaming import StreamEvent, configure_stream_sink
+from agent_harness.streaming import StreamEvent, configure_stream_sink
 
 
 class JsonlSink:
@@ -279,7 +279,7 @@ configure_stream_sink(JsonlSink())
 When a `stream_id` is supplied, Claude token deltas and tool activity progress can be emitted to that sink. Tool activities receive an injectable `StreamContext` only when they ask for it:
 
 ```python
-from claude_harness.streaming import StreamContext
+from agent_harness.streaming import StreamContext
 
 
 async def _export_report_activity(
@@ -297,9 +297,9 @@ If no sink is configured, streaming is a no-op.
 Tools are categorized with `ToolType`. The harness can require guards for specific categories. Today, `ToolType.ADMIN` requires a pre-guard by default.
 
 ```python
-from claude_harness.guards import GuardContext, GuardResult
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import guard, tool
+from agent_harness.guards import GuardContext, GuardResult
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import guard, tool
 
 
 @guard(name="require_ops_approval", fulfills=ToolType.ADMIN)
@@ -457,9 +457,9 @@ from dataclasses import asdict
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.guards import GuardContext, GuardResult
-    from claude_harness.tool_types import ToolType
-    from claude_harness.tools import guard
+    from agent_harness.guards import GuardContext, GuardResult
+    from agent_harness.tool_types import ToolType
+    from agent_harness.tools import guard
     from my_agent.workflows.customer_confirmation_workflow import (
         CustomerConfirmationRequest,
         CustomerConfirmationWorkflow,
@@ -523,8 +523,8 @@ The tool stays focused on the actual mutation:
 # tools/substitute_item_tool.py
 from datetime import timedelta
 
-from claude_harness.tool_types import ToolType
-from claude_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.tool_types import ToolType
+from agent_harness.tools import ToolContext, ToolResult, tool
 from my_agent.guards.customer_confirmation_guard import confirm_customer_change
 
 
@@ -579,9 +579,9 @@ From Claude's point of view, `substitute_item` is one tool call. From the applic
 Applications using this harness should register the Claude activity plus the generic tool and guard routers:
 
 ```python
-from claude_harness.claude_agent import call_claude
-from claude_harness.guards import run_guard_activity
-from claude_harness.tools import run_tool_activity
+from agent_harness.guards import run_guard_activity
+from agent_harness.providers.claude import call_claude
+from agent_harness.tools import run_tool_activity
 from my_agent.workflows.customer_confirmation_workflow import (
     CustomerConfirmationWorkflow,
     send_customer_confirmation_email,

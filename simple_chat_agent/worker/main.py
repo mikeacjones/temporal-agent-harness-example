@@ -8,14 +8,14 @@ import uvicorn
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from claude_harness.claude_agent import call_claude
-from claude_harness.guards import run_guard_activity
-from claude_harness.mcp import (
+from agent_harness.guards import run_guard_activity
+from agent_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
-from claude_harness.streaming import configure_stream_sink
-from claude_harness.tools import run_tool_activity
+from agent_harness.streaming import configure_stream_sink
+from agent_harness.tools import run_tool_activity
+from agent_harness.providers.claude import call_claude
 from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.worker.demo_workspace_activities import (
     configure_demo_workspace,

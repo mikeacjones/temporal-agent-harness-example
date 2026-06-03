@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 
 McpAuthMode = Literal["none", "bearer", "oauth"]
@@ -11,7 +11,7 @@ McpAuthMode = Literal["none", "bearer", "oauth"]
 class HttpMcpToolConfig:
     name: str
     description: str
-    input_schema: dict[str, Any]
+    input_schema: dict
     public_name: str | None = None
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Literal
 
 from temporalio import workflow
@@ -13,11 +14,9 @@ from temporalio.common import (
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.claude_agent import (
-        ClaudeThinkingConfig,
-        DEFAULT_MAX_CONTEXT_TOKENS,
-    )
-    from claude_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
+    from agent_harness.mcp_types import HttpMcpServerConfig
+    from agent_harness.providers.claude import ClaudeThinkingConfig
     from simple_chat_agent import TASK_QUEUE
     from simple_chat_agent.worker.workflow import (
         ChatMessage,
@@ -29,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
 
 CHAT_REGISTRY_PREFIX = "simple-chat-user-"
 ChatStatus = Literal["active", "deleting"]
+USER_WORKFLOW_RUN_TTL = timedelta(days=15)
 
 
 @dataclass
@@ -45,6 +45,7 @@ class UserChatsInput:
     chats: list[ChatRecord] = field(default_factory=list)
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     demo_workspace: "UserDemoWorkspaceRecord | None" = None
+    last_touched_at: str = ""
 
 
 def user_email_search_attributes(
@@ -142,9 +143,19 @@ class UserChatsWorkflow:
         self._chats: dict[str, ChatRecord] = {}
         self._mcp_servers: dict[str, HttpMcpServerConfig] = {}
         self._demo_workspace: UserDemoWorkspaceRecord | None = None
+        self._run_started_at: datetime | None = None
+        self._last_touched_at: datetime | None = None
+        self._touched_this_run = False
 
     @workflow.run
     async def run(self, request: UserChatsInput) -> None:
+        self._run_started_at = workflow.now()
+        self._last_touched_at = _parse_datetime(request.last_touched_at)
+        if self._last_touched_at is None:
+            self._last_touched_at = self._run_started_at
+            self._touched_this_run = True
+        else:
+            self._touched_this_run = self._last_touched_at > self._run_started_at
         self._user_id = request.user_id
         self._user_email = request.user_email
         self._search_attr_name = request.search_attr_name
@@ -156,29 +167,32 @@ class UserChatsWorkflow:
         }
         self._demo_workspace = request.demo_workspace
 
-        # This entity workflow receives an update on every chat create/touch/
-        # forget and MCP change, so its history grows unbounded. Continue-as-new
-        # when the server suggests it AND no update handler is mid-flight (so we
-        # never drop an in-flight update), carrying the full registry state
-        # forward. Child chat workflows are unaffected (ParentClosePolicy.ABANDON
-        # + external-handle lifecycle ops).
-        await workflow.wait_condition(
-            lambda: workflow.info().is_continue_as_new_suggested()
-            and workflow.all_handlers_finished()
-        )
-        workflow.continue_as_new(
-            UserChatsInput(
-                user_id=self._user_id,
-                user_email=self._user_email,
-                search_attr_name=self._search_attr_name,
-                chats=list(self._chats.values()),
-                mcp_servers=list(self._mcp_servers.values()),
-                demo_workspace=self._demo_workspace,
+        # This entity workflow receives updates on every chat create/touch/forget
+        # and MCP/workspace change. Checkpoint active runs before claim-checked
+        # payload lifecycle can expire; if no update touched this run for a full
+        # TTL, close the registry and its tracked chat workflows.
+        while True:
+            await workflow.wait_condition(
+                lambda: (
+                    workflow.info().is_continue_as_new_suggested()
+                    or self._checkpoint_due()
+                )
+                and workflow.all_handlers_finished(),
+                timeout=self._time_until_checkpoint(),
             )
-        )
+            if not workflow.all_handlers_finished():
+                continue
+            if workflow.info().is_continue_as_new_suggested():
+                workflow.continue_as_new(self._continue_as_new_input())
+            if self._checkpoint_due():
+                if self._touched_this_run:
+                    workflow.continue_as_new(self._continue_as_new_input())
+                await self._delete_all_chats()
+                return
 
     @workflow.update
     async def create_chat(self, request: CreateChatRequest) -> ChatRecord:
+        self._touch()
         workflow_id = f"simple-chat-{workflow.uuid4()}"
         task_queue = request.task_queue or TASK_QUEUE
         initial_message = (
@@ -214,6 +228,7 @@ class UserChatsWorkflow:
                 transcript=transcript,
                 pending_messages=pending_messages,
                 good_place_censor=request.good_place_censor,
+                last_touched_at=workflow.now().isoformat(),
             ),
             id=workflow_id,
             task_queue=task_queue,
@@ -239,6 +254,7 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def touch_chat(self, request: TouchChatRequest) -> ChatRecord | None:
+        self._touch()
         record = self._chats.get(request.workflow_id)
         if record is None:
             return None
@@ -257,12 +273,14 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def forget_chat(self, workflow_id: str) -> None:
+        self._touch()
         self._chats.pop(workflow_id, None)
 
     @workflow.update
     async def upsert_mcp_server(
         self, request: UpdateMcpServerRequest
     ) -> list[HttpMcpServerConfig]:
+        self._touch()
         self._mcp_servers[request.server.server_id] = request.server
         await self._broadcast_tool_connections(
             request.available_tool_names,
@@ -274,6 +292,7 @@ class UserChatsWorkflow:
     async def delete_mcp_server(
         self, request: DeleteMcpServerRequest
     ) -> list[HttpMcpServerConfig]:
+        self._touch()
         self._mcp_servers.pop(request.server_id, None)
         await self._broadcast_tool_connections(
             request.available_tool_names,
@@ -283,6 +302,7 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def delete_chat(self, workflow_id: str) -> None:
+        self._touch()
         record = self._chats.get(workflow_id)
         if record is None:
             return
@@ -311,6 +331,7 @@ class UserChatsWorkflow:
         self,
         record: UserDemoWorkspaceRecord,
     ) -> UserDemoWorkspaceRecord:
+        self._touch()
         updated = UserDemoWorkspaceRecord(
             control_workflow_id=record.control_workflow_id,
             status=record.status,
@@ -326,6 +347,7 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def clear_demo_workspace(self) -> None:
+        self._touch()
         self._demo_workspace = None
 
     @workflow.query
@@ -369,6 +391,57 @@ class UserChatsWorkflow:
                 )
             except Exception:
                 pass
+
+    def _touch(self) -> None:
+        self._last_touched_at = workflow.now()
+        self._touched_this_run = True
+
+    def _checkpoint_due(self) -> bool:
+        if self._run_started_at is None:
+            return False
+        return workflow.now() >= self._run_started_at + USER_WORKFLOW_RUN_TTL
+
+    def _time_until_checkpoint(self) -> timedelta:
+        if self._run_started_at is None:
+            return USER_WORKFLOW_RUN_TTL
+        remaining = (self._run_started_at + USER_WORKFLOW_RUN_TTL) - workflow.now()
+        return max(remaining, timedelta())
+
+    def _continue_as_new_input(self) -> UserChatsInput:
+        return UserChatsInput(
+            user_id=self._user_id,
+            user_email=self._user_email,
+            search_attr_name=self._search_attr_name,
+            chats=list(self._chats.values()),
+            mcp_servers=list(self._mcp_servers.values()),
+            demo_workspace=self._demo_workspace,
+            last_touched_at=(
+                self._last_touched_at.isoformat()
+                if self._last_touched_at is not None
+                else ""
+            ),
+        )
+
+    async def _delete_all_chats(self) -> None:
+        for record in list(self._chats.values()):
+            if record.status != "active":
+                continue
+            handle = workflow.get_external_workflow_handle(record.workflow_id)
+            try:
+                await handle.signal(SimpleChatWorkflow.delete)
+                await handle.cancel()
+            except Exception:
+                pass
+        self._chats.clear()
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _conversation_title(message: str) -> str:

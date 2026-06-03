@@ -6,7 +6,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from temporalio.client import Client
 
@@ -19,6 +19,7 @@ from simple_chat_agent.api.artifacts import artifact_response
 from simple_chat_agent.api.auth import AuthenticatedUser
 from simple_chat_agent.api.schemas import (
     ApprovalDecisionRequest,
+    AttachmentTextRequest,
     CreateSessionRequest,
     MessageRequest,
     SteerRequest,
@@ -42,7 +43,16 @@ from simple_chat_agent.api.thinking import (
     good_place_enabled,
     thinking_config_from_request,
 )
-from simple_chat_agent.common.store import AppStore
+from simple_chat_agent.common.attachments import (
+    AttachmentValidationError,
+    artifact_is_user_attachment,
+    attachment_dict,
+    attachment_dicts,
+    attachment_ref_from_artifact,
+    create_user_attachment,
+    generated_artifacts,
+)
+from simple_chat_agent.common.store import AppStore, ArtifactRecord, artifact_is_expired
 from simple_chat_agent.worker.tools import (
     configured_research_tool_names,
     tool_names_for_connections,
@@ -331,11 +341,17 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         request: MessageRequest,
     ) -> dict[str, str]:
         user = await deps.require_conversation_owner(http_request, workflow_id)
+        attachments = _attachment_refs_for_request(
+            deps.store(),
+            user_id=user.user_id,
+            workflow_id=workflow_id,
+            attachment_ids=request.attachment_ids,
+        )
         await deps.signal_workflow(
             http_request,
             workflow_id,
             SimpleChatWorkflow.chat,
-            request.message,
+            args=[request.message, attachments],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -353,11 +369,17 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         request: SteerRequest,
     ) -> dict[str, str]:
         user = await deps.require_conversation_owner(http_request, workflow_id)
+        attachments = _attachment_refs_for_request(
+            deps.store(),
+            user_id=user.user_id,
+            workflow_id=workflow_id,
+            attachment_ids=request.attachment_ids,
+        )
         await deps.signal_workflow(
             http_request,
             workflow_id,
             SimpleChatWorkflow.steer,
-            args=[request.message, request.mode],
+            args=[request.message, request.mode, attachments],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -416,14 +438,83 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         workflow_id: str,
     ) -> dict[str, Any]:
         user = await deps.require_conversation_owner(request, workflow_id)
+        artifacts = deps.store().list_artifacts(
+            user_id=user.user_id,
+            workflow_id=workflow_id,
+        )
+        return {"artifacts": artifact_dicts(generated_artifacts(artifacts))}
+
+    @router.get("/api/sessions/{workflow_id}/attachments")
+    async def list_session_attachments(
+        request: Request,
+        workflow_id: str,
+    ) -> dict[str, Any]:
+        user = await deps.require_conversation_owner(request, workflow_id)
         return {
-            "artifacts": artifact_dicts(
+            "attachments": attachment_dicts(
                 deps.store().list_artifacts(
                     user_id=user.user_id,
                     workflow_id=workflow_id,
                 )
             )
         }
+
+    @router.post("/api/sessions/{workflow_id}/attachments")
+    async def upload_attachment(
+        request: Request,
+        workflow_id: str,
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        user = await deps.require_conversation_owner(request, workflow_id)
+        content = await file.read()
+        try:
+            artifact = create_user_attachment(
+                deps.store(),
+                user_id=user.user_id,
+                conversation_id=workflow_id,
+                workflow_id=workflow_id,
+                name=file.filename or "attachment",
+                content=content,
+                mime_type=file.content_type,
+                upload_kind="file",
+            )
+        except AttachmentValidationError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+        await deps.touch_conversation(
+            user.user_id,
+            workflow_id,
+            user_email=user.username,
+        )
+        await deps.touch_demo_workspace()
+        return {"attachment": attachment_dict(artifact)}
+
+    @router.post("/api/sessions/{workflow_id}/attachments/text")
+    async def create_text_attachment(
+        request: Request,
+        workflow_id: str,
+        attachment_request: AttachmentTextRequest,
+    ) -> dict[str, Any]:
+        user = await deps.require_conversation_owner(request, workflow_id)
+        try:
+            artifact = create_user_attachment(
+                deps.store(),
+                user_id=user.user_id,
+                conversation_id=workflow_id,
+                workflow_id=workflow_id,
+                name=attachment_request.name,
+                content=attachment_request.content.encode("utf-8"),
+                mime_type=attachment_request.mime_type,
+                upload_kind="paste",
+            )
+        except AttachmentValidationError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+        await deps.touch_conversation(
+            user.user_id,
+            workflow_id,
+            user_email=user.username,
+        )
+        await deps.touch_demo_workspace()
+        return {"attachment": attachment_dict(artifact)}
 
     @router.get("/api/artifacts/{artifact_id}")
     async def view_artifact(request: Request, artifact_id: str) -> Response:
@@ -432,7 +523,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             user_id=user.user_id,
             artifact_id=artifact_id,
         )
-        if artifact is None:
+        if artifact is None or artifact_is_user_attachment(artifact):
             raise HTTPException(status_code=404, detail="Artifact not found")
         return artifact_response(deps.store(), artifact, disposition="inline")
 
@@ -443,8 +534,28 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             user_id=user.user_id,
             artifact_id=artifact_id,
         )
-        if artifact is None:
+        if artifact is None or artifact_is_user_attachment(artifact):
             raise HTTPException(status_code=404, detail="Artifact not found")
+        return artifact_response(deps.store(), artifact, disposition="attachment")
+
+    @router.get("/api/attachments/{attachment_id}")
+    async def view_attachment(request: Request, attachment_id: str) -> Response:
+        user = deps.current_user(request)
+        artifact = _get_user_attachment(
+            deps.store(),
+            user_id=user.user_id,
+            attachment_id=attachment_id,
+        )
+        return artifact_response(deps.store(), artifact, disposition="inline")
+
+    @router.get("/api/attachments/{attachment_id}/download")
+    async def download_attachment(request: Request, attachment_id: str) -> Response:
+        user = deps.current_user(request)
+        artifact = _get_user_attachment(
+            deps.store(),
+            user_id=user.user_id,
+            attachment_id=attachment_id,
+        )
         return artifact_response(deps.store(), artifact, disposition="attachment")
 
     @router.get("/api/sessions/{workflow_id}/events")
@@ -492,3 +603,42 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         return {"status": "ok"}
 
     return router
+
+
+def _attachment_refs_for_request(
+    store: AppStore,
+    *,
+    user_id: str,
+    workflow_id: str,
+    attachment_ids: list[str],
+) -> list[Any]:
+    refs: list[Any] = []
+    seen: set[str] = set()
+    for attachment_id in attachment_ids:
+        normalized_id = str(attachment_id or "").strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        artifact = _get_user_attachment(
+            store,
+            user_id=user_id,
+            attachment_id=normalized_id,
+        )
+        if artifact.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        refs.append(attachment_ref_from_artifact(artifact))
+    return refs
+
+
+def _get_user_attachment(
+    store: AppStore,
+    *,
+    user_id: str,
+    attachment_id: str,
+) -> ArtifactRecord:
+    artifact = store.get_artifact(user_id=user_id, artifact_id=attachment_id)
+    if artifact is None or not artifact_is_user_attachment(artifact):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if artifact_is_expired(artifact):
+        raise HTTPException(status_code=410, detail="Attachment has expired")
+    return artifact

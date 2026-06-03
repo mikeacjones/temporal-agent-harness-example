@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+ARTIFACT_RETENTION_DAYS = 30
+
 
 @dataclass(frozen=True)
 class ConversationRecord:
@@ -406,13 +408,15 @@ class AppStore:
                 content=content,
                 metadata=metadata,
             )
+        now = _now()
         artifact_id = f"artifact_{uuid4().hex}"
         safe_name = _safe_artifact_name(name)
         artifact_path = self._artifact_dir / f"{artifact_id}-{safe_name}"
         artifact_path.write_bytes(content)
 
-        now = _now()
-        metadata_json = json.dumps(metadata if metadata is not None else {})
+        metadata_json = json.dumps(
+            _metadata_with_expiration(metadata, created_at=now)
+        )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -802,7 +806,9 @@ class S3DynamoArtifactStore:
         )
         now = _now()
         path = f"s3://{self._bucket}/{key}"
-        metadata_json = json.dumps(metadata if metadata is not None else {})
+        metadata_json = json.dumps(
+            _metadata_with_expiration(metadata, created_at=now)
+        )
         self._table.put_item(
             Item={
                 "user_id": user_id,
@@ -908,6 +914,30 @@ def read_artifact_bytes(artifact: ArtifactRecord) -> bytes:
     return path.read_bytes()
 
 
+def artifact_expires_at(artifact: ArtifactRecord) -> str:
+    metadata_expires_at = artifact.metadata.get("expires_at")
+    if isinstance(metadata_expires_at, str) and metadata_expires_at:
+        return metadata_expires_at
+    return _expiration_for_created_at(artifact.created_at)
+
+
+def artifact_is_expired(
+    artifact: ArtifactRecord,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(artifact_expires_at(artifact))
+    except ValueError:
+        return False
+    check_time = now or datetime.now(UTC)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if check_time.tzinfo is None:
+        check_time = check_time.replace(tzinfo=UTC)
+    return check_time >= expires_at
+
+
 def app_store() -> AppStore:
     return AppStore()
 
@@ -955,3 +985,23 @@ def _safe_artifact_name(name: str) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _metadata_with_expiration(
+    metadata: dict[str, Any] | None,
+    *,
+    created_at: str,
+) -> dict[str, Any]:
+    result = dict(metadata or {})
+    result.setdefault("expires_at", _expiration_for_created_at(created_at))
+    return result
+
+
+def _expiration_for_created_at(created_at: str) -> str:
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        created = datetime.now(UTC)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return (created + timedelta(days=ARTIFACT_RETENTION_DAYS)).isoformat()

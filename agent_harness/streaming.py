@@ -14,7 +14,7 @@ class StreamEvent:
     tool_name: str | None
     step: str | None
     kind: str
-    payload: Any
+    payload: object
     sequence: int
 
 
@@ -66,17 +66,13 @@ def configure_stream_sink(
     _raise_stream_errors = raise_stream_errors
 
 
-def stream_sink_configured() -> bool:
-    return _stream_sink is not None
-
-
 @dataclass
 class EmitStreamEventRequest:
     stream_id: str | None
     tool_name: str | None
     step: str | None
     kind: str
-    payload: Any
+    payload: object
 
 
 async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
@@ -90,5 +86,5 @@ async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
 
 if temporal_activity is not None:
     emit_stream_event_activity = temporal_activity.defn(
-        name="claude_harness.emit_stream_event"
+        name="agent_harness.emit_stream_event"
     )(emit_stream_event_activity)

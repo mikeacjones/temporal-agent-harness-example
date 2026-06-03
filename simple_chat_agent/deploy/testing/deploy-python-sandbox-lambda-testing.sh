@@ -37,8 +37,8 @@ from pathlib import Path
 root = Path(sys.argv[1])
 zip_path = Path(sys.argv[2])
 files = [
-    "claude_harness/__init__.py",
-    "claude_harness/streaming.py",
+    "agent_harness/__init__.py",
+    "agent_harness/streaming.py",
     "simple_chat_agent/__init__.py",
     "simple_chat_agent/worker/__init__.py",
     "simple_chat_agent/worker/sandbox/__init__.py",

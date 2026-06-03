@@ -54,4 +54,6 @@ kubectl rollout status "deployment/${FRONTEND_DEPLOYMENT}" -n "${NAMESPACE}" --t
 kubectl rollout status "deployment/${API_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 kubectl rollout status "deployment/${WORKER_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 
+"${ROOT}/simple_chat_agent/deploy/configure-s3-lifecycle.sh"
+
 echo ">> Done. Deployed ${IMAGE}:${TAG}"
