@@ -346,8 +346,7 @@ async def _query_snapshot(
 ) -> SimpleChatSnapshot:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.snapshot,
-        limit,
-        max_bytes,
+        args=[limit, max_bytes],
     )
 
 
@@ -360,9 +359,7 @@ async def _query_transcript_page(
 ) -> TranscriptPage:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_page,
-        before,
-        limit,
-        max_bytes,
+        args=[before, limit, max_bytes],
     )
 
 
@@ -374,8 +371,7 @@ async def _query_transcript_deltas_since(
 ) -> TranscriptDeltaResult:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_deltas_since,
-        after_revision,
-        max_bytes,
+        args=[after_revision, max_bytes],
     )
 
 
