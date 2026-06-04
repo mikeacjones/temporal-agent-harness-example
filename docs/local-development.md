@@ -1,11 +1,9 @@
 # Running Locally
 
-This guide runs the demo on your machine without Google OAuth. Local auth is
-explicitly opt-in and is intended only for private local development.
+This guide runs the demo on your machine with only a single external dependency: the LLM provider. 
 
 ## Required Tools
 
-- Python 3.12
 - `uv`
 - Node.js 22 and `npm`
 - Temporal CLI
