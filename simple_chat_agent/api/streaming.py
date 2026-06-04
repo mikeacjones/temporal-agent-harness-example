@@ -15,6 +15,7 @@ from simple_chat_agent.common.streaming import stream_path
 STREAM_ACTIVE_POLL_INTERVAL_SECONDS = 0.02
 STREAM_IDLE_POLL_INTERVAL_SECONDS = 0.5
 STREAM_BUFFER_TTL_SECONDS = 1800.0
+TURN_STREAM_REPLAY_LIMIT = 100
 
 
 class StreamBroker:
@@ -28,9 +29,33 @@ class StreamBroker:
         # Otherwise (local dev) it is tailed from per-stream files on disk.
         return bool(os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip())
 
-    def append(self, stream_id: str, event: dict[str, Any]) -> None:
+    def append(self, stream_id: str, event: dict[str, Any]) -> str:
+        return self.append_event(stream_id, "stream", event)
+
+    def append_event(
+        self,
+        stream_id: str,
+        event: str,
+        data: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
         entry = self._ensure_buffer(stream_id)
-        entry["events"].append(event)
+        if idempotency_key:
+            existing = entry["idempotency"].get(idempotency_key)
+            if existing is not None:
+                return existing
+
+        entry["events"].append(
+            {
+                "event": event,
+                "data": data,
+                "idempotency_key": idempotency_key or "",
+            }
+        )
+        cursor = self._buffer_event_id(entry, len(entry["events"]))
+        if idempotency_key:
+            entry["idempotency"][idempotency_key] = cursor
         now = time.monotonic()
         entry["updated"] = now
         # Lazily evict whole streams that have gone idle, to bound memory.
@@ -40,6 +65,7 @@ class StreamBroker:
             if now - value["updated"] > STREAM_BUFFER_TTL_SECONDS
         ]:
             self._buffers.pop(stale, None)
+        return cursor
 
     def clear(self, stream_id: str) -> None:
         if self.http_enabled:
@@ -66,11 +92,56 @@ class StreamBroker:
             return self._buffer_replay(stream_id, cursor=cursor, limit=limit)
         return self._file_replay(stream_id, cursor=cursor, limit=limit)
 
+    async def turn_event_stream(
+        self,
+        workflow_id: str,
+        request: Request,
+        *,
+        cursor: str,
+    ) -> AsyncIterator[dict[str, str]]:
+        current_cursor = cursor
+        sleep_seconds = STREAM_ACTIVE_POLL_INTERVAL_SECONDS
+        while not await request.is_disconnected():
+            replay = self._replay_entries(
+                workflow_id,
+                cursor=current_cursor,
+                limit=TURN_STREAM_REPLAY_LIMIT,
+            )
+            if not replay["replay_available"]:
+                yield self._event(
+                    "reconcile",
+                    {
+                        "workflow_id": workflow_id,
+                        "reason": replay.get("reason")
+                        or "stream replay unavailable",
+                    },
+                    event_id=replay.get("cursor") or current_cursor,
+                )
+                return
+
+            entries = replay["entries"]
+            for entry in entries:
+                current_cursor = entry["id"]
+                event = entry["event"]
+                data = dict(entry["data"])
+                if event == "turn_settled":
+                    data["cursor"] = current_cursor
+                yield self._event(event, data, event_id=current_cursor)
+                if event == "turn_settled":
+                    return
+
+            if entries:
+                sleep_seconds = STREAM_ACTIVE_POLL_INTERVAL_SECONDS
+            else:
+                current_cursor = replay.get("cursor") or current_cursor
+                sleep_seconds = STREAM_IDLE_POLL_INTERVAL_SECONDS
+            await asyncio.sleep(sleep_seconds)
+
     async def event_stream(
         self,
         workflow_id: str,
         request: Request,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, str]]:
         source = (
             self._buffer_event_stream(workflow_id, request)
             if self.http_enabled
@@ -84,6 +155,7 @@ class StreamBroker:
         if entry is None:
             entry = {
                 "events": [],
+                "idempotency": {},
                 "generation": uuid4().hex[:12],
                 "updated": time.monotonic(),
             }
@@ -109,27 +181,50 @@ class StreamBroker:
         return None
 
     @staticmethod
-    def _sse(event: str, data: Any, *, event_id: str | None = None) -> str:
-        prefix = f"id: {event_id}\n" if event_id is not None else ""
-        return f"{prefix}event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+    def event(
+        event: str,
+        data: dict[str, Any],
+        *,
+        event_id: str | None = None,
+    ) -> dict[str, str]:
+        value = {
+            "event": event,
+            "data": json.dumps(data, default=str),
+        }
+        if event_id is not None:
+            value["id"] = event_id
+        return value
 
-    def _stream_reconcile_event(
+    _event = event
+
+    def _replay_entries(
         self,
         workflow_id: str,
         *,
-        reason: str,
-        event_id: str,
-    ) -> str:
-        return self._sse(
-            "reconcile",
-            {
-                "workflow_id": workflow_id,
-                "reason": reason,
-            },
-            event_id=event_id,
-        )
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        if self.http_enabled:
+            return self._buffer_replay_entries(workflow_id, cursor=cursor, limit=limit)
+        return self._file_replay_entries(workflow_id, cursor=cursor, limit=limit)
 
     def _file_replay(
+        self,
+        workflow_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        replay = self._file_replay_entries(workflow_id, cursor=cursor, limit=limit)
+        entries = replay.pop("entries", [])
+        return {
+            **replay,
+            "events": [
+                entry["data"] for entry in entries if entry["event"] == "stream"
+            ],
+        }
+
+    def _file_replay_entries(
         self,
         workflow_id: str,
         *,
@@ -142,8 +237,15 @@ class StreamBroker:
             with suppress(ValueError):
                 offset = max(0, int(cursor))
         if not path.exists():
+            if offset == 0:
+                return {
+                    "entries": [],
+                    "cursor": "0",
+                    "replay_available": True,
+                    "reason": "",
+                }
             return {
-                "events": [],
+                "entries": [],
                 "cursor": "0",
                 "replay_available": False,
                 "reason": "stream file unavailable",
@@ -151,19 +253,24 @@ class StreamBroker:
         if offset > path.stat().st_size:
             offset = 0
 
-        events: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
         position = offset
         with path.open("r", encoding="utf-8") as stream:
             stream.seek(offset)
             for line in stream:
                 position = stream.tell()
                 with suppress(json.JSONDecodeError):
-                    events.append(json.loads(line))
-                if len(events) >= limit:
+                    entries.append(
+                        {
+                            "id": str(position),
+                            **self._entry_from_json_line(json.loads(line)),
+                        }
+                    )
+                if len(entries) >= limit:
                     break
 
         return {
-            "events": events,
+            "entries": entries,
             "cursor": str(position),
             "replay_available": True,
             "reason": "",
@@ -176,10 +283,26 @@ class StreamBroker:
         cursor: str | None,
         limit: int,
     ) -> dict[str, Any]:
+        replay = self._buffer_replay_entries(workflow_id, cursor=cursor, limit=limit)
+        entries = replay.pop("entries", [])
+        return {
+            **replay,
+            "events": [
+                entry["data"] for entry in entries if entry["event"] == "stream"
+            ],
+        }
+
+    def _buffer_replay_entries(
+        self,
+        workflow_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
         entry = self._buffers.get(workflow_id)
         if entry is None:
             return {
-                "events": [],
+                "entries": [],
                 "cursor": "",
                 "replay_available": False,
                 "reason": "stream buffer unavailable",
@@ -189,7 +312,7 @@ class StreamBroker:
         parsed = self._parse_buffer_event_id(cursor, entry)
         if cursor and parsed is None:
             return {
-                "events": [],
+                "entries": [],
                 "cursor": self._buffer_event_id(entry, len(events)),
                 "replay_available": False,
                 "reason": "stream cursor unavailable",
@@ -199,7 +322,14 @@ class StreamBroker:
         start = min(max(0, start), len(events))
         end = min(len(events), start + limit)
         return {
-            "events": events[start:end],
+            "entries": [
+                {
+                    "id": self._buffer_event_id(entry, index + 1),
+                    "event": events[index]["event"],
+                    "data": events[index]["data"],
+                }
+                for index in range(start, end)
+            ],
             "cursor": self._buffer_event_id(entry, end),
             "replay_available": True,
             "reason": "",
@@ -209,7 +339,7 @@ class StreamBroker:
         self,
         workflow_id: str,
         request: Request,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, str]]:
         path = stream_path(workflow_id)
         # Resume from where this EventSource left off (the browser replays its
         # last received id on auto-reconnect, e.g. after a backgrounded tab).
@@ -234,9 +364,12 @@ class StreamBroker:
             needs_reconcile = True
 
         if needs_reconcile:
-            yield self._stream_reconcile_event(
-                workflow_id,
-                reason="stream cursor unavailable",
+            yield self._event(
+                "reconcile",
+                {
+                    "workflow_id": workflow_id,
+                    "reason": "stream cursor unavailable",
+                },
                 event_id=str(offset),
             )
             return
@@ -247,9 +380,12 @@ class StreamBroker:
             if path.exists():
                 if offset > path.stat().st_size:
                     offset = path.stat().st_size
-                    yield self._stream_reconcile_event(
-                        workflow_id,
-                        reason="stream cursor reset",
+                    yield self._event(
+                        "reconcile",
+                        {
+                            "workflow_id": workflow_id,
+                            "reason": "stream cursor reset",
+                        },
                         event_id=str(offset),
                     )
                     break
@@ -267,7 +403,12 @@ class StreamBroker:
                 for line, position in new_lines:
                     with suppress(json.JSONDecodeError):
                         emitted = True
-                        yield self._sse("stream", json.loads(line), event_id=str(position))
+                        entry = self._entry_from_json_line(json.loads(line))
+                        yield self._event(
+                            entry["event"],
+                            entry["data"],
+                            event_id=str(position),
+                        )
 
             sleep_seconds = (
                 STREAM_ACTIVE_POLL_INTERVAL_SECONDS
@@ -280,7 +421,7 @@ class StreamBroker:
         self,
         workflow_id: str,
         request: Request,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict[str, str]]:
         # Resume by generation-scoped buffer index (the browser replays its
         # last received id). If the generation changed, this web process no
         # longer has the exact missed events and asks the browser to fetch a
@@ -303,9 +444,12 @@ class StreamBroker:
             needs_reconcile = True
 
         if needs_reconcile:
-            yield self._stream_reconcile_event(
-                workflow_id,
-                reason="stream cursor unavailable",
+            yield self._event(
+                "reconcile",
+                {
+                    "workflow_id": workflow_id,
+                    "reason": "stream cursor unavailable",
+                },
                 event_id=self._buffer_event_id(entry, resume),
             )
             return
@@ -319,18 +463,24 @@ class StreamBroker:
             if entry["generation"] != cursor_generation or resume > len(events):
                 resume = len(events)
                 cursor_generation = entry["generation"]
-                yield self._stream_reconcile_event(
-                    workflow_id,
-                    reason="stream buffer reset",
+                yield self._event(
+                    "reconcile",
+                    {
+                        "workflow_id": workflow_id,
+                        "reason": "stream buffer reset",
+                    },
                     event_id=self._buffer_event_id(entry, resume),
                 )
                 break
 
             for index in range(resume, len(events)):
                 emitted = True
-                yield self._sse(
-                    "stream",
-                    events[index],
+                entry_data = dict(events[index]["data"])
+                if events[index]["event"] == "turn_settled":
+                    entry_data["cursor"] = self._buffer_event_id(entry, index + 1)
+                yield self._event(
+                    events[index]["event"],
+                    entry_data,
                     event_id=self._buffer_event_id(entry, index + 1),
                 )
             resume = len(events)
@@ -341,3 +491,15 @@ class StreamBroker:
                 else STREAM_IDLE_POLL_INTERVAL_SECONDS
             )
             await asyncio.sleep(sleep_seconds)
+
+    @staticmethod
+    def _entry_from_json_line(value: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(value.get("event"), str) and isinstance(value.get("data"), dict):
+            return {
+                "event": value["event"],
+                "data": value["data"],
+            }
+        return {
+            "event": "stream",
+            "data": value,
+        }

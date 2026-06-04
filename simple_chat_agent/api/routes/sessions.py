@@ -4,10 +4,11 @@ import asyncio
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
+from sse_starlette.sse import EventSourceResponse
 from temporalio.client import Client
 
 from simple_chat_agent.api.anthropic_models import (
@@ -65,7 +66,6 @@ from simple_chat_agent.worker.workflow import SimpleChatWorkflow
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_HARD_MAX_BYTES
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_MIN_MAX_BYTES
-
 
 @dataclass(frozen=True)
 class SessionRouteDeps:
@@ -341,7 +341,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         http_request: Request,
         workflow_id: str,
         request: MessageRequest,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         user = await deps.require_conversation_owner(http_request, workflow_id)
         attachments = _attachment_refs_for_request(
             deps.store(),
@@ -349,11 +349,12 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
             attachment_ids=request.attachment_ids,
         )
+        cursor = deps.stream_broker().cursor(workflow_id)
         await deps.signal_workflow(
             http_request,
             workflow_id,
             SimpleChatWorkflow.chat,
-            args=[request.message, attachments],
+            args=[request.message, attachments, request.after_revision],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -362,7 +363,63 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             user_email=user.username,
         )
         await deps.touch_demo_workspace()
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "cursor": cursor,
+            "workflow_id": workflow_id,
+        }
+
+    @router.post("/api/sessions/{workflow_id}/chat/stream")
+    async def chat_stream(
+        http_request: Request,
+        workflow_id: str,
+        request: MessageRequest,
+    ) -> EventSourceResponse:
+        user = await deps.require_conversation_owner(http_request, workflow_id)
+        attachments = _attachment_refs_for_request(
+            deps.store(),
+            user_id=user.user_id,
+            workflow_id=workflow_id,
+            attachment_ids=request.attachment_ids,
+        )
+        cursor = deps.stream_broker().cursor(workflow_id)
+        await deps.signal_workflow(
+            http_request,
+            workflow_id,
+            SimpleChatWorkflow.chat,
+            args=[request.message, attachments, request.after_revision],
+        )
+        await deps.touch_conversation(
+            user.user_id,
+            workflow_id,
+            title=conversation_title(request.message),
+            user_email=user.username,
+        )
+        await deps.touch_demo_workspace()
+
+        async def generate() -> AsyncIterator[dict[str, str]]:
+            yield deps.stream_broker().event(
+                "turn_accepted",
+                {
+                    "workflow_id": workflow_id,
+                    "cursor": cursor,
+                },
+            )
+
+            async for chunk in deps.stream_broker().turn_event_stream(
+                workflow_id,
+                http_request,
+                cursor=cursor,
+            ):
+                yield chunk
+
+        return EventSourceResponse(
+            generate(),
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @router.post("/api/sessions/{workflow_id}/steer")
     async def steer(
@@ -561,14 +618,38 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         return artifact_response(deps.store(), artifact, disposition="attachment")
 
     @router.get("/api/sessions/{workflow_id}/events")
-    async def events(workflow_id: str, request: Request) -> StreamingResponse:
+    async def events(workflow_id: str, request: Request) -> EventSourceResponse:
         await deps.require_conversation_owner(request, workflow_id)
-        return StreamingResponse(
+        return EventSourceResponse(
             deps.stream_broker().event_stream(workflow_id, request),
-            media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.get("/api/sessions/{workflow_id}/events/turn")
+    async def turn_events(
+        workflow_id: str,
+        request: Request,
+        cursor: str | None = Query(None),
+        after_revision: int = Query(default=0, ge=0),
+    ) -> EventSourceResponse:
+        await deps.require_conversation_owner(request, workflow_id)
+        stream_cursor = (
+            request.headers.get("last-event-id")
+            or cursor
+            or deps.stream_broker().cursor(workflow_id)
+        )
+
+        return EventSourceResponse(
+            deps.stream_broker().turn_event_stream(
+                workflow_id,
+                request,
+                cursor=stream_cursor,
+            ),
+            headers={
+                "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
         )

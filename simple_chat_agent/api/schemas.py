@@ -32,6 +32,7 @@ class CreateSessionRequest(BaseModel):
 class MessageRequest(BaseModel):
     message: str
     attachment_ids: list[str] = Field(default_factory=list)
+    after_revision: int = 0
 
 
 class SteerRequest(MessageRequest):

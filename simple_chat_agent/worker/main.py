@@ -41,6 +41,7 @@ from simple_chat_agent.common.external_storage import simple_chat_data_converter
 from simple_chat_agent.common.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
 from simple_chat_agent.common.streaming import configured_stream_sink
 from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
+from simple_chat_agent.worker.streaming_activities import emit_turn_settled
 from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
 from simple_chat_agent.worker.workflow import SimpleChatWorkflow
 
@@ -77,6 +78,7 @@ async def main() -> None:
             call_agent_api,
             run_tool_activity,
             run_guard_activity,
+            emit_turn_settled,
             provision_demo_workspace,
             resolve_demo_workspace_images,
             create_demo_workspace_namespace,

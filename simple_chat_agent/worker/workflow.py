@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from agent_harness.attachments import AttachmentRef
@@ -89,6 +90,7 @@ class QueuedChatMessage:
     content: str
     transcript_index: int
     attachments: list[AttachmentRef] = field(default_factory=list)
+    settle_after_revision: int = 0
 
 
 @dataclass
@@ -121,6 +123,7 @@ class SimpleChatInput:
     agent_context_state: AgentState | None = None
     pending_messages: list[QueuedChatMessage] = field(default_factory=list)
     active_message_index: int | None = None
+    active_settle_after_revision: int = 0
     approval_memory: list[str] = field(default_factory=list)
     approval_counter: int = 0
     good_place_censor: bool = False
@@ -196,15 +199,21 @@ class SimpleChatWorkflow:
         self._run_started_at: datetime | None = None
         self._last_touched_at: datetime | None = None
         self._touched_this_run = False
+        self._active_settle_after_revision = 0
 
     @workflow.signal
     async def chat(
         self,
         message: str,
         attachments: list[AttachmentRef] | None = None,
+        after_revision: int = 0,
     ) -> None:
         self._touch()
-        transcript_index = self._enqueue_chat(message, attachments=attachments)
+        transcript_index = self._enqueue_chat(
+            message,
+            attachments=attachments,
+            settle_after_revision=after_revision,
+        )
         self._record_transcript_change(
             transcript_index,
             _chat_message_for_queue(self._pending_messages[-1]),
@@ -573,6 +582,7 @@ class SimpleChatWorkflow:
             self._last_touched_at = self._run_started_at
             self._touched_this_run = True
         self._active_message_index = chat_input.active_message_index
+        self._active_settle_after_revision = chat_input.active_settle_after_revision
         self._active_message = None
         self._agent_context_state = chat_input.agent_context_state or chat_input.agent_state
         self._approval_memory = set(chat_input.approval_memory)
@@ -622,6 +632,7 @@ class SimpleChatWorkflow:
         resume_agent_state = chat_input.agent_state
 
         while True:
+            settle_after_revision = self._active_settle_after_revision
             if resume_agent_state is None:
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
@@ -648,11 +659,14 @@ class SimpleChatWorkflow:
                 attachments = queued_message.attachments
                 self._active_message_index = queued_message.transcript_index
                 self._active_message = queued_message
+                settle_after_revision = queued_message.settle_after_revision
+                self._active_settle_after_revision = settle_after_revision
             else:
                 message = None
                 attachments = []
             self._status = "responding"
             self._record_state_change()
+            should_emit_settled = False
             try:
                 result = await self._run_agent_turn(
                     message=message,
@@ -688,13 +702,18 @@ class SimpleChatWorkflow:
                         )
                 self._agent_context_state = await self._agent.compacted_state()
                 self._record_latest_rendered_message_change()
+                should_emit_settled = True
             except UserFacingAgentError as err:
                 self._record_system_message(err.message)
+                should_emit_settled = True
             finally:
                 self._active_message_index = None
                 self._active_message = None
+                self._active_settle_after_revision = 0
                 self._status = "idle"
                 self._record_state_change()
+                if should_emit_settled:
+                    await self._emit_turn_settled(settle_after_revision)
 
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()
@@ -755,6 +774,7 @@ class SimpleChatWorkflow:
         message: str,
         *,
         attachments: list[AttachmentRef] | None = None,
+        settle_after_revision: int = 0,
     ) -> int:
         attachment_refs = list(attachments or [])
         transcript_index = self._next_transcript_index()
@@ -763,9 +783,40 @@ class SimpleChatWorkflow:
                 content=message,
                 transcript_index=transcript_index,
                 attachments=attachment_refs,
+                settle_after_revision=max(0, int(settle_after_revision or 0)),
             )
         )
         return transcript_index
+
+    async def _emit_turn_settled(self, after_revision: int) -> None:
+        if not self._stream_id:
+            return
+        after_revision = max(0, int(after_revision or 0))
+        result = self.transcript_deltas_since(
+            after_revision,
+            TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+        )
+        payload = _transcript_delta_result_payload(result)
+        payload["settled"] = not _transcript_delta_result_still_live(payload)
+        await workflow.execute_activity(
+            "simple_chat_agent.emit_turn_settled",
+            {
+                "stream_id": self._stream_id,
+                "workflow_id": workflow.info().workflow_id,
+                "idempotency_key": (
+                    f"{workflow.info().workflow_id}:"
+                    f"{self._transcript_revision}:"
+                    f"{self._state_revision}:"
+                    f"{after_revision}"
+                ),
+                "result": payload,
+            },
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=30),
+            ),
+        )
 
     async def _run_agent_turn(
         self,
@@ -913,6 +964,7 @@ class SimpleChatWorkflow:
             agent_context_state=agent_context_state,
             pending_messages=list(self._pending_messages),
             active_message_index=self._active_message_index,
+            active_settle_after_revision=self._active_settle_after_revision,
             approval_memory=sorted(self._approval_memory),
             approval_counter=self._approval_counter,
             good_place_censor=chat_input.good_place_censor,
@@ -925,6 +977,41 @@ class SimpleChatWorkflow:
                 else chat_input.last_touched_at
             ),
         )
+
+
+def _transcript_delta_result_payload(result: TranscriptDeltaResult) -> dict[str, Any]:
+    return {
+        "from_revision": result.from_revision,
+        "to_revision": result.to_revision,
+        "needs_snapshot": result.needs_snapshot,
+        "transcript_length": result.transcript_length,
+        "status": result.status,
+        "pending_messages": result.pending_messages,
+        "active_message_index": result.active_message_index,
+        "state_revision": result.state_revision,
+        "limited": result.limited,
+        "byte_limit": result.byte_limit,
+        "estimated_bytes": result.estimated_bytes,
+        "deltas": [
+            {
+                "revision": delta.revision,
+                "index": delta.index,
+                "message": asdict(delta.message),
+            }
+            for delta in result.deltas
+        ],
+    }
+
+
+def _transcript_delta_result_still_live(result: dict[str, Any]) -> bool:
+    if result.get("status") in {"responding", "starting"}:
+        return True
+    try:
+        if int(result.get("pending_messages") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    return result.get("active_message_index") is not None
 
 
 _ATTACHMENT_LINE_RE = re.compile(

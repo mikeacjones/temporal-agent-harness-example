@@ -272,7 +272,7 @@ export function applyTranscriptDeltasInState(previous, result) {
       (workflowState.active_message_index ?? null);
   if (toRevision <= Number(workflowState.transcript_revision || 0)) {
     if (stateOnlyChanged) {
-      return updateWorkflowStateInState(previous, {
+      const next = updateWorkflowStateInState(previous, {
         ...workflowState,
         status: result.status || workflowState.status,
         pending_messages: Number(
@@ -281,8 +281,9 @@ export function applyTranscriptDeltasInState(previous, result) {
         active_message_index: result.active_message_index ?? null,
         state_revision: nextStateRevision,
       });
+      return finalizeSettledStreamInState(next, result);
     }
-    return previous;
+    return finalizeSettledStreamInState(previous, result);
   }
 
   const stateWithSettledPending = {
@@ -293,7 +294,7 @@ export function applyTranscriptDeltasInState(previous, result) {
     }),
   };
 
-  return updateWorkflowStateInState(stateWithSettledPending, {
+  const next = updateWorkflowStateInState(stateWithSettledPending, {
     ...workflowState,
     status: result.status || workflowState.status,
     pending_messages: Number(result.pending_messages ?? workflowState.pending_messages ?? 0),
@@ -305,6 +306,37 @@ export function applyTranscriptDeltasInState(previous, result) {
     transcript_revision: toRevision,
     state_revision: nextStateRevision,
   });
+  return finalizeSettledStreamInState(next, result);
+}
+
+function finalizeSettledStreamInState(state, result) {
+  if (!result?.settled || transcriptDeltaResultStillLive(result)) return state;
+  return markStreamCommittedInState(state, {
+    assistantIndex:
+      latestAssistantDeltaIndex(result) ?? latestAssistantTranscriptIndex(state.workflowState),
+  });
+}
+
+function transcriptDeltaResultStillLive(result) {
+  if (!result) return true;
+  if (result.status === "responding" || result.status === "starting") return true;
+  if (Number(result.pending_messages || 0) > 0) return true;
+  return result.active_message_index !== null && result.active_message_index !== undefined;
+}
+
+function latestAssistantDeltaIndex(result) {
+  let assistantIndex = null;
+  for (const delta of result?.deltas || []) {
+    if (delta?.message?.role !== "assistant") continue;
+    const index = Number(delta.index);
+    if (Number.isFinite(index)) assistantIndex = index;
+  }
+  return assistantIndex;
+}
+
+function latestAssistantTranscriptIndex(workflowState) {
+  const indexes = assistantTranscriptIndexes(workflowState);
+  return indexes.length ? indexes[indexes.length - 1] : null;
 }
 
 function mergeWorkflowTranscriptPage(workflowState, page) {

@@ -334,6 +334,31 @@ async def internal_stream(request: Request) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/internal/stream/event")
+async def internal_stream_event(request: Request) -> dict[str, str]:
+    # Worker -> web: append a named stream event that may be retried by a
+    # workflow activity. The idempotency key lets the broker preserve exactly one
+    # terminal projection event per completed turn while keeping live chunks
+    # best-effort.
+    token = os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip()
+    if not token or request.headers.get("x-stream-token") != token:
+        raise HTTPException(status_code=401, detail="Invalid stream token.")
+    payload = await request.json()
+    stream_id = str(payload.get("stream_id") or "")
+    event = str(payload.get("event") or "")
+    data = payload.get("data")
+    idempotency_key = str(payload.get("idempotency_key") or "")
+    if not stream_id or not event or not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Invalid stream event payload.")
+    cursor = _stream_broker().append_event(
+        stream_id,
+        event,
+        data,
+        idempotency_key=idempotency_key or None,
+    )
+    return {"status": "ok", "cursor": cursor}
+
+
 async def _query_state(workflow_id: str) -> SimpleChatState:
     return await _handle(workflow_id).query(SimpleChatWorkflow.state)
 
