@@ -120,6 +120,18 @@ class PendingApproval:
 
 @dataclass
 class SimpleChatInput:
+    """Durable chat workflow state carried across Continue-As-New.
+
+    `agent_state` is hot resume state for a Continue-As-New that happened
+    mid-agent-run. When present, the next run resumes the agent loop without a
+    new user message.
+
+    `agent_context_state` is idle context state for a workflow between turns.
+    It restores the compacted model-visible context before the next user
+    message starts. Both fields use the same AgentState shape, but they
+    represent different points in the workflow state machine.
+    """
+
     user_ref: str = "local-user"
     conversation_id: str = "local-conversation"
     system_prompt: str = "You are a concise test chatbot."
@@ -616,6 +628,8 @@ class SimpleChatWorkflow:
             pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,
             post_llm_guards=[good_place_post_guard] if chat_input.good_place_censor else None,
         )
+        # Idle state restores the compacted context before waiting for a new
+        # user message. Hot resume state is passed into the agent run below.
         if chat_input.agent_context_state is not None and chat_input.agent_state is None:
             self._agent.restore_idle_state(chat_input.agent_context_state)
         self._status = "idle"

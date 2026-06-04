@@ -9,6 +9,32 @@ translation, stop reasons, and SDK call.
 This split lets an app keep the same workflow, tool, context, approval, and
 attachment behavior while swapping from one model vendor to another.
 
+## What Belongs In This Folder
+
+Provider modules are adapter code. They translate between the harness's generic
+agent concepts and one vendor's API.
+
+Provider modules should contain:
+
+- vendor request and response dataclasses;
+- an `AgentProvider` implementation;
+- pure message/request/response conversion helpers;
+- the Temporal activity that calls the vendor SDK;
+- vendor stream-event translation into `AgentStreamWriter`;
+- a small convenience `Agent` subclass when useful for app construction.
+
+Provider modules should not contain product auth, user state, API routes,
+artifact storage, tool implementations, or UI behavior. Those belong in the
+application.
+
+Current provider modules:
+
+| File | Status |
+| --- | --- |
+| `claude.py` | Primary implementation used by `simple_chat_agent`. |
+| `gemini.py` | Initial Gemini provider implementation. |
+| `chatgpt.py` | Initial ChatGPT provider implementation. |
+
 ## Required Shape
 
 Implement `AgentProvider` from `interface.py`.
@@ -27,6 +53,8 @@ Required provider responsibilities:
 - `request_chat_history` and `replace_request_chat_history`: expose and replace
   the request history as generic `AgentMessage` values. Guards and context
   windowing depend on this.
+- `replace_request_stream_attempt`: update retry-attempt metadata before a
+  provider activity retry so stream consumers can reset duplicate partials.
 - `request_to_dict` / `request_from_dict`: lossless serialization for guard
   activities and workflow state.
 - `response_to_dict` / `response_from_dict`: lossless serialization for guard
@@ -116,6 +144,21 @@ conversion helpers. Examples:
 Do not push those details into `Agent` unless the generic loop truly needs the
 concept. For example, context windowing, tool execution, and approvals are
 generic; Claude thinking is provider-specific.
+
+## Context And Token Budgeting
+
+The generic agent asks the provider for a request-overhead estimate through
+`estimate_request_tokens(...)`. That estimate is used before context windowing
+so the context manager can reserve room for the system prompt and tool schema.
+
+Providers should also detect provider-specific context-limit failures in their
+activity and return the generic `ContextWindowExceeded` error type when
+possible. The generic agent can then compact more aggressively and retry once
+without making every provider expose the same tokenizer.
+
+If a provider has an accurate token-counting API, use it inside the provider
+activity or provider-specific helper. Keep non-deterministic token-count API
+calls out of workflow code.
 
 ## Attachments
 

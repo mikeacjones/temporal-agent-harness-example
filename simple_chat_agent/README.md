@@ -1,6 +1,6 @@
 # Simple Chat Agent
 
-This is the demo application for the Claude harness. It is intentionally not a
+This is the demo application for the agent harness. It is intentionally not a
 generic agent SDK. It shows how an application can compose the harness with its
 own workflow shape, auth model, tool registry, approval UX, artifact storage,
 and streaming UI.
@@ -13,7 +13,7 @@ The app includes:
   HTTP MCP servers for one user.
 - A React/Vite frontend and FastAPI API with login, chat history, streaming
   visibility, tool approvals, tool configuration, and artifact viewing/downloading.
-- A Temporal worker that hosts the chat workflows, subagent workflow, Claude
+- A Temporal worker that hosts the chat workflows, subagent workflow, provider
   activity, generic tool activity, and generic guard activity.
 - Example tools for URL fetches, Python sandbox execution, artifact creation,
   GitHub operations, HTTP MCP servers, optional research/search providers, and

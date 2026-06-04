@@ -24,6 +24,42 @@ longer share a pod or any local volume:
 - `agent-harness-worker` — Temporal worker + codec. Horizontally scalable (bump
   `replicas`); the codec reads claim-checks from S3, so any worker pod decodes.
 
+## Deployment Philosophy
+
+The deployment keeps runtime responsibilities separated even though all three
+processes are built from one Docker image.
+
+- The web pod is static and should not receive application secrets.
+- The API pod owns login, OAuth, browser routes, artifact metadata, and the
+  in-memory stream broker.
+- The worker pod owns Temporal workflow/activity execution and the codec server.
+- S3 and DynamoDB are the durable cross-pod stores.
+- Temporal Cloud is the durable workflow store.
+
+This keeps pod restarts and worker crashes demo-friendly. Crashing a worker
+should interrupt execution, not erase state. Crashing the web pod should only
+affect static asset serving. Crashing the API pod can lose in-memory sideband
+stream buffers, but durable workflow state remains queryable.
+
+## Manifest And Script Map
+
+| Path | Purpose |
+| --- | --- |
+| `deployment.yaml` | Production web/API/worker Deployments and environment wiring. |
+| `service.yaml` | ClusterIP Services for web, API, and codec. |
+| `ingressroute.yaml` | Traefik routes, TLS, HTTPS redirect middleware, and codec host. |
+| `certificate.yaml` | Production wildcard and app certificates. |
+| `serviceaccount.yaml` | Shared ServiceAccount and IRSA role annotation. |
+| `demo-workspace-rbac.yaml` | RBAC that lets the controller create/delete temp namespaces and workloads. |
+| `searxng.yaml` | Internal SearXNG deployment/service used by research tools. |
+| `configure-s3-lifecycle.sh` | Applies the broad S3 expiration policy used by claim-checks, artifacts, and attachments. |
+| `deploy.sh` | Build, push, apply manifests, set images, wait for rollout, refresh S3 lifecycle. |
+| `testing/` | Parallel testing stack manifests and testing deploy scripts. |
+
+Manifests are intentionally plain Kubernetes YAML plus Traefik CRDs. The demo
+does not use Helm or Kustomize so the rendered runtime shape is easy to inspect
+while presenting.
+
 ## Build & push the image
 
 Built for `linux/amd64` (EKS node arch). Build from the **repo root**:
@@ -75,6 +111,40 @@ kubectl apply -f simple_chat_agent/deploy/
 Certificates take ~1 minute to be issued by Let's Encrypt; watch with
 `kubectl get certificate -n $NS`.
 
+For normal production rollouts, prefer `deploy.sh`; it builds an immutable
+timestamp tag, applies manifests, updates the three Deployments, waits for
+rollout, and refreshes the S3 lifecycle policy.
+
+## Testing Stack
+
+The testing stack lives alongside production in the same Kubernetes namespace
+but uses separate Deployment names, hostnames, workflow prefixes, task queues,
+and environment overrides.
+
+Use:
+
+```bash
+./simple_chat_agent/deploy/testing/deploy-testing.sh
+```
+
+The testing script:
+
+1. builds the current branch into a `testing-<timestamp>` image tag;
+2. deploys or updates the testing Python sandbox Lambda;
+3. applies the shared internal SearXNG manifest;
+4. applies testing-specific web/API/worker manifests;
+5. rolls out the testing Deployments;
+6. refreshes the S3 lifecycle policy.
+
+The testing URL is:
+
+```text
+https://agent-harness-demo.testing.tmprl-demo.cloud
+```
+
+Use testing before merging risky workflow, stream, provider, or deployment
+changes into production.
+
 ## Claim-check storage (S3)
 
 Offloaded ("claim-check") payloads are stored in S3 so they survive pod
@@ -116,6 +186,29 @@ serves browser SSE from its in-memory stream buffer. That keeps the frontend pod
 static, but the API should stay at one replica until the stream buffer moves to a
 shared backplane.
 
+## Temporary Demo Workspaces
+
+The main environment can create temporary isolated workspaces for crash demos.
+The controller workflow creates a namespace, copies relevant configuration,
+deploys web/API/worker workloads with a unique task queue and workflow prefix,
+and routes a unique host through the wildcard certificate.
+
+Temp workspaces intentionally reuse shared infrastructure where it is safe:
+
+- same image repository;
+- same ServiceAccount/IAM role shape;
+- same S3 bucket with per-workflow key prefixes;
+- same internal SearXNG service URL;
+- same Temporal Cloud namespace, but with unique task queues and workflow id
+  prefixes.
+
+The temp namespace can be crashed with normal Kubernetes commands without
+affecting the main pods. Workspace cleanup deletes the namespace and purges
+known workspace payload prefixes.
+
+Worker versioning is enabled by default for the main worker. Temp workers may
+disable versioning because each workspace has a short-lived unique task queue.
+
 ## Manual steps (cannot be done with kubectl)
 
 1. **Temporal Cloud** → namespace `michaelj-agent-harness-demo.a2dd6` → set the
@@ -126,3 +219,19 @@ shared backplane.
    `https://agent-harness-demo.tmprl-demo.cloud/oauth/github/callback`.
 3. **Google OAuth client** → add authorized redirect URI
    `https://agent-harness-demo.tmprl-demo.cloud/oauth/google/callback`.
+
+## Rollout Verification
+
+After any rollout, check:
+
+```bash
+kubectl get deploy agent-harness-web agent-harness-api agent-harness-worker \
+  -n temporal-michaelj-agent-harness-demo -o wide
+
+kubectl get pods -n temporal-michaelj-agent-harness-demo -o wide
+
+curl -sS -L --max-time 20 -o /dev/null -w '%{http_code}\n' \
+  https://agent-harness-demo.tmprl-demo.cloud
+```
+
+For testing, use the `*-testing` deployment names and the testing hostname.
