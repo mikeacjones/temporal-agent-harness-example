@@ -91,6 +91,19 @@ class QueuedChatMessage:
     transcript_index: int
     attachments: list[AttachmentRef] = field(default_factory=list)
     settle_after_revision: int = 0
+    available_tool_names: list[str] | None = None
+    github_connection_id: str | None = None
+    mcp_servers: list[HttpMcpServerConfig] | None = None
+
+
+@dataclass
+class ChatSignalRequest:
+    message: str
+    attachments: list[AttachmentRef] = field(default_factory=list)
+    after_revision: int = 0
+    available_tool_names: list[str] = field(default_factory=list)
+    github_connection_id: str | None = None
+    mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -202,17 +215,15 @@ class SimpleChatWorkflow:
         self._active_settle_after_revision = 0
 
     @workflow.signal
-    async def chat(
-        self,
-        message: str,
-        attachments: list[AttachmentRef] | None = None,
-        after_revision: int = 0,
-    ) -> None:
+    async def chat(self, request: ChatSignalRequest) -> None:
         self._touch()
         transcript_index = self._enqueue_chat(
-            message,
-            attachments=attachments,
-            settle_after_revision=after_revision,
+            request.message,
+            attachments=request.attachments,
+            settle_after_revision=request.after_revision,
+            available_tool_names=request.available_tool_names,
+            github_connection_id=request.github_connection_id,
+            mcp_servers=request.mcp_servers,
         )
         self._record_transcript_change(
             transcript_index,
@@ -275,26 +286,6 @@ class SimpleChatWorkflow:
         self._record_system_message(
             f"Interrupt sent; provider will continue with: {message}"
         )
-
-    @workflow.signal
-    async def update_tool_connections(
-        self,
-        available_tool_names: list[str],
-        github_connection_id: str | None = None,
-        mcp_servers: list[HttpMcpServerConfig] | None = None,
-    ) -> None:
-        self._touch()
-        self._available_tool_names = set(available_tool_names)
-        self._github_connection_id = github_connection_id
-        if mcp_servers is not None:
-            self._mcp_servers = list(mcp_servers)
-        github_status = "connected" if github_connection_id else "disconnected"
-        mcp_status = f"{len(self._mcp_servers)} MCP server(s)"
-        self._record_system_message(
-            f"Tool availability updated. GitHub is {github_status}; "
-            f"{mcp_status} configured."
-        )
-        self._record_state_change()
 
     @workflow.signal
     async def resolve_approval(
@@ -661,6 +652,7 @@ class SimpleChatWorkflow:
                 self._active_message = queued_message
                 settle_after_revision = queued_message.settle_after_revision
                 self._active_settle_after_revision = settle_after_revision
+                self._apply_queued_tool_config(queued_message)
             else:
                 message = None
                 attachments = []
@@ -775,6 +767,9 @@ class SimpleChatWorkflow:
         *,
         attachments: list[AttachmentRef] | None = None,
         settle_after_revision: int = 0,
+        available_tool_names: list[str] | None = None,
+        github_connection_id: str | None = None,
+        mcp_servers: list[HttpMcpServerConfig] | None = None,
     ) -> int:
         attachment_refs = list(attachments or [])
         transcript_index = self._next_transcript_index()
@@ -784,9 +779,23 @@ class SimpleChatWorkflow:
                 transcript_index=transcript_index,
                 attachments=attachment_refs,
                 settle_after_revision=max(0, int(settle_after_revision or 0)),
+                available_tool_names=(
+                    list(available_tool_names)
+                    if available_tool_names is not None
+                    else None
+                ),
+                github_connection_id=github_connection_id,
+                mcp_servers=list(mcp_servers) if mcp_servers is not None else None,
             )
         )
         return transcript_index
+
+    def _apply_queued_tool_config(self, queued_message: QueuedChatMessage) -> None:
+        if queued_message.available_tool_names is None:
+            return
+        self._available_tool_names = set(queued_message.available_tool_names)
+        self._github_connection_id = queued_message.github_connection_id
+        self._mcp_servers = list(queued_message.mcp_servers or [])
 
     async def _emit_turn_settled(self, after_revision: int) -> None:
         if not self._stream_id:

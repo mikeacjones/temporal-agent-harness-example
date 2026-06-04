@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from temporalio import workflow
-from temporalio.exceptions import is_cancelled_exception
+from temporalio.exceptions import ActivityError, ApplicationError, is_cancelled_exception
 
 from .activity_options import DEFAULT_ACTIVITY_OPTIONS, ActivityOptions
 from .attachments import AttachmentRef
@@ -539,6 +539,13 @@ class Agent:
                 payload=err.to_tool_payload(),
                 error=True,
             )
+        except Exception as err:
+            if is_cancelled_exception(err):
+                raise
+            result = ToolResult(
+                payload=_tool_exception_payload(tool_name, err),
+                error=True,
+            )
 
         return tool_result_block(
             tool_use_id=tool_use_id,
@@ -578,6 +585,59 @@ class Agent:
 class ToolExecutionResult:
     tool_results: list[dict]
     interrupted: bool = False
+
+
+def _tool_exception_payload(tool_name: str, err: Exception) -> dict[str, Any]:
+    causes = [_exception_summary(cause) for cause in _exception_chain(err)]
+    root = causes[-1] if causes else _exception_summary(err)
+    return {
+        "error": root["message"] or "Tool execution failed.",
+        "type": "ToolExecutionFailed",
+        "tool_name": tool_name,
+        "exception_type": type(err).__name__,
+        "cause_type": root["type"],
+        "message": (
+            "The tool failed after any configured retries. Treat this as the "
+            "tool result and continue if possible."
+        ),
+        "causes": causes,
+    }
+
+
+def _exception_chain(err: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = err
+    while current is not None and id(current) not in seen and len(chain) < 6:
+        chain.append(current)
+        seen.add(id(current))
+        next_err = current.__cause__ or current.__context__
+        current = next_err if next_err is not current else None
+    return chain
+
+
+def _exception_summary(err: BaseException) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "type": type(err).__name__,
+        "message": _exception_message(err),
+    }
+    if isinstance(err, ApplicationError):
+        summary["application_type"] = err.type
+        summary["non_retryable"] = err.non_retryable
+    if isinstance(err, ActivityError):
+        summary["activity_type"] = err.activity_type
+        summary["activity_id"] = err.activity_id
+        summary["retry_state"] = (
+            err.retry_state.name if err.retry_state is not None else None
+        )
+    return summary
+
+
+def _exception_message(err: BaseException) -> str:
+    message = getattr(err, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    return str(err)
 
 
 @dataclass

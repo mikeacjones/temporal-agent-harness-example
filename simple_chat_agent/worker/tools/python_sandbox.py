@@ -22,9 +22,7 @@ from simple_chat_agent.worker.sandbox.runtime import (
 LAMBDA_ACTIVITY_TIMEOUT_SECONDS = LAMBDA_MAX_TIMEOUT_SECONDS + 60
 LAMBDA_INVOKE_READ_TIMEOUT_SECONDS = LAMBDA_MAX_TIMEOUT_SECONDS + 30
 LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    maximum_interval=timedelta(seconds=10),
-    maximum_attempts=3,
+    maximum_attempts=1,
 )
 
 
@@ -35,11 +33,11 @@ LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
         "scripts, imports, network calls, parsing, and data transformations. "
         "For long-running work, write progress to stdout or stderr with print() "
         "or sys.stderr.write(); that output streams back to the user while the "
-        "code is still running. Runtime, output, permissions, and retries are "
-        "bounded by the sandbox. The sandbox ceases to exist when the tool finishes, "
+        "code is still running. Runtime, output, and permissions are bounded by "
+        "the sandbox. The sandbox ceases to exist when the tool finishes, "
         "as well as any files written to disk. Treat this as purely ephemeral. "
         "External side effects performed by user code are not made idempotent by "
-        "the harness."
+        "the harness, so sandbox executions are not retried automatically."
     ),
     tool_type=ToolType.MUTATING,
     pre_guards=["mutating_tool_approval"],
@@ -54,9 +52,7 @@ async def python_sandbox(
         args={"code": code, "timeout_seconds": timeout_seconds},
         schedule_to_start_timeout=timedelta(seconds=30),
         start_to_close_timeout=timedelta(seconds=LAMBDA_ACTIVITY_TIMEOUT_SECONDS),
-        schedule_to_close_timeout=timedelta(
-            seconds=LAMBDA_ACTIVITY_TIMEOUT_SECONDS * 3
-        ),
+        schedule_to_close_timeout=timedelta(seconds=LAMBDA_ACTIVITY_TIMEOUT_SECONDS),
         retry_policy=LAMBDA_ACTIVITY_RETRY_POLICY,
     )
     return ToolResult(payload=payload, error="error" in payload)

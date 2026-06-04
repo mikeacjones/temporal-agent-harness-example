@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlencode, urlparse
@@ -89,10 +89,6 @@ from simple_chat_agent.common.mcp_auth import (
 )
 from simple_chat_agent.common.mcp_oauth import PendingMcpOAuthFlow
 from simple_chat_agent.common.store import AppStore
-from simple_chat_agent.worker.tools import (
-    configured_research_tool_names,
-    tool_names_for_connections,
-)
 from simple_chat_agent.worker.demo_workspace_workflow import (
     DemoWorkspaceConfig,
     DemoWorkspaceInput,
@@ -735,27 +731,6 @@ async def _require_conversation_owner(
     return user
 
 
-async def _update_user_workflows_tool_connections(
-    user: AuthenticatedUser,
-) -> None:
-    github_connection_id = _github_connection_id_for_user(user)
-    mcp_servers = await (
-        await _ensure_user_chats_workflow(user.user_id, user.username)
-    ).query(UserChatsWorkflow.list_mcp_servers)
-    available_tool_names = tool_names_for_connections(
-        github_connection_id=github_connection_id,
-        mcp_servers=mcp_servers,
-        research_tool_names=configured_research_tool_names(),
-    )
-
-    for conversation in await _list_user_chats(user.user_id, user.username):
-        with suppress(Exception):
-            await _handle(conversation.workflow_id).signal(
-                SimpleChatWorkflow.update_tool_connections,
-                args=[available_tool_names, github_connection_id, mcp_servers],
-            )
-
-
 async def _upsert_user_mcp_server(
     user: AuthenticatedUser,
     server: HttpMcpServerConfig,
@@ -763,35 +738,7 @@ async def _upsert_user_mcp_server(
     registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     await registry.execute_update(
         UserChatsWorkflow.upsert_mcp_server,
-        UpdateMcpServerRequest(
-            server=server,
-            available_tool_names=tool_names_for_connections(
-                github_connection_id=_github_connection_id_for_user(user),
-                mcp_servers=[
-                    *[
-                        existing
-                        for existing in await registry.query(
-                            UserChatsWorkflow.list_mcp_servers
-                        )
-                        if existing.server_id != server.server_id
-                    ],
-                    server,
-                ],
-                research_tool_names=configured_research_tool_names(),
-            ),
-            github_connection_id=_github_connection_id_for_user(user),
-        ),
-    )
-
-
-async def _available_tool_names_for_user(user: AuthenticatedUser) -> list[str]:
-    mcp_servers = await (
-        await _ensure_user_chats_workflow(user.user_id, user.username)
-    ).query(UserChatsWorkflow.list_mcp_servers)
-    return tool_names_for_connections(
-        github_connection_id=_github_connection_id_for_user(user),
-        mcp_servers=mcp_servers,
-        research_tool_names=configured_research_tool_names(),
+        UpdateMcpServerRequest(server=server),
     )
 
 
@@ -859,11 +806,7 @@ app.include_router(
             store=_store,
             current_user=_current_user,
             ensure_user_chats_workflow=_ensure_user_chats_workflow,
-            update_user_workflows_tool_connections=(
-                _update_user_workflows_tool_connections
-            ),
             upsert_user_mcp_server=_upsert_user_mcp_server,
-            github_connection_id_for_user=_github_connection_id_for_user,
             github_tools_enabled=github_tools_enabled,
             mcp_oauth_flows=_mcp_oauth_flows,
         )

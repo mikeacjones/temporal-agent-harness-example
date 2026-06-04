@@ -111,15 +111,11 @@ class UserDemoWorkspaceRecord:
 @dataclass
 class UpdateMcpServerRequest:
     server: HttpMcpServerConfig
-    available_tool_names: list[str]
-    github_connection_id: str | None = None
 
 
 @dataclass
 class DeleteMcpServerRequest:
     server_id: str
-    available_tool_names: list[str]
-    github_connection_id: str | None = None
 
 
 def user_chats_workflow_id(user_id: str) -> str:
@@ -275,10 +271,6 @@ class UserChatsWorkflow:
     ) -> list[HttpMcpServerConfig]:
         self._touch()
         self._mcp_servers[request.server.server_id] = request.server
-        await self._broadcast_tool_connections(
-            request.available_tool_names,
-            request.github_connection_id,
-        )
         return self.list_mcp_servers()
 
     @workflow.update
@@ -287,10 +279,6 @@ class UserChatsWorkflow:
     ) -> list[HttpMcpServerConfig]:
         self._touch()
         self._mcp_servers.pop(request.server_id, None)
-        await self._broadcast_tool_connections(
-            request.available_tool_names,
-            request.github_connection_id,
-        )
         return self.list_mcp_servers()
 
     @workflow.update
@@ -362,28 +350,6 @@ class UserChatsWorkflow:
     @workflow.query
     def list_mcp_servers(self) -> list[HttpMcpServerConfig]:
         return sorted(self._mcp_servers.values(), key=lambda server: server.label)
-
-    async def _broadcast_tool_connections(
-        self,
-        available_tool_names: list[str],
-        github_connection_id: str | None,
-    ) -> None:
-        mcp_servers = self.list_mcp_servers()
-        for record in self._chats.values():
-            if record.status != "active":
-                continue
-            handle = workflow.get_external_workflow_handle(record.workflow_id)
-            try:
-                await handle.signal(
-                    SimpleChatWorkflow.update_tool_connections,
-                    args=[
-                        available_tool_names,
-                        github_connection_id,
-                        mcp_servers,
-                    ],
-                )
-            except Exception:
-                pass
 
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()

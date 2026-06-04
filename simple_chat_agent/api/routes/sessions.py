@@ -62,7 +62,7 @@ from simple_chat_agent.worker.user_chats_workflow import (
     CreateChatRequest,
     UserChatsWorkflow,
 )
-from simple_chat_agent.worker.workflow import SimpleChatWorkflow
+from simple_chat_agent.worker.workflow import ChatSignalRequest, SimpleChatWorkflow
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_HARD_MAX_BYTES
 from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_MIN_MAX_BYTES
@@ -354,7 +354,14 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.chat,
-            args=[request.message, attachments, request.after_revision],
+            args=[
+                await _chat_signal_request(
+                    deps,
+                    user=user,
+                    message_request=request,
+                    attachments=attachments,
+                )
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -387,7 +394,14 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.chat,
-            args=[request.message, attachments, request.after_revision],
+            args=[
+                await _chat_signal_request(
+                    deps,
+                    user=user,
+                    message_request=request,
+                    attachments=attachments,
+                )
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -711,6 +725,30 @@ def _attachment_refs_for_request(
             raise HTTPException(status_code=404, detail="Attachment not found")
         refs.append(attachment_ref_from_artifact(artifact))
     return refs
+
+
+async def _chat_signal_request(
+    deps: SessionRouteDeps,
+    *,
+    user: AuthenticatedUser,
+    message_request: MessageRequest,
+    attachments: list[Any],
+) -> ChatSignalRequest:
+    registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
+    mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
+    github_connection_id = deps.github_connection_id_for_user(user)
+    return ChatSignalRequest(
+        message=message_request.message,
+        attachments=attachments,
+        after_revision=message_request.after_revision,
+        available_tool_names=tool_names_for_connections(
+            github_connection_id=github_connection_id,
+            mcp_servers=mcp_servers,
+            research_tool_names=configured_research_tool_names(),
+        ),
+        github_connection_id=github_connection_id,
+        mcp_servers=mcp_servers,
+    )
 
 
 def _get_user_attachment(
