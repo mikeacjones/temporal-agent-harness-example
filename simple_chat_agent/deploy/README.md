@@ -82,17 +82,19 @@ docker buildx build --platform linux/amd64 \
 The entire root `.env` is loaded as a Secret consumed by the API and worker via
 `envFrom`. The static frontend Deployment does not consume this Secret. A few
 values are overridden for the deployed environment (the public GitHub callback
-URL, proxy trust, a real session secret, and codec settings):
+URL, proxy trust, a real session secret, local auth disabled, and codec
+settings):
 
 ```bash
 NS=temporal-michaelj-agent-harness-demo
 ENVFILE=$(mktemp)
-grep -vE '^(SIMPLE_CHAT_PUBLIC_URL|GITHUB_OAUTH_REDIRECT_URI|FORWARDED_ALLOW_IPS|SIMPLE_CHAT_JWT_SECRET|SIMPLE_CHAT_CODEC_SERVER_HOST|SIMPLE_CHAT_CODEC_AUTH_ENABLED|SIMPLE_CHAT_STREAM_TOKEN)=' .env > "$ENVFILE"
+grep -vE '^(SIMPLE_CHAT_PUBLIC_URL|GITHUB_OAUTH_REDIRECT_URI|FORWARDED_ALLOW_IPS|SIMPLE_CHAT_JWT_SECRET|SIMPLE_CHAT_LOCAL_AUTH_ENABLED|SIMPLE_CHAT_LOCAL_AUTH_USERNAME|SIMPLE_CHAT_LOCAL_AUTH_PASSWORD|SIMPLE_CHAT_CODEC_SERVER_HOST|SIMPLE_CHAT_CODEC_AUTH_ENABLED|SIMPLE_CHAT_STREAM_TOKEN)=' .env > "$ENVFILE"
 cat >> "$ENVFILE" <<EOF
 SIMPLE_CHAT_PUBLIC_URL=https://agent-harness-demo.tmprl-demo.cloud
 GITHUB_OAUTH_REDIRECT_URI=https://agent-harness-demo.tmprl-demo.cloud/oauth/github/callback
 FORWARDED_ALLOW_IPS=*
 SIMPLE_CHAT_JWT_SECRET=$(openssl rand -hex 32)
+SIMPLE_CHAT_LOCAL_AUTH_ENABLED=0
 SIMPLE_CHAT_CODEC_SERVER_HOST=0.0.0.0
 SIMPLE_CHAT_CODEC_AUTH_ENABLED=1
 SIMPLE_CHAT_STREAM_TOKEN=$(openssl rand -hex 32)
@@ -180,6 +182,11 @@ to a local on-disk store (used for local dev).
 
 When the S3 / DynamoDB env vars are unset (local dev), the app falls back to
 on-disk file + SQLite storage with no AWS dependency.
+
+Local testing auth is for private local runs only. Deployed environments should
+leave `SIMPLE_CHAT_LOCAL_AUTH_ENABLED=0` and use Google OAuth. Even if local
+auth is accidentally enabled, the local login route is not registered while
+Google OAuth credentials are configured.
 
 The deployed API receives sideband stream events over `/internal/stream` and
 serves browser SSE from its in-memory stream buffer. That keeps the frontend pod

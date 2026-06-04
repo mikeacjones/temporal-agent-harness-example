@@ -50,7 +50,7 @@ deployment serves only API and OAuth routes.
 | `schemas.py` | Request shapes accepted from the browser. |
 | `serialization.py` | UI-shaped response dictionaries for workflow state, transcripts, artifacts, and attachments. |
 | `streaming.py` | API-owned in-memory stream broker and SSE helpers. |
-| `auth.py`, `google_oauth.py`, `github_oauth.py` | Login/session/OAuth helpers. |
+| `auth.py`, `local_auth.py`, `google_oauth.py`, `github_oauth.py` | Login/session/OAuth helpers. |
 | `features.py`, `thinking.py`, `anthropic_models.py` | Runtime feature gates and model/thinking configuration. |
 | `artifacts.py` | Artifact/attachment response helpers for view and download routes. |
 
@@ -123,8 +123,22 @@ queries bounded rendered views.
 
 ## Auth And OAuth
 
-The login flow is Google OAuth. The API stores a signed session cookie and
-derives the current `AuthenticatedUser` on each request.
+The API stores a signed session cookie and derives the current
+`AuthenticatedUser` on each request. The session format is provider-neutral;
+Google OAuth and local testing auth are only ways to mint that session.
+
+`GET /api/auth/config` tells the UI which login mode to render:
+
+- `google`: Google OAuth is configured.
+- `local`: local testing auth is explicitly enabled and Google OAuth is not
+  configured.
+- `none`: no login method is configured.
+
+`POST /api/auth/local/login` is registered only in `local` mode. If
+`GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` are present, the local
+route is not registered and the UI uses Google login. This keeps the local
+demo/demo login unavailable in shared or deployed Google-authenticated
+environments.
 
 GitHub and MCP OAuth are optional tool-enablement flows. OAuth tokens are stored
 in `AppStore`, keyed by user/provider. Workflows receive stable connection ids

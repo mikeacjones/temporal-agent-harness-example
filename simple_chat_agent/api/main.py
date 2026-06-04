@@ -38,6 +38,7 @@ from simple_chat_agent.api.auth import (
     AuthError,
     create_session_token,
     user_from_google_subject,
+    user_from_local_username,
     user_from_session_token,
 )
 from simple_chat_agent.common.env import load_dotenv
@@ -68,6 +69,10 @@ from simple_chat_agent.api.google_oauth import (
     google_oauth_configured,
     google_redirect_uri_from_base,
     identity_from_id_token,
+)
+from simple_chat_agent.api.local_auth import (
+    local_auth_credentials_valid,
+    local_auth_requested,
 )
 from simple_chat_agent.api.routes.sessions import (
     SessionRouteDeps,
@@ -113,6 +118,9 @@ from simple_chat_agent.worker.workflow import (
     TranscriptDeltaResult,
     TranscriptPage,
 )
+
+
+load_dotenv()
 
 
 @asynccontextmanager
@@ -213,6 +221,36 @@ async def google_auth_configured() -> dict[str, Any]:
     }
 
 
+def _local_auth_route_enabled() -> bool:
+    return (
+        local_auth_requested()
+        and not google_oauth_configured()
+        and not demo_workspace_mode()
+    )
+
+
+@app.get("/api/auth/config")
+async def auth_config() -> dict[str, Any]:
+    google_configured = google_oauth_configured()
+    local_enabled = _local_auth_route_enabled()
+    if demo_workspace_mode():
+        google_configured = bool(
+            os.environ.get("SIMPLE_CHAT_DEMO_PARENT_PUBLIC_URL", "").strip()
+        )
+        local_enabled = False
+    mode = "none"
+    if google_configured:
+        mode = "google"
+    elif local_enabled:
+        mode = "local"
+    return {
+        "mode": mode,
+        "google_configured": google_configured,
+        "local_enabled": local_enabled,
+        "allowed_domain": google_allowed_domain(),
+    }
+
+
 @app.get("/oauth/google/start")
 async def google_oauth_start(request: Request) -> RedirectResponse:
     if demo_workspace_mode():
@@ -304,6 +342,42 @@ async def google_oauth_callback(
         samesite="lax",
     )
     return response
+
+
+if _local_auth_route_enabled():
+
+    @app.post("/api/auth/local/login")
+    async def local_auth_login(request: Request) -> Response:
+        if not _local_auth_route_enabled():
+            raise HTTPException(status_code=404, detail="Not found")
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        username = body.get("username")
+        password = body.get("password")
+        if not isinstance(username, str) or not isinstance(password, str):
+            raise HTTPException(status_code=401, detail="Invalid local credentials")
+        if not local_auth_credentials_valid(username, password):
+            raise HTTPException(status_code=401, detail="Invalid local credentials")
+
+        user = user_from_local_username(username)
+        response = Response(
+            content=json.dumps(
+                {"status": "ok", "user_id": user.user_id, "username": user.username}
+            ),
+            media_type="application/json",
+        )
+        response.set_cookie(
+            SESSION_COOKIE,
+            create_session_token(user),
+            max_age=DEFAULT_SESSION_SECONDS,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
 
 
 @app.post("/api/logout")

@@ -28,10 +28,13 @@ export const emptyArtifactViewer = {
 export const initialState = {
   auth: "loading",
   user: null,
+  authMode: "unknown",
   loginConfigured: true,
   loginSubtitle: "",
   loginError: "",
   loggingIn: false,
+  localLoginUsername: "demo",
+  localLoginPassword: "demo",
   config: null,
   demoWorkspace: null,
   demoWorkspaceLoading: false,
