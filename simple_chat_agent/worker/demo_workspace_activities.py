@@ -446,6 +446,16 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         values["SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"] = os.environ[
             "SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"
         ]
+    if os.environ.get("SIMPLE_CHAT_WORKER_VERSION"):
+        values["SIMPLE_CHAT_WORKER_VERSION"] = os.environ["SIMPLE_CHAT_WORKER_VERSION"]
+    if os.environ.get("SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"):
+        values["SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"] = os.environ[
+            "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"
+        ]
+    if os.environ.get("SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"):
+        values["SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"] = os.environ[
+            "SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"
+        ]
     if os.environ.get("PYTHON_SANDBOX_LAMBDA_FUNCTION"):
         values["PYTHON_SANDBOX_LAMBDA_FUNCTION"] = os.environ[
             "PYTHON_SANDBOX_LAMBDA_FUNCTION"

@@ -6,7 +6,8 @@ from contextlib import suppress
 
 import uvicorn
 from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
+from temporalio.worker import Worker, WorkerDeploymentConfig
 
 from agent_harness.guards import run_guard_activity
 from agent_harness.mcp import (
@@ -46,6 +47,12 @@ from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
 from simple_chat_agent.worker.workflow import SimpleChatWorkflow
 
 
+WORKER_VERSION_ENV = "SIMPLE_CHAT_WORKER_VERSION"
+WORKER_VERSIONING_ENABLED_ENV = "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"
+WORKER_DEPLOYMENT_NAME_ENV = "SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"
+DEFAULT_WORKER_VERSION = "1.0.0"
+
+
 async def main() -> None:
     load_dotenv()
     configure_stream_sink(configured_stream_sink())
@@ -64,6 +71,15 @@ async def main() -> None:
     client = await Client.connect(
         os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233"), **client_config
     )
+
+    deployment_config = _worker_deployment_config(TASK_QUEUE)
+    if deployment_config:
+        print(
+            "Temporal worker versioning enabled: "
+            f"deployment={deployment_config.version.deployment_name} "
+            f"build_id={deployment_config.version.build_id} "
+            f"behavior={deployment_config.default_versioning_behavior.name}"
+        )
 
     worker = Worker(
         client,
@@ -89,6 +105,7 @@ async def main() -> None:
             delete_demo_workspace,
             purge_demo_workspace_payloads,
         ],
+        deployment_config=deployment_config,
     )
     if not codec_server_enabled():
         await worker.run()
@@ -123,6 +140,35 @@ async def _run_worker_and_codec_server(
             await task
     for task in done:
         task.result()
+
+
+def _worker_deployment_config(task_queue: str) -> WorkerDeploymentConfig | None:
+    if not _env_flag(WORKER_VERSIONING_ENABLED_ENV, default=True):
+        print("Temporal worker versioning disabled")
+        return None
+
+    build_id = os.environ.get(WORKER_VERSION_ENV, DEFAULT_WORKER_VERSION).strip()
+    deployment_name = os.environ.get(WORKER_DEPLOYMENT_NAME_ENV, task_queue).strip()
+    if not build_id:
+        raise RuntimeError(f"{WORKER_VERSION_ENV} must not be empty")
+    if not deployment_name:
+        raise RuntimeError(f"{WORKER_DEPLOYMENT_NAME_ENV} must not be empty")
+
+    return WorkerDeploymentConfig(
+        version=WorkerDeploymentVersion(
+            deployment_name=deployment_name,
+            build_id=build_id,
+        ),
+        use_worker_versioning=True,
+        default_versioning_behavior=VersioningBehavior.PINNED,
+    )
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 if __name__ == "__main__":

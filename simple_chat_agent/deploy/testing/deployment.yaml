@@ -120,6 +120,8 @@ spec:
             # --- test isolation ---
             - name: SIMPLE_CHAT_TASK_QUEUE
               value: simple-chat-agent-testing
+            - name: SIMPLE_CHAT_WORKER_VERSION
+              value: "1.0.0"
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
             - name: SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED
@@ -206,6 +208,8 @@ spec:
             # --- test isolation ---
             - name: SIMPLE_CHAT_TASK_QUEUE
               value: simple-chat-agent-testing
+            - name: SIMPLE_CHAT_WORKER_VERSION
+              value: "1.0.0"
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
             - name: SIMPLE_CHAT_PUBLIC_URL
