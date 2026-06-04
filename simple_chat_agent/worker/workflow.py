@@ -659,6 +659,7 @@ class SimpleChatWorkflow:
             self._status = "responding"
             self._record_state_change()
             should_emit_settled = False
+            continue_as_new_state: AgentState | None = None
             try:
                 result = await self._run_agent_turn(
                     message=message,
@@ -667,13 +668,6 @@ class SimpleChatWorkflow:
                     max_turns=chat_input.max_turns,
                 )
                 resume_agent_state = None
-                if result.needs_continue_as_new:
-                    workflow.continue_as_new(
-                        await self._continue_as_new_input(
-                            chat_input,
-                            result.continuation_state,
-                        )
-                    )
                 if (
                     chat_input.good_place_censor
                     and self._active_message_index is not None
@@ -692,7 +686,11 @@ class SimpleChatWorkflow:
                                 ),
                             ),
                         )
-                self._agent_context_state = await self._agent.compacted_state()
+                if result.needs_continue_as_new:
+                    continue_as_new_state = result.continuation_state
+                    self._agent_context_state = continue_as_new_state
+                else:
+                    self._agent_context_state = await self._agent.compacted_state()
                 self._record_latest_rendered_message_change()
                 should_emit_settled = True
             except UserFacingAgentError as err:
@@ -706,6 +704,13 @@ class SimpleChatWorkflow:
                 self._record_state_change()
                 if should_emit_settled:
                     await self._emit_turn_settled(settle_after_revision)
+            if continue_as_new_state is not None:
+                workflow.continue_as_new(
+                    await self._continue_as_new_input(
+                        chat_input,
+                        continue_as_new_state,
+                    )
+                )
 
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()
