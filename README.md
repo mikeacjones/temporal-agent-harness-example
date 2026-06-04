@@ -9,6 +9,9 @@ The interesting part is not "how to call an LLM." It is how the agent loop, tool
 Want to run this locally without setting up Google OAuth? Start here:
 [Running Locally](docs/local-development.md).
 
+Planning your own Temporal-backed agent architecture? Start here:
+[Building Agents On Temporal: Production Readiness Notes](docs/temporal-agent-production-readiness.md).
+
 ## Demo Recording
 
 [![Temporal Agent Harness demo recording](docs/demo-video-thumbnail.png)](https://drive.google.com/file/d/1HEwsBnabhiszNh0ULDwCcnAavfNzDcLK/view?usp=sharing)
