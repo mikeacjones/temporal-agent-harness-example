@@ -434,6 +434,7 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         "SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED": "0",
         "SIMPLE_CHAT_GITHUB_TOOLS_ENABLED": "0",
         "SIMPLE_CHAT_TASK_QUEUE": request.task_queue,
+        "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED": "0",
         "SIMPLE_CHAT_WORKFLOW_PREFIX": request.workflow_prefix,
         "SIMPLE_CHAT_PUBLIC_URL": request.url,
         "SIMPLE_CHAT_STREAM_SINK_URL": f"http://{API_SERVICE}",
@@ -445,16 +446,6 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
     if os.environ.get("SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"):
         values["SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"] = os.environ[
             "SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"
-        ]
-    if os.environ.get("SIMPLE_CHAT_WORKER_VERSION"):
-        values["SIMPLE_CHAT_WORKER_VERSION"] = os.environ["SIMPLE_CHAT_WORKER_VERSION"]
-    if os.environ.get("SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"):
-        values["SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"] = os.environ[
-            "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"
-        ]
-    if os.environ.get("SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"):
-        values["SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"] = os.environ[
-            "SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME"
         ]
     if os.environ.get("PYTHON_SANDBOX_LAMBDA_FUNCTION"):
         values["PYTHON_SANDBOX_LAMBDA_FUNCTION"] = os.environ[
