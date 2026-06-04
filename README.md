@@ -89,8 +89,16 @@ sequenceDiagram
 The provider API call is an activity. Tool execution happens from workflow code. If a tool needs side effects, it calls through `ctx.activity(...)`, which routes through a generic activity while setting a useful Temporal summary.
 
 ```python
+from datetime import timedelta
+
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import ToolContext, ToolResult, ToolSet, tool
+from agent_harness.tools import (
+    ToolActivityContext,
+    ToolContext,
+    ToolResult,
+    ToolSet,
+    tool,
+)
 
 
 @tool(
@@ -127,6 +135,40 @@ await ctx.activity(_update_customer, step="update")
 
 This keeps the activity type generic while making Temporal history useful to humans.
 
+Long-running tool activity functions can opt into Temporal heartbeats by setting
+`heartbeat_timeout` on `ctx.activity(...)`. The generic tool activity router
+sends conservative liveness heartbeats while the function runs. Tool authors can
+also request an activity-side `ToolActivityContext` when they have meaningful
+progress details:
+
+```python
+async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
+    result = await ctx.activity(
+        _export_report_activity,
+        args={"report_id": report_id},
+        start_to_close_timeout=timedelta(minutes=10),
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    return ToolResult(payload=result, error=False)
+
+
+async def _export_report_activity(
+    report_id: str,
+    *,
+    activity_ctx: ToolActivityContext,
+) -> dict:
+    activity_ctx.heartbeat({"phase": "loading"})
+    # do work
+    activity_ctx.heartbeat({"phase": "writing"})
+    # do work
+    return {"report_id": report_id, "status": "exported"}
+```
+
+The author heartbeat API is coalesced, and the automatic router heartbeat skips
+sends when a manual heartbeat happened recently. Use the sideband stream for
+high-frequency user-visible progress; use heartbeats for liveness, cancellation,
+and coarse retry progress.
+
 ## Tool Idempotency
 
 Temporal Activities may be retried when a worker crashes, a network write fails,
@@ -161,11 +203,10 @@ description or use a conservative retry policy.
 
 ## Tool Failure Semantics
 
-Expected tool failures should be returned as data, either by returning
-`ToolResult(payload={...}, error=True)` or by raising `UserFacingToolError`.
-Unexpected exceptions are treated as bugs and are allowed to propagate so
-Temporal can surface them during replay/retry instead of hiding them in model
-context.
+Expected tool failures should be returned as data with
+`ToolResult(payload={...}, error=True)`. During agent execution, unexpected tool
+exceptions are converted into LLM-visible tool errors so the workflow can keep
+running and the model can recover. Cancellations still propagate.
 
 ## Registration
 

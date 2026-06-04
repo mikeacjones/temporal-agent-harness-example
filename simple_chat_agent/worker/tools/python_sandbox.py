@@ -11,7 +11,7 @@ from temporalio.exceptions import ApplicationError
 
 from agent_harness.streaming import StreamContext
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.tools import ToolActivityContext, ToolContext, ToolResult, tool
 from simple_chat_agent.worker.sandbox.runtime import (
     DEFAULT_TIMEOUT_SECONDS,
     LAMBDA_MAX_TIMEOUT_SECONDS,
@@ -21,6 +21,7 @@ from simple_chat_agent.worker.sandbox.runtime import (
 
 LAMBDA_ACTIVITY_TIMEOUT_SECONDS = LAMBDA_MAX_TIMEOUT_SECONDS + 60
 LAMBDA_INVOKE_READ_TIMEOUT_SECONDS = LAMBDA_MAX_TIMEOUT_SECONDS + 30
+LAMBDA_ACTIVITY_HEARTBEAT_TIMEOUT_SECONDS = 30
 LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
     maximum_attempts=1,
 )
@@ -53,6 +54,7 @@ async def python_sandbox(
         schedule_to_start_timeout=timedelta(seconds=30),
         start_to_close_timeout=timedelta(seconds=LAMBDA_ACTIVITY_TIMEOUT_SECONDS),
         schedule_to_close_timeout=timedelta(seconds=LAMBDA_ACTIVITY_TIMEOUT_SECONDS),
+        heartbeat_timeout=timedelta(seconds=LAMBDA_ACTIVITY_HEARTBEAT_TIMEOUT_SECONDS),
         retry_policy=LAMBDA_ACTIVITY_RETRY_POLICY,
     )
     return ToolResult(payload=payload, error="error" in payload)
@@ -63,15 +65,30 @@ async def _run_python_sandbox_activity(
     timeout_seconds: int,
     *,
     stream: StreamContext,
+    activity_ctx: ToolActivityContext,
 ) -> dict[str, Any]:
     timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
+    activity_ctx.heartbeat(
+        {"phase": "starting", "timeout_seconds": timeout_seconds},
+        force=True,
+    )
     function_name = _sandbox_lambda_function_name()
     if not function_name:
-        return await execute_python_sandbox(code, timeout_seconds, stream=stream)
+        activity_ctx.heartbeat({"phase": "local_execution"})
+        payload = await execute_python_sandbox(code, timeout_seconds, stream=stream)
+        activity_ctx.heartbeat({"phase": "complete", "error": "error" in payload})
+        return payload
 
     await stream.emit(
         {"function_name": function_name, "timeout_seconds": timeout_seconds},
         kind="python_sandbox_lambda_invoke",
+    )
+    activity_ctx.heartbeat(
+        {
+            "phase": "lambda_invoke",
+            "function_name": function_name,
+            "timeout_seconds": timeout_seconds,
+        }
     )
     payload = await _invoke_sandbox_lambda(
         function_name=function_name,
@@ -81,6 +98,7 @@ async def _run_python_sandbox_activity(
     )
     if "error" in payload:
         await stream.emit(payload, kind="python_sandbox_lambda_error")
+    activity_ctx.heartbeat({"phase": "complete", "error": "error" in payload})
     return payload
 
 

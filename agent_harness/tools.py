@@ -19,7 +19,13 @@ from .activity_options import (
     ActivityOptions,
     activity_options_with_overrides,
 )
-from .activity_router import ActivityFn, call_activity, function_ref, resolve_function_ref
+from .activity_router import (
+    ActivityFn,
+    ToolActivityContext,
+    call_activity,
+    function_ref,
+    resolve_function_ref,
+)
 from .guards import (
     GuardDef,
     GuardFn,
@@ -571,7 +577,17 @@ async def run_tool_activity(request: ToolActivityRequest) -> Any:
         tool_name=request.tool_name,
         step=request.step,
     )
-    return await call_activity(fn, request.args, stream)
+    activity_context = ToolActivityContext(
+        tool_name=request.tool_name,
+        step=request.step,
+        stream_id=request.stream_id,
+    )
+    return await call_activity(
+        fn,
+        request.args,
+        stream,
+        activity_context=activity_context,
+    )
 
 
 async def _call_tool(
