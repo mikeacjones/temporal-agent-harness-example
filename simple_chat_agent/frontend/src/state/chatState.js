@@ -426,6 +426,7 @@ export function handleStreamEventInState(previous, event) {
     streamTurn: cloneStreamTurn(previous.streamTurn),
   };
   const sequence = agentPayloadSequence(event);
+  const attempt = agentPayloadAttempt(event);
 
   if (event.kind === AgentStreamEventKind.AGENT_START) {
     next.currentAgentSequence = sequence;
@@ -434,8 +435,10 @@ export function handleStreamEventInState(previous, event) {
       next.workflowState = { ...next.workflowState, status: "responding" };
     }
     const turn = ensureStreamTurn(next, sequence);
+    resetAgentSequenceForNewAttempt(turn, sequence, attempt);
     completeOpenToolSegments(turn);
     const agentSegment = ensureAgentSegment(turn, sequence);
+    recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     turn.status = "streaming";
     turn.activeSequence = sequence;
@@ -443,7 +446,10 @@ export function handleStreamEventInState(previous, event) {
     if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
     const activeSequence = activeAgentSequence(next, sequence);
     adoptAgentSequence(next, activeSequence);
-    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    const turn = ensureStreamTurn(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     agentSegment.text += event.payload.text;
     next.streamTurn.status = "streaming";
@@ -451,7 +457,10 @@ export function handleStreamEventInState(previous, event) {
     if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
     const activeSequence = activeAgentSequence(next, sequence);
     adoptAgentSequence(next, activeSequence);
-    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    const turn = ensureStreamTurn(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     next.streamTurn.status = "streaming";
   } else if (
@@ -461,7 +470,10 @@ export function handleStreamEventInState(previous, event) {
     if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
     const activeSequence = activeAgentSequence(next, sequence);
     adoptAgentSequence(next, activeSequence);
-    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    const turn = ensureStreamTurn(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     agentSegment.thinking += event.payload.thinking;
     next.streamTurn.status = "streaming";
@@ -480,7 +492,9 @@ export function handleStreamEventInState(previous, event) {
     const turn =
       streamTurnForSequence(next.streamTurn, activeSequence) ||
       ensureStreamTurn(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
     const agentSegment = ensureAgentSegment(turn, activeSequence);
+    recordAgentAttempt(agentSegment, attempt);
     finishAgentSegment(agentSegment, event.payload || {});
     if (terminal) {
       completeOpenToolSegments(turn);
@@ -496,6 +510,7 @@ export function handleStreamEventInState(previous, event) {
     const activeSequence = activeAgentSequence(next, sequence);
     adoptAgentSequence(next, activeSequence);
     const turn = ensureStreamTurn(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
     appendStreamToolEvent(turn, event, activeSequence);
     if (turn.status !== "complete" && turn.status !== "interrupted") {
       turn.status = "tooling";
@@ -513,6 +528,11 @@ export function handleStreamEventInState(previous, event) {
 function agentPayloadSequence(event) {
   const sequence = event.payload?.sequence;
   return sequence === undefined ? null : sequence;
+}
+
+function agentPayloadAttempt(event) {
+  const attempt = Number(event.payload?.attempt);
+  return Number.isFinite(attempt) ? attempt : null;
 }
 
 function activeAgentSequence(state, eventSequence) {
@@ -672,10 +692,7 @@ function ensureAgentSegment(turn, sequence) {
   const normalizedSequence = sequence ?? turn.activeSequence ?? null;
   registerStreamSequence(turn, normalizedSequence);
   turn.activeSequence = normalizedSequence;
-  let segment = turn.segments.find(
-    (candidate) =>
-      candidate.type === "agent" && candidate.sequence === normalizedSequence,
-  );
+  let segment = agentSegmentForSequence(turn, normalizedSequence);
   if (!segment) {
     segment = {
       id: `agent:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
@@ -692,6 +709,31 @@ function ensureAgentSegment(turn, sequence) {
     turn.segments.push(segment);
   }
   return segment;
+}
+
+function agentSegmentForSequence(turn, sequence) {
+  return turn.segments.find(
+    (candidate) => candidate.type === "agent" && candidate.sequence === sequence,
+  );
+}
+
+function resetAgentSequenceForNewAttempt(turn, sequence, attempt) {
+  if (attempt === null || attempt === undefined) return;
+  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
+  const segment = agentSegmentForSequence(turn, normalizedSequence);
+  if (!segment) return;
+  const previousAttempt = Number(segment.attempt ?? 1);
+  if (!Number.isFinite(previousAttempt) || attempt <= previousAttempt) return;
+  turn.segments = turn.segments.filter((candidate) => {
+    if (candidate.type === "agent") return candidate.sequence !== normalizedSequence;
+    if (candidate.type === "tools") return candidate.afterSequence !== normalizedSequence;
+    return true;
+  });
+}
+
+function recordAgentAttempt(segment, attempt) {
+  if (attempt === null || attempt === undefined) return;
+  segment.attempt = attempt;
 }
 
 function ensureToolSegment(turn, sequence) {

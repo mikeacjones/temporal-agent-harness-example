@@ -6,7 +6,7 @@ import time
 from typing import Any, Callable, cast, get_type_hints
 
 from temporalio import activity as temporal_activity
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, CancelledError
 
 from .streaming import StreamContext
 
@@ -223,9 +223,11 @@ async def _auto_heartbeat_loop(
             ):
                 continue
             activity_context._send("timer")
-        except BaseException:
+        except (asyncio.CancelledError, CancelledError):
             activity_task.cancel()
-            return
+            raise
+        except Exception:
+            continue
 
 
 def _auto_heartbeat_interval(timeout_seconds: float) -> float | None:

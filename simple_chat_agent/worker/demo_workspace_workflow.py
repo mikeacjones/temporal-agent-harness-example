@@ -166,7 +166,7 @@ class DemoWorkspaceWorkflow:
             return self._state
 
         now = workflow.now().isoformat()
-        workspace_id = _workspace_id(workflow.uuid4())
+        workspace_id = _workspace_id(config.user_id)
         namespace = f"agent-harness-demo-{workspace_id}"
         task_queue = f"{config.task_queue_prefix}-{workspace_id}"
         workflow_prefix = f"{config.workflow_prefix_prefix}{workspace_id}-"
@@ -446,9 +446,9 @@ def _provision_request(
     )
 
 
-def _workspace_id(unique_id: str) -> str:
-    unique = str(unique_id).replace("-", "")
-    return f"temp-{unique[:8]}"
+def _workspace_id(user_id: str) -> str:
+    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    return f"temp-{digest[:8]}"
 
 
 def _registry_workflow_id(*, user_id: str, workflow_prefix: str) -> str:

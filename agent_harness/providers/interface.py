@@ -11,6 +11,7 @@ from agent_harness.messages import AgentMessage
 
 ProviderActivity = Callable[..., Any]
 ProviderStopReason = str
+CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE = "ContextWindowExceeded"
 
 
 @dataclass
@@ -20,8 +21,10 @@ class ProviderRequest:
     max_tokens: int
     tools: list[dict]
     chat_history: list[dict]
+    context_token_limit: int | None = None
     stream_id: str | None = None
     stream_sequence: int | None = None
+    stream_attempt: int | None = None
 
 
 @dataclass
@@ -66,10 +69,12 @@ class AgentProvider(Protocol):
         system_prompt: str,
         model: str,
         max_tokens: int,
+        context_token_limit: int | None,
         tools: list[dict[str, Any]],
         chat_history: list[AgentMessage],
         stream_id: str | None,
         stream_sequence: int | None,
+        stream_attempt: int | None,
     ) -> ProviderRequest:
         pass
 
@@ -80,6 +85,13 @@ class AgentProvider(Protocol):
         self,
         request: ProviderRequest,
         chat_history: list[AgentMessage],
+    ) -> ProviderRequest:
+        pass
+
+    def replace_request_stream_attempt(
+        self,
+        request: ProviderRequest,
+        stream_attempt: int | None,
     ) -> ProviderRequest:
         pass
 

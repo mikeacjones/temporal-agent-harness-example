@@ -40,7 +40,17 @@ from ..messages import (
 from ..sliding_window_context_manager import estimate_token_count
 from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
-from .interface import AgentProvider, ProviderRequest, ProviderResponse
+from .errors import (
+    counted_context_window_message,
+    counted_tokens_exceed_context,
+    status_error_is_context_window_exceeded,
+)
+from .interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+)
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
@@ -78,12 +88,14 @@ class ClaudeRequest:
     system_prompt: str
     model: str
     max_tokens: int
+    context_token_limit: int | None
     tools: list[dict]
     chat_history: list[dict]
     thinking: dict | None = None
     output_config: dict | None = None
     stream_id: str | None = None
     stream_sequence: int | None = None
+    stream_attempt: int | None = None
 
 
 @dataclass
@@ -140,19 +152,23 @@ class ClaudeProvider(AgentProvider):
         system_prompt: str,
         model: str,
         max_tokens: int,
+        context_token_limit: int | None,
         tools: list[dict[str, Any]],
         chat_history: list[AgentMessage],
         stream_id: str | None,
         stream_sequence: int | None,
+        stream_attempt: int | None,
     ) -> "ClaudeRequest":
         return ClaudeRequest(
             system_prompt=system_prompt,
             model=model,
             max_tokens=max_tokens,
+            context_token_limit=context_token_limit,
             tools=tools,
             chat_history=_agent_messages_to_claude_messages(chat_history),
             stream_id=stream_id,
             stream_sequence=stream_sequence,
+            stream_attempt=stream_attempt,
             **_thinking_request_params(self._thinking, max_tokens=max_tokens),
         )
 
@@ -168,6 +184,13 @@ class ClaudeProvider(AgentProvider):
             cast(ClaudeRequest, request),
             chat_history=_agent_messages_to_claude_messages(chat_history),
         )
+
+    def replace_request_stream_attempt(
+        self,
+        request: ProviderRequest,
+        stream_attempt: int | None,
+    ) -> "ClaudeRequest":
+        return replace(cast(ClaudeRequest, request), stream_attempt=stream_attempt)
 
     def request_to_dict(self, request: ProviderRequest) -> dict[str, Any]:
         return _claude_request_to_dict(cast(ClaudeRequest, request))
@@ -262,11 +285,13 @@ def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
         "system_prompt": request.system_prompt,
         "model": request.model,
         "max_tokens": request.max_tokens,
+        "context_token_limit": request.context_token_limit,
         "thinking": _copy_optional_mapping(request.thinking),
         "tools": [_copy_mapping(tool) for tool in request.tools],
         "chat_history": [_copy_mapping(message) for message in request.chat_history],
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
+        "stream_attempt": request.stream_attempt,
         "output_config": _copy_optional_mapping(request.output_config),
     }
 
@@ -276,12 +301,14 @@ def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
         system_prompt=cast(str, request["system_prompt"]),
         model=cast(str, request["model"]),
         max_tokens=cast(int, request["max_tokens"]),
+        context_token_limit=cast(int | None, request.get("context_token_limit")),
         thinking=_copy_optional_mapping(request.get("thinking")),
         output_config=_copy_optional_mapping(request.get("output_config")),
         tools=_mapping_list(request.get("tools", [])),
         chat_history=_mapping_list(request.get("chat_history", [])),
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
+        stream_attempt=cast(int | None, request.get("stream_attempt")),
     )
 
 
@@ -351,13 +378,26 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
 
     try:
         async with AsyncAnthropic(max_retries=0) as client:
+            if _should_count_request_tokens(request):
+                await _raise_if_claude_context_too_large(
+                    client,
+                    request,
+                    create_params,
+                )
             response = await _stream_claude_message(
                 client,
                 create_params,
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
+                stream_attempt=request.stream_attempt,
             )
     except APIStatusError as err:
+        if _anthropic_error_is_context_window_exceeded(err):
+            raise ApplicationError(
+                str(err),
+                type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         if _anthropic_status_is_non_retryable(err.status_code):
             raise ApplicationError(
                 str(err),
@@ -386,14 +426,69 @@ def _anthropic_status_is_non_retryable(status_code: int) -> bool:
     return 400 <= status_code < 500
 
 
+def _anthropic_error_is_context_window_exceeded(err: APIStatusError) -> bool:
+    return status_error_is_context_window_exceeded(err.status_code, str(err))
+
+
+def _should_count_request_tokens(request: ClaudeRequest) -> bool:
+    return bool(
+        request.context_token_limit is not None
+        and request.stream_attempt is not None
+        and request.stream_attempt > 1
+    )
+
+
+async def _raise_if_claude_context_too_large(
+    client: AsyncAnthropic,
+    request: ClaudeRequest,
+    create_params: dict[str, Any],
+) -> None:
+    count_params: dict[str, Any] = {
+        "model": create_params["model"],
+        "messages": create_params["messages"],
+        "system": create_params["system"],
+    }
+    if request.tools:
+        count_params["tools"] = create_params["tools"]
+    if request.thinking is not None:
+        count_params["thinking"] = create_params["thinking"]
+    if request.output_config is not None:
+        count_params["output_config"] = create_params["output_config"]
+
+    token_count = await client.messages.count_tokens(**count_params)
+    input_tokens = int(token_count.input_tokens)
+    if not counted_tokens_exceed_context(
+        input_tokens=input_tokens,
+        max_output_tokens=request.max_tokens,
+        context_token_limit=request.context_token_limit,
+    ):
+        return
+
+    raise ApplicationError(
+        counted_context_window_message(
+            provider="Claude",
+            input_tokens=input_tokens,
+            max_output_tokens=request.max_tokens,
+            context_token_limit=cast(int, request.context_token_limit),
+        ),
+        type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+        non_retryable=True,
+    )
+
+
 async def _stream_claude_message(
     client: AsyncAnthropic,
     create_params: dict[str, Any],
     *,
     stream_id: str | None,
     stream_sequence: int | None,
+    stream_attempt: int | None,
 ) -> Any:
-    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="claude")
+    stream = AgentStreamWriter.for_provider(
+        stream_id=stream_id,
+        provider="claude",
+        attempt=stream_attempt,
+    )
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))

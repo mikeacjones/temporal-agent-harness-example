@@ -167,14 +167,17 @@ class UserChatsWorkflow:
         # payload lifecycle can expire; if no update touched this run for a full
         # TTL, close the registry and its tracked chat workflows.
         while True:
-            await workflow.wait_condition(
-                lambda: (
-                    workflow.info().is_continue_as_new_suggested()
-                    or self._checkpoint_due()
+            try:
+                await workflow.wait_condition(
+                    lambda: (
+                        workflow.info().is_continue_as_new_suggested()
+                        or self._checkpoint_due()
+                    )
+                    and workflow.all_handlers_finished(),
+                    timeout=self._time_until_checkpoint(),
                 )
-                and workflow.all_handlers_finished(),
-                timeout=self._time_until_checkpoint(),
-            )
+            except asyncio.TimeoutError:
+                pass
             if not workflow.all_handlers_finished():
                 continue
             if workflow.info().is_continue_as_new_suggested():

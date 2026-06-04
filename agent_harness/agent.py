@@ -31,7 +31,13 @@ from .messages import (
     tool_use_blocks,
     visible_user_message_text,
 )
-from .providers.interface import AgentProvider, ProviderResponse, start_provider_activity
+from .providers.interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+    start_provider_activity,
+)
 from .sliding_window_context_manager import SlidingWindowContextManager
 from .tools import ToolResult, ToolSet
 
@@ -43,6 +49,12 @@ InterruptPartialResponsePolicy = Literal["discard"]
 @dataclass(frozen=True)
 class ContinueAsNewPolicy:
     enabled: bool = True
+
+
+CONTEXT_OVERFLOW_RECOVERY_ATTEMPTS = 1
+CONTEXT_OVERFLOW_RETRY_CHARS_PER_TOKEN = 2.5
+CONTEXT_OVERFLOW_RETRY_SAFETY_MARGIN_MULTIPLIER = 4
+CONTEXT_OVERFLOW_RETRY_MIN_SAFETY_MARGIN_TOKENS = 16_000
 
 
 class Agent:
@@ -294,17 +306,18 @@ class Agent:
     ) -> ProviderResponse | None:
         self._provider_call_sequence += 1
         tool_params = [dict(tool) for tool in tool_schemas]
-        context_budget = self._context_token_budget(tool_params)
         # Guards see the FULL durable history (un-windowed) so they can inspect
         # and mutate the whole conversation.
         guard_request = self._provider.create_request(
             system_prompt=self._system_prompt,
             model=self._model,
             max_tokens=self._max_tokens,
+            context_token_limit=self._max_context_tokens,
             tools=tool_params,
             chat_history=await self._context.full_messages(),
             stream_id=self._stream_id,
             stream_sequence=self._provider_call_sequence,
+            stream_attempt=1,
         )
 
         pre_guard_execution = await self._llm_guards.execute_pre(
@@ -327,26 +340,18 @@ class Agent:
             self._provider.request_chat_history(guarded)
         )
 
-        request = self._provider.replace_request_chat_history(
-            guarded,
-            chat_history=await self._context.messages_for_model(context_budget),
-        )
-
-        provider_handle = start_provider_activity(self._provider, request)
-
         try:
-            await workflow.wait_condition(
-                lambda: self._interrupt_requested or provider_handle.done()
+            response = await self._call_provider_with_context_recovery(
+                guarded,
+                tool_params,
             )
-            if self._interrupt_requested:
-                await self._discard_interrupted_provider_call(provider_handle)
+            if response is None:
                 return None
 
-            response = await provider_handle
             post_guard_execution = await self._llm_guards.execute_post(
                 request=self._provider.request_to_dict(
                     self._provider.replace_request_chat_history(
-                        request,
+                        guarded,
                         chat_history=await self._context.full_messages(),
                     )
                 ),
@@ -372,19 +377,96 @@ class Agent:
                 return None
             raise
 
+    async def _call_provider_with_context_recovery(
+        self,
+        guarded_request: ProviderRequest,
+        tool_params: list[dict[str, Any]],
+    ) -> ProviderResponse | None:
+        context_budget = self._context_token_budget(tool_params)
+        stream_attempt = 1
+        context_overflow_retries = 0
+
+        while True:
+            request = self._provider.replace_request_chat_history(
+                guarded_request,
+                chat_history=await self._context.messages_for_model(context_budget),
+            )
+            request = self._provider.replace_request_stream_attempt(
+                request,
+                stream_attempt,
+            )
+
+            try:
+                return await self._run_provider_activity(request)
+            except BaseException as err:
+                if self._interrupt_requested and is_cancelled_exception(err):
+                    return None
+                if (
+                    context_overflow_retries < CONTEXT_OVERFLOW_RECOVERY_ATTEMPTS
+                    and _is_context_window_exceeded(err)
+                ):
+                    context_overflow_retries += 1
+                    stream_attempt += 1
+                    context_budget = self._context_token_budget(
+                        tool_params,
+                        context_overflow_retry=True,
+                    )
+                    continue
+                raise
+
+    async def _run_provider_activity(
+        self,
+        request: ProviderRequest,
+    ) -> ProviderResponse | None:
+        provider_handle = start_provider_activity(self._provider, request)
+
+        await workflow.wait_condition(
+            lambda: self._interrupt_requested or provider_handle.done()
+        )
+        if self._interrupt_requested:
+            await self._discard_interrupted_provider_call(provider_handle)
+            return None
+
+        return await provider_handle
+
     def _context_token_budget(
         self,
         tool_schemas: list[dict[str, Any]],
+        *,
+        context_overflow_retry: bool = False,
     ) -> ContextTokenBudget:
+        reserved_input_tokens = self._provider.estimate_request_tokens(
+            system_prompt=self._system_prompt,
+            tools=tool_schemas,
+        )
+        safety_margin_tokens = self._context_safety_margin_tokens
+        chars_per_token = self._context_chars_per_token
+        if context_overflow_retry:
+            safety_margin_tokens = max(
+                safety_margin_tokens * CONTEXT_OVERFLOW_RETRY_SAFETY_MARGIN_MULTIPLIER,
+                CONTEXT_OVERFLOW_RETRY_MIN_SAFETY_MARGIN_TOKENS,
+            )
+            max_safety_margin = (
+                self._max_context_tokens
+                - self._max_tokens
+                - reserved_input_tokens
+                - 1
+            )
+            safety_margin_tokens = min(
+                safety_margin_tokens,
+                max(0, max_safety_margin),
+            )
+            chars_per_token = min(
+                chars_per_token,
+                CONTEXT_OVERFLOW_RETRY_CHARS_PER_TOKEN,
+            )
+
         return ContextTokenBudget(
             max_context_tokens=self._max_context_tokens,
             reserved_output_tokens=self._max_tokens,
-            reserved_input_tokens=self._provider.estimate_request_tokens(
-                system_prompt=self._system_prompt,
-                tools=tool_schemas,
-            ),
-            safety_margin_tokens=self._context_safety_margin_tokens,
-            chars_per_token=self._context_chars_per_token,
+            reserved_input_tokens=reserved_input_tokens,
+            safety_margin_tokens=safety_margin_tokens,
+            chars_per_token=chars_per_token,
         )
 
     async def _discard_interrupted_provider_call(
@@ -602,6 +684,14 @@ def _tool_exception_payload(tool_name: str, err: Exception) -> dict[str, Any]:
         ),
         "causes": causes,
     }
+
+
+def _is_context_window_exceeded(err: BaseException) -> bool:
+    return any(
+        isinstance(cause, ApplicationError)
+        and cause.type == CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE
+        for cause in _exception_chain(err)
+    )
 
 
 def _exception_chain(err: BaseException) -> list[BaseException]:

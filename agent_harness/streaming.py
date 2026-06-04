@@ -71,6 +71,7 @@ class StreamContext:
 class AgentStreamWriter:
     stream: StreamContext
     provider: str
+    attempt: int | None = None
 
     @classmethod
     def for_provider(
@@ -79,6 +80,7 @@ class AgentStreamWriter:
         stream_id: str | None,
         provider: str,
         step: str | None = None,
+        attempt: int | None = None,
     ) -> "AgentStreamWriter":
         return cls(
             stream=StreamContext(
@@ -87,6 +89,7 @@ class AgentStreamWriter:
                 step=step,
             ),
             provider=provider,
+            attempt=attempt,
         )
 
     async def agent_started(self, *, sequence: int | None) -> None:
@@ -226,6 +229,7 @@ class AgentStreamWriter:
             {
                 "provider": self.provider,
                 **payload,
+                **_attempt_payload(self.attempt),
             },
             kind=kind.value,
         )
@@ -233,6 +237,34 @@ class AgentStreamWriter:
 
 _stream_sink: StreamSink | None = None
 _raise_stream_errors = False
+
+
+def _activity_attempt() -> int | None:
+    if temporal_activity is None:
+        return None
+    try:
+        return temporal_activity.info().attempt
+    except RuntimeError:
+        return None
+
+
+def _attempt_payload(stream_attempt: int | None) -> dict[str, int]:
+    activity_attempt = _activity_attempt()
+    payload: dict[str, int] = {}
+    if stream_attempt is not None:
+        payload["stream_attempt"] = stream_attempt
+    if activity_attempt is not None:
+        payload["activity_attempt"] = activity_attempt
+
+    if stream_attempt is None:
+        if activity_attempt is not None:
+            payload["attempt"] = activity_attempt
+        return payload
+
+    # Keep the existing UI's single attempt value monotonic across both
+    # workflow-level request retries and Temporal activity retries.
+    payload["attempt"] = stream_attempt * 1000 + (activity_attempt or 1)
+    return payload
 
 
 def configure_stream_sink(

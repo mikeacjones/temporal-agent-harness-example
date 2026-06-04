@@ -37,7 +37,13 @@ from ..messages import (
 from ..sliding_window_context_manager import estimate_token_count
 from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
-from .interface import AgentProvider, ProviderRequest, ProviderResponse
+from .errors import status_error_is_context_window_exceeded
+from .interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+)
 
 ChatGPTStopReason = str
 ChatGPTReasoningEffort = Literal["minimal", "low", "medium", "high"]
@@ -67,10 +73,12 @@ class ChatGPTRequest:
     system_prompt: str
     model: str
     max_tokens: int
+    context_token_limit: int | None
     tools: list[dict]
     chat_history: list[dict]
     stream_id: str | None = None
     stream_sequence: int | None = None
+    stream_attempt: int | None = None
     reasoning: dict | None = None
 
 
@@ -128,19 +136,23 @@ class ChatGPTProvider(AgentProvider):
         system_prompt: str,
         model: str,
         max_tokens: int,
+        context_token_limit: int | None,
         tools: list[dict[str, Any]],
         chat_history: list[AgentMessage],
         stream_id: str | None,
         stream_sequence: int | None,
+        stream_attempt: int | None,
     ) -> ChatGPTRequest:
         return ChatGPTRequest(
             system_prompt=system_prompt,
             model=model,
             max_tokens=max_tokens,
+            context_token_limit=context_token_limit,
             tools=_chatgpt_tools_from_agent_tools(tools),
             chat_history=_agent_messages_to_chatgpt_input(chat_history),
             stream_id=stream_id,
             stream_sequence=stream_sequence,
+            stream_attempt=stream_attempt,
             reasoning=_reasoning_config_to_openai(self._reasoning),
         )
 
@@ -156,6 +168,13 @@ class ChatGPTProvider(AgentProvider):
             cast(ChatGPTRequest, request),
             chat_history=_agent_messages_to_chatgpt_input(chat_history),
         )
+
+    def replace_request_stream_attempt(
+        self,
+        request: ProviderRequest,
+        stream_attempt: int | None,
+    ) -> ChatGPTRequest:
+        return replace(cast(ChatGPTRequest, request), stream_attempt=stream_attempt)
 
     def request_to_dict(self, request: ProviderRequest) -> dict[str, Any]:
         return _chatgpt_request_to_dict(cast(ChatGPTRequest, request))
@@ -306,10 +325,12 @@ def _chatgpt_request_to_dict(request: ChatGPTRequest) -> dict[str, Any]:
         "system_prompt": request.system_prompt,
         "model": request.model,
         "max_tokens": request.max_tokens,
+        "context_token_limit": request.context_token_limit,
         "tools": [_copy_mapping(tool) for tool in request.tools],
         "chat_history": [_copy_mapping(message) for message in request.chat_history],
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
+        "stream_attempt": request.stream_attempt,
         "reasoning": _copy_optional_mapping(request.reasoning),
     }
 
@@ -319,10 +340,12 @@ def _chatgpt_request_from_dict(request: dict[str, Any]) -> ChatGPTRequest:
         system_prompt=cast(str, request["system_prompt"]),
         model=cast(str, request["model"]),
         max_tokens=cast(int, request["max_tokens"]),
+        context_token_limit=cast(int | None, request.get("context_token_limit")),
         tools=_mapping_list(request.get("tools", [])),
         chat_history=_mapping_list(request.get("chat_history", [])),
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
+        stream_attempt=cast(int | None, request.get("stream_attempt")),
         reasoning=_copy_optional_mapping(request.get("reasoning")),
     )
 
@@ -423,8 +446,15 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 create_params,
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
+                stream_attempt=request.stream_attempt,
             )
     except APIStatusError as err:
+        if _openai_error_is_context_window_exceeded(err):
+            raise ApplicationError(
+                str(err),
+                type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         if _openai_status_is_non_retryable(err.status_code):
             raise ApplicationError(
                 str(err),
@@ -450,8 +480,13 @@ async def _stream_chatgpt_response(
     *,
     stream_id: str | None,
     stream_sequence: int | None,
+    stream_attempt: int | None,
 ) -> _ChatGPTStreamState:
-    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="chatgpt")
+    stream = AgentStreamWriter.for_provider(
+        stream_id=stream_id,
+        provider="chatgpt",
+        attempt=stream_attempt,
+    )
     stream_state = _ChatGPTStreamState(sequence=stream_sequence)
     heartbeat_state = _ChatGPTHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
@@ -706,6 +741,13 @@ def _openai_status_is_non_retryable(status_code: int) -> bool:
     if status_code in {408, 409, 429}:
         return False
     return 400 <= status_code < 500
+
+
+def _openai_error_is_context_window_exceeded(err: Any) -> bool:
+    return status_error_is_context_window_exceeded(
+        cast(int | None, getattr(err, "status_code", None)),
+        str(err),
+    )
 
 
 def _agent_messages_to_chatgpt_input(

@@ -40,7 +40,17 @@ from ..messages import (
 from ..sliding_window_context_manager import estimate_token_count
 from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
-from .interface import AgentProvider, ProviderRequest, ProviderResponse
+from .errors import (
+    counted_context_window_message,
+    counted_tokens_exceed_context,
+    status_error_is_context_window_exceeded,
+)
+from .interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+)
 
 GeminiStopReason = str
 
@@ -74,10 +84,12 @@ class GeminiRequest:
     system_prompt: str
     model: str
     max_tokens: int
+    context_token_limit: int | None
     tools: list[dict]
     chat_history: list[dict]
     stream_id: str | None = None
     stream_sequence: int | None = None
+    stream_attempt: int | None = None
     thinking_config: dict | None = None
 
 
@@ -135,19 +147,23 @@ class GeminiProvider(AgentProvider):
         system_prompt: str,
         model: str,
         max_tokens: int,
+        context_token_limit: int | None,
         tools: list[dict[str, Any]],
         chat_history: list[AgentMessage],
         stream_id: str | None,
         stream_sequence: int | None,
+        stream_attempt: int | None,
     ) -> GeminiRequest:
         return GeminiRequest(
             system_prompt=system_prompt,
             model=model,
             max_tokens=max_tokens,
+            context_token_limit=context_token_limit,
             tools=_gemini_tools_from_agent_tools(tools),
             chat_history=_agent_messages_to_gemini_contents(chat_history),
             stream_id=stream_id,
             stream_sequence=stream_sequence,
+            stream_attempt=stream_attempt,
             thinking_config=_thinking_config_to_gemini(self._thinking),
         )
 
@@ -163,6 +179,13 @@ class GeminiProvider(AgentProvider):
             cast(GeminiRequest, request),
             chat_history=_agent_messages_to_gemini_contents(chat_history),
         )
+
+    def replace_request_stream_attempt(
+        self,
+        request: ProviderRequest,
+        stream_attempt: int | None,
+    ) -> GeminiRequest:
+        return replace(cast(GeminiRequest, request), stream_attempt=stream_attempt)
 
     def request_to_dict(self, request: ProviderRequest) -> dict[str, Any]:
         return _gemini_request_to_dict(cast(GeminiRequest, request))
@@ -308,10 +331,12 @@ def _gemini_request_to_dict(request: GeminiRequest) -> dict[str, Any]:
         "system_prompt": request.system_prompt,
         "model": request.model,
         "max_tokens": request.max_tokens,
+        "context_token_limit": request.context_token_limit,
         "tools": [_copy_mapping(tool) for tool in request.tools],
         "chat_history": [_copy_mapping(message) for message in request.chat_history],
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
+        "stream_attempt": request.stream_attempt,
         "thinking_config": _copy_optional_mapping(request.thinking_config),
     }
 
@@ -321,10 +346,12 @@ def _gemini_request_from_dict(request: dict[str, Any]) -> GeminiRequest:
         system_prompt=cast(str, request["system_prompt"]),
         model=cast(str, request["model"]),
         max_tokens=cast(int, request["max_tokens"]),
+        context_token_limit=cast(int | None, request.get("context_token_limit")),
         tools=_mapping_list(request.get("tools", [])),
         chat_history=_mapping_list(request.get("chat_history", [])),
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
+        stream_attempt=cast(int | None, request.get("stream_attempt")),
         thinking_config=_copy_optional_mapping(request.get("thinking_config")),
     )
 
@@ -400,6 +427,13 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
 
     try:
         async with genai.Client(api_key=api_key).aio as client:
+            if _should_count_request_tokens(request):
+                await _raise_if_gemini_context_too_large(
+                    client,
+                    request,
+                    contents,
+                    config,
+                )
             state = await _stream_gemini_message(
                 client,
                 model=request.model,
@@ -407,8 +441,15 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
                 config=config,
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
+                stream_attempt=request.stream_attempt,
             )
     except genai_errors.APIError as err:
+        if _google_error_is_context_window_exceeded(err):
+            raise ApplicationError(
+                str(err),
+                type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         if _google_status_is_non_retryable(
             cast(int | None, getattr(err, "code", None))
         ):
@@ -461,6 +502,49 @@ def _gemini_generate_content_config(
     )
 
 
+def _should_count_request_tokens(request: GeminiRequest) -> bool:
+    return bool(
+        request.context_token_limit is not None
+        and request.stream_attempt is not None
+        and request.stream_attempt > 1
+    )
+
+
+async def _raise_if_gemini_context_too_large(
+    client: Any,
+    request: GeminiRequest,
+    contents: list[genai_types.Content],
+    config: genai_types.GenerateContentConfig,
+) -> None:
+    count_config = genai_types.CountTokensConfig(
+        system_instruction=config.system_instruction,
+        tools=config.tools,
+    )
+    token_count = await client.models.count_tokens(
+        model=request.model,
+        contents=contents,
+        config=count_config,
+    )
+    input_tokens = int(token_count.total_tokens or 0)
+    if not counted_tokens_exceed_context(
+        input_tokens=input_tokens,
+        max_output_tokens=request.max_tokens,
+        context_token_limit=request.context_token_limit,
+    ):
+        return
+
+    raise ApplicationError(
+        counted_context_window_message(
+            provider="Gemini",
+            input_tokens=input_tokens,
+            max_output_tokens=request.max_tokens,
+            context_token_limit=cast(int, request.context_token_limit),
+        ),
+        type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+        non_retryable=True,
+    )
+
+
 async def _stream_gemini_message(
     client: Any,
     *,
@@ -469,8 +553,13 @@ async def _stream_gemini_message(
     config: genai_types.GenerateContentConfig,
     stream_id: str | None,
     stream_sequence: int | None,
+    stream_attempt: int | None,
 ) -> _GeminiStreamState:
-    stream = AgentStreamWriter.for_provider(stream_id=stream_id, provider="gemini")
+    stream = AgentStreamWriter.for_provider(
+        stream_id=stream_id,
+        provider="gemini",
+        attempt=stream_attempt,
+    )
     stream_state = _GeminiStreamState(sequence=stream_sequence, model=model)
     heartbeat_state = _GeminiHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
@@ -635,6 +724,13 @@ def _google_status_is_non_retryable(status_code: int | None) -> bool:
     if status_code is None or status_code in {408, 409, 429}:
         return False
     return 400 <= status_code < 500
+
+
+def _google_error_is_context_window_exceeded(err: Any) -> bool:
+    return status_error_is_context_window_exceeded(
+        cast(int | None, getattr(err, "code", None)),
+        str(err),
+    )
 
 
 def _agent_messages_to_gemini_contents(

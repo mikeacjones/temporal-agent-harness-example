@@ -634,10 +634,14 @@ class SimpleChatWorkflow:
                             ),
                         )
                     return
-                await workflow.wait_condition(
-                    lambda: self._delete_requested or len(self._pending_messages) > 0,
-                    timeout=self._time_until_checkpoint(),
-                )
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._delete_requested
+                        or len(self._pending_messages) > 0,
+                        timeout=self._time_until_checkpoint(),
+                    )
+                except asyncio.TimeoutError:
+                    pass
                 if self._delete_requested:
                     return
                 if self._checkpoint_due() and workflow.all_handlers_finished():
