@@ -55,6 +55,68 @@ SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
 GOOGLE_API_KEY=...
 ```
 
+## Optional Local SearXNG
+
+The `search_web` tool is enabled when both the API and worker processes see
+`SIMPLE_CHAT_SEARXNG_BASE_URL`. For local development, you can run SearXNG in
+Docker and point the app at it:
+
+```bash
+mkdir -p .local/searxng/config .local/searxng/cache
+
+cat > .local/searxng/config/settings.yml <<'YAML'
+use_default_settings: true
+
+general:
+  instance_name: "Agent Harness Local Search"
+  enable_metrics: false
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  formats:
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "local-agent-harness-searxng"
+  limiter: false
+  image_proxy: false
+  method: "GET"
+
+outgoing:
+  request_timeout: 4.0
+  max_request_timeout: 8.0
+  useragent_suffix: "temporal-agent-harness-local"
+YAML
+
+docker run --rm --name agent-harness-searxng \
+  -p 8080:8080 \
+  -e SEARXNG_BASE_URL=http://127.0.0.1:8080/ \
+  -e SEARXNG_PORT=8080 \
+  -e SEARXNG_BIND_ADDRESS=0.0.0.0 \
+  -v "$PWD/.local/searxng/config:/etc/searxng" \
+  -v "$PWD/.local/searxng/cache:/var/cache/searxng" \
+  ghcr.io/searxng/searxng:latest
+```
+
+In your repo-root `.env`, set:
+
+```bash
+SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
+```
+
+Restart both the API and worker after changing the value. The API uses it to
+advertise `search_web` in the Tools window, and the worker uses it when the
+agent actually calls the tool.
+
+You can sanity-check the local SearXNG instance before restarting the app:
+
+```bash
+curl 'http://127.0.0.1:8080/search?q=temporal&format=json'
+```
+
 ## Install Dependencies
 
 From the repo root:

@@ -183,6 +183,9 @@ GOOGLE_YOUTUBE_API_KEY=...
 GOOGLE_SAFE_BROWSING_API_KEY=...
 ```
 
+For local SearXNG Docker setup, see `docs/local-development.md` from the repo
+root.
+
 The Kubernetes manifests deploy SearXNG as an internal ClusterIP service in the
 primary namespace; it is not routed through ingress. Temporary demo workspaces
 receive the same SearXNG URL and Google research API key environment values so
