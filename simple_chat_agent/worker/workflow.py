@@ -628,7 +628,10 @@ class SimpleChatWorkflow:
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
                         workflow.continue_as_new(
-                            await self._continue_as_new_input(chat_input, None)
+                            await self._continue_as_new_input(chat_input, None),
+                            initial_versioning_behavior=(
+                                workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                            ),
                         )
                     return
                 await workflow.wait_condition(
@@ -640,7 +643,10 @@ class SimpleChatWorkflow:
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
                         workflow.continue_as_new(
-                            await self._continue_as_new_input(chat_input, None)
+                            await self._continue_as_new_input(chat_input, None),
+                            initial_versioning_behavior=(
+                                workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                            ),
                         )
                     return
                 if not self._pending_messages:
@@ -709,7 +715,10 @@ class SimpleChatWorkflow:
                     await self._continue_as_new_input(
                         chat_input,
                         continue_as_new_state,
-                    )
+                    ),
+                    initial_versioning_behavior=(
+                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                    ),
                 )
 
     def _touch(self) -> None:

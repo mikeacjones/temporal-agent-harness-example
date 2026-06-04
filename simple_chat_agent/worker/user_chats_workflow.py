@@ -178,10 +178,20 @@ class UserChatsWorkflow:
             if not workflow.all_handlers_finished():
                 continue
             if workflow.info().is_continue_as_new_suggested():
-                workflow.continue_as_new(self._continue_as_new_input())
+                workflow.continue_as_new(
+                    self._continue_as_new_input(),
+                    initial_versioning_behavior=(
+                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                    ),
+                )
             if self._checkpoint_due():
                 if self._touched_this_run:
-                    workflow.continue_as_new(self._continue_as_new_input())
+                    workflow.continue_as_new(
+                        self._continue_as_new_input(),
+                        initial_versioning_behavior=(
+                            workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                        ),
+                    )
                 await self._delete_all_chats()
                 return
 

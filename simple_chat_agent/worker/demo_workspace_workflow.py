@@ -130,7 +130,10 @@ class DemoWorkspaceWorkflow:
                         user_email=self._state.user_email,
                         search_attr_name=request.search_attr_name,
                         state=self._state,
-                    )
+                    ),
+                    initial_versioning_behavior=(
+                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                    ),
                 )
             if self._state.status != "active":
                 await workflow.wait_condition(
