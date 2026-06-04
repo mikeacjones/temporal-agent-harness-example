@@ -1,6 +1,6 @@
 # Running Locally
 
-This guide runs the demo on your machine with only a single external dependency: the LLM provider. 
+This guide runs the demo on your machine with a single external dependency: the LLM provider. 
 
 ## Required Tools
 
