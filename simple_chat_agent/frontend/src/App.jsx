@@ -1401,6 +1401,12 @@ export default function App() {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Creating demo workspace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -1412,7 +1418,7 @@ export default function App() {
       justify-content: center;
       background: #141414;
       color: #f8fafc;
-      font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     }
     main {
       width: min(420px, calc(100vw - 32px));
@@ -1440,7 +1446,7 @@ export default function App() {
       max-width: 100%;
       overflow: hidden;
       color: #7c8fb1;
-      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font: 12px/1.4 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
@@ -1548,6 +1554,12 @@ export default function App() {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Demo workspace failed</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
   <style>
     :root { color-scheme: dark; }
     body {
@@ -1558,7 +1570,7 @@ export default function App() {
       justify-content: center;
       background: #141414;
       color: #f8fafc;
-      font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     }
     main {
       width: min(520px, calc(100vw - 32px));
@@ -1572,7 +1584,7 @@ export default function App() {
       overflow-wrap: anywhere;
       white-space: pre-wrap;
       color: #ffb199;
-      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font: 12px/1.5 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
     }
   </style>
 </head>

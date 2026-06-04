@@ -485,6 +485,7 @@ def _user_email_sa_name() -> str:
 
 
 async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any:
+    await _require_demo_workspace_can_start_registry()
     workflow_id = user_chats_workflow_id(user_id)
     search_attr_name = _user_email_sa_name()
     return await _client().start_workflow(
@@ -503,6 +504,34 @@ async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any
             user_email=user_email,
         ),
     )
+
+
+async def _require_demo_workspace_can_start_registry() -> None:
+    if not demo_workspace_mode():
+        return
+
+    handle = _demo_workspace_parent_workflow()
+    if handle is None:
+        raise HTTPException(
+            status_code=410,
+            detail="Demo workspace is no longer available.",
+        )
+
+    try:
+        state = await handle.query(DemoWorkspaceWorkflow.state)
+    except Exception as err:
+        if _is_demo_workspace_absent(err):
+            raise HTTPException(
+                status_code=410,
+                detail="Demo workspace is no longer available.",
+            ) from err
+        raise
+
+    if state.status not in {"active", "provisioning"}:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Demo workspace is {state.status}.",
+        )
 
 
 async def _ensure_demo_workspace_workflow(user: AuthenticatedUser) -> Any:

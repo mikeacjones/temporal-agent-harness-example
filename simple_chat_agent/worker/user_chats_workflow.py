@@ -12,6 +12,7 @@ from temporalio.common import (
     SearchAttributePair,
     TypedSearchAttributes,
 )
+from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -316,8 +317,9 @@ class UserChatsWorkflow:
         try:
             await handle.signal(SimpleChatWorkflow.delete)
             await handle.cancel()
-        except Exception:
-            pass
+        except Exception as err:
+            if not _is_missing_external_workflow(err):
+                raise
 
         self._chats.pop(workflow_id, None)
 
@@ -403,8 +405,9 @@ class UserChatsWorkflow:
             try:
                 await handle.signal(SimpleChatWorkflow.delete)
                 await handle.cancel()
-            except Exception:
-                pass
+            except Exception as err:
+                if not _is_missing_external_workflow(err):
+                    raise
         self._chats.clear()
 
 
@@ -424,3 +427,17 @@ def _conversation_title(message: str) -> str:
     if len(normalized) <= 64:
         return normalized
     return f"{normalized[:61]}..."
+
+
+def _is_missing_external_workflow(err: Exception) -> bool:
+    if not isinstance(err, ApplicationError):
+        return False
+    error_type = (err.type or "").lower()
+    message = str(err).lower()
+    return (
+        "notfound" in error_type
+        or "not_found" in error_type
+        or "not found" in message
+        or "already completed" in message
+        or "not running" in message
+    )
