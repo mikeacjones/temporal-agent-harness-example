@@ -144,7 +144,7 @@ samp,
     display: grid;
     gap: var(--space-xs);
 }
-.login-field label {
+.login-field span {
     color: var(--color-text-secondary);
     font-size: var(--font-size-sm);
 }
@@ -171,15 +171,18 @@ samp,
 .login-subtitle:empty {
     display: none;
 }
-.login-google {
+.login-button {
     display: flex;
     align-items: center;
     justify-content: center;
     height: 48px;
+    width: 100%;
     border-radius: var(--radius-lg);
     text-decoration: none;
     font-weight: 600;
+    font: inherit;
     color: var(--color-text-primary);
+    cursor: pointer;
     /* Outline button with a UV -> bubble-gum gradient border (transparent
          fill), matching Temporal's "Log In" button. */
     border: 2px solid transparent;
@@ -189,8 +192,12 @@ samp,
         linear-gradient(90deg, #444ce7, #ff61fa) border-box;
     transition: filter var(--transition-fast);
 }
-.login-google:hover {
+.login-button:hover {
     filter: brightness(1.2);
+}
+.login-button:disabled {
+    opacity: 0.6;
+    cursor: default;
 }
 .login-google[aria-disabled="true"] {
     opacity: 0.6;

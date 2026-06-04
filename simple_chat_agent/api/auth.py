@@ -31,6 +31,13 @@ def user_from_google_subject(*, subject: str, email: str) -> AuthenticatedUser:
     )
 
 
+def user_from_local_username(username: str) -> AuthenticatedUser:
+    return AuthenticatedUser(
+        user_id=f"user_local_{_short_digest(username)}",
+        username=username,
+    )
+
+
 def create_session_token(
     user: AuthenticatedUser,
     *,

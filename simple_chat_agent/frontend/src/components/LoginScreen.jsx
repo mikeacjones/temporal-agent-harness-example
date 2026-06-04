@@ -1,21 +1,96 @@
-export function LoginScreen({ hidden, loggingIn, configured, subtitle, error, onLoginClick }) {
+export function LoginScreen({
+  hidden,
+  loggingIn,
+  authMode,
+  configured,
+  subtitle,
+  error,
+  localUsername,
+  localPassword,
+  onLocalUsernameChange,
+  onLocalPasswordChange,
+  onLocalSubmit,
+  onGoogleLoginClick,
+}) {
   return (
     <section className="login-screen" hidden={hidden}>
       <div className={`login-card${loggingIn ? " logging-in" : ""}`}>
         <h1 aria-label="Simple Chat Agent"></h1>
         <p className="login-subtitle">{subtitle}</p>
-        <div className="login-form">
-          <a
-            className="login-google"
-            href="/oauth/google/start"
-            aria-disabled={configured ? undefined : "true"}
-            onClick={onLoginClick}
-          >
-            Log In
-          </a>
-          <p className="login-error">{error}</p>
-        </div>
+        {authMode === "local" ? (
+          <LocalLoginForm
+            username={localUsername}
+            password={localPassword}
+            error={error}
+            onUsernameChange={onLocalUsernameChange}
+            onPasswordChange={onLocalPasswordChange}
+            onSubmit={onLocalSubmit}
+          />
+        ) : (
+          <GoogleLoginForm
+            configured={configured}
+            error={error}
+            onLoginClick={onGoogleLoginClick}
+          />
+        )}
       </div>
     </section>
   );
+}
+
+function GoogleLoginForm({ configured, error, onLoginClick }) {
+  return (
+    <div className="login-form">
+      <a
+        className="login-button login-google"
+        href="/oauth/google/start"
+        aria-disabled={configured ? undefined : "true"}
+        onClick={onLoginClick}
+      >
+        Log In
+      </a>
+      <LoginError error={error} />
+    </div>
+  );
+}
+
+function LocalLoginForm({
+  username,
+  password,
+  error,
+  onUsernameChange,
+  onPasswordChange,
+  onSubmit,
+}) {
+  return (
+    <form className="login-form" onSubmit={onSubmit}>
+      <label className="login-field">
+        <span>Username</span>
+        <input
+          name="username"
+          autoComplete="username"
+          value={username}
+          onChange={(event) => onUsernameChange(event.currentTarget.value)}
+        />
+      </label>
+      <label className="login-field">
+        <span>Password</span>
+        <input
+          name="password"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(event) => onPasswordChange(event.currentTarget.value)}
+        />
+      </label>
+      <button className="login-button" type="submit">
+        Log In
+      </button>
+      <LoginError error={error} />
+    </form>
+  );
+}
+
+function LoginError({ error }) {
+  return <p className="login-error">{error}</p>;
 }

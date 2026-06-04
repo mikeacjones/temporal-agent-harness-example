@@ -257,7 +257,10 @@ class StreamBroker:
         position = offset
         with path.open("r", encoding="utf-8") as stream:
             stream.seek(offset)
-            for line in stream:
+            while len(entries) < limit:
+                line = stream.readline()
+                if not line:
+                    break
                 position = stream.tell()
                 with suppress(json.JSONDecodeError):
                     entries.append(
@@ -266,8 +269,6 @@ class StreamBroker:
                             **self._entry_from_json_line(json.loads(line)),
                         }
                     )
-                if len(entries) >= limit:
-                    break
 
         return {
             "entries": entries,

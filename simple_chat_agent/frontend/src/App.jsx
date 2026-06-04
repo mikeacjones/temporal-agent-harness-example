@@ -433,30 +433,38 @@ export default function App() {
       ...previous,
       auth: "login",
       loginError,
+      loggingIn: false,
       statusNotice: "",
     }));
-    configureLoginButton();
+    configureAuth();
   }
 
-  async function configureLoginButton() {
+  async function configureAuth() {
     try {
-      const response = await fetch("/api/auth/google/configured");
+      const response = await fetch("/api/auth/config");
       if (!response.ok) throw new Error(await response.text());
       const body = await response.json();
+      const mode = body.mode || "none";
       setState((previous) => ({
         ...previous,
-        loginConfigured: Boolean(body.configured),
-        loginSubtitle: body.configured
-          ? ""
-          : "Google OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET.",
+        authMode: mode,
+        loginConfigured: mode === "google" || mode === "local",
+        loginSubtitle: loginSubtitleForMode(mode),
       }));
     } catch (error) {
       setState((previous) => ({
         ...previous,
+        authMode: "none",
         loginConfigured: false,
         loginSubtitle: `Could not check auth config: ${error}`,
       }));
     }
+  }
+
+  function loginSubtitleForMode(mode) {
+    if (mode === "local") return "Local testing mode. Use demo/demo unless overridden.";
+    if (mode === "google") return "";
+    return "Authentication is not configured. Set Google OAuth credentials or enable local testing auth.";
   }
 
   async function loadConversationsData() {
@@ -2000,12 +2008,37 @@ export default function App() {
 
   function handleLoginClick(event) {
     event.preventDefault();
-    if (!state.loginConfigured) return;
+    if (state.authMode !== "google" || !state.loginConfigured) return;
     const href = event.currentTarget.getAttribute("href");
     setState((previous) => ({ ...previous, loggingIn: true }));
     setTimeout(() => {
       window.location.href = href;
     }, 750);
+  }
+
+  async function handleLocalLoginSubmit(event) {
+    event.preventDefault();
+    const current = stateRef.current;
+    if (current.authMode !== "local") return;
+    setState((previous) => ({ ...previous, loggingIn: true, loginError: "" }));
+    try {
+      const response = await fetch("/api/auth/local/login", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          username: current.localLoginUsername,
+          password: current.localLoginPassword,
+        }),
+      });
+      if (!response.ok) throw new Error(await responseErrorText(response));
+      await boot({ cancelled: false });
+    } catch (error) {
+      setState((previous) => ({
+        ...previous,
+        loggingIn: false,
+        loginError: String(error),
+      }));
+    }
   }
 
   const status = displayStatus(state);
@@ -2028,9 +2061,19 @@ export default function App() {
         hidden={state.auth !== "login"}
         loggingIn={state.loggingIn}
         configured={state.loginConfigured}
+        authMode={state.authMode}
         subtitle={state.loginSubtitle}
         error={state.loginError}
-        onLoginClick={handleLoginClick}
+        localUsername={state.localLoginUsername}
+        localPassword={state.localLoginPassword}
+        onLocalUsernameChange={(value) =>
+          setState((previous) => ({ ...previous, localLoginUsername: value }))
+        }
+        onLocalPasswordChange={(value) =>
+          setState((previous) => ({ ...previous, localLoginPassword: value }))
+        }
+        onLocalSubmit={handleLocalLoginSubmit}
+        onGoogleLoginClick={handleLoginClick}
       />
       <div className="app" hidden={state.auth !== "app"}>
         <AppHeader

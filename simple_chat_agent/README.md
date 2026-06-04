@@ -43,13 +43,12 @@ Create a repo-root `.env` file:
 ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_MODEL=claude-sonnet-4-5
 
-SIMPLE_CHAT_JWT_SECRET=replace-me-for-any-shared-demo
+SIMPLE_CHAT_JWT_SECRET=replace-me-for-local-dev
 
-# Sign in with Google (required to log in)
-GOOGLE_OAUTH_CLIENT_ID=...
-GOOGLE_OAUTH_CLIENT_SECRET=...
-GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/oauth/google/callback
-GOOGLE_OAUTH_ALLOWED_DOMAIN=temporal.io
+# Local-only login. Do not set Google OAuth credentials when using this mode.
+SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1
+SIMPLE_CHAT_LOCAL_AUTH_USERNAME=demo
+SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=demo
 ```
 
 Start a local Temporal dev server:
@@ -113,6 +112,23 @@ uv run python -m simple_chat_agent.api.main
 Open `http://127.0.0.1:8000` and log in. The default credentials are
 `demo` / `demo` unless you override them in `.env`.
 
+For the full local setup, including required CLI tools and optional Google
+OAuth, see [`docs/local-development.md`](../docs/local-development.md).
+
+## Authentication Modes
+
+The app always uses the same signed session cookie after login, but it can mint
+that session in two ways:
+
+- Google OAuth for shared and deployed environments.
+- Local testing auth for private local runs.
+
+Local testing auth is default-off. When
+`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1` and Google OAuth is not configured, the API
+registers `POST /api/auth/local/login` and the UI renders the local
+username/password form. If Google OAuth is configured, the local route is not
+registered and the UI uses Google login.
+
 ## What To Try
 
 - Start a new chat and ask a normal question.
@@ -166,6 +182,9 @@ GOOGLE_BOOKS_API_KEY=...
 GOOGLE_YOUTUBE_API_KEY=...
 GOOGLE_SAFE_BROWSING_API_KEY=...
 ```
+
+For local SearXNG Docker setup, see `docs/local-development.md` from the repo
+root.
 
 The Kubernetes manifests deploy SearXNG as an internal ClusterIP service in the
 primary namespace; it is not routed through ingress. Temporary demo workspaces
