@@ -5,9 +5,15 @@ This guide runs the demo on your machine with a single external dependency: the 
 ## Required Tools
 
 - `uv`
+  - Package: https://github.com/astral-sh/uv
+  - Homebrew install: `brew install uv`
 - Node.js 22 and `npm`
+  - Package: https://nodejs.org/
+  - Homebrew install: `brew install node@22`
+  - `npm` is bundled with Node.js.
 - Temporal CLI
-- A shell that can run the commands below
+  - Package: https://github.com/temporalio/cli
+  - Homebrew install: `brew install temporal`
 
 Optional tools:
 
@@ -59,10 +65,14 @@ The `search_web` tool is enabled when both the API and worker processes see
 `SIMPLE_CHAT_SEARXNG_BASE_URL`. For local development, you can run SearXNG in
 Docker and point the app at it:
 
+Create a `settings.yml` file, for example at
+`.local/searxng/config/settings.yml`:
+
 ```bash
 mkdir -p .local/searxng/config .local/searxng/cache
+```
 
-cat > .local/searxng/config/settings.yml <<'YAML'
+```yaml
 use_default_settings: true
 
 general:
@@ -87,8 +97,11 @@ outgoing:
   request_timeout: 4.0
   max_request_timeout: 8.0
   useragent_suffix: "temporal-agent-harness-local"
-YAML
+```
 
+Mount that config directory when you start the SearXNG container:
+
+```bash
 docker run --rm --name agent-harness-searxng \
   -p 8080:8080 \
   -e SEARXNG_BASE_URL=http://127.0.0.1:8080/ \
