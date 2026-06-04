@@ -6,6 +6,10 @@ It is an example of how a team might build a small, opinionated agent harness ar
 
 The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
 
+## Demo Recording
+
+[![Temporal Agent Harness demo recording](docs/demo-video-thumbnail.png)](https://drive.google.com/file/d/1HEwsBnabhiszNh0ULDwCcnAavfNzDcLK/view?usp=sharing)
+
 ## Opinionated Architecture
 
 ![Agent harness architecture](docs/agent-harness-simplified.png)
