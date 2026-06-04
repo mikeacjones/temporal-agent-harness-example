@@ -13,6 +13,7 @@ from temporalio.common import (
     SearchAttributePair,
     TypedSearchAttributes,
 )
+from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from simple_chat_agent.worker.workflow import SimpleChatWorkflow
@@ -130,7 +131,10 @@ class DemoWorkspaceWorkflow:
                         user_email=self._state.user_email,
                         search_attr_name=request.search_attr_name,
                         state=self._state,
-                    )
+                    ),
+                    initial_versioning_behavior=(
+                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                    ),
                 )
             if self._state.status != "active":
                 await workflow.wait_condition(
@@ -163,7 +167,7 @@ class DemoWorkspaceWorkflow:
             return self._state
 
         now = workflow.now().isoformat()
-        workspace_id = _workspace_id(workflow.uuid4())
+        workspace_id = _workspace_id(config.user_id)
         namespace = f"agent-harness-demo-{workspace_id}"
         task_queue = f"{config.task_queue_prefix}-{workspace_id}"
         workflow_prefix = f"{config.workflow_prefix_prefix}{workspace_id}-"
@@ -293,8 +297,9 @@ class DemoWorkspaceWorkflow:
             try:
                 await handle.signal(SimpleChatWorkflow.delete)
                 await handle.cancel()
-            except Exception:
-                pass
+            except Exception as err:
+                if not _is_missing_external_workflow(err):
+                    raise
 
         workflow_ids = [chat.workflow_id for chat in self._state.chats if chat.workflow_id]
         if workflow_ids and self._state.temporal_namespace:
@@ -313,8 +318,9 @@ class DemoWorkspaceWorkflow:
                 await workflow.get_external_workflow_handle(
                     self._state.registry_workflow_id
                 ).cancel()
-            except Exception:
-                pass
+            except Exception as err:
+                if not _is_missing_external_workflow(err):
+                    raise
 
         if self._state.namespace:
             self._state.provisioning_step = "deleting-namespace"
@@ -443,11 +449,25 @@ def _provision_request(
     )
 
 
-def _workspace_id(unique_id: str) -> str:
-    unique = str(unique_id).replace("-", "")
-    return f"temp-{unique[:8]}"
+def _workspace_id(user_id: str) -> str:
+    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    return f"temp-{digest[:8]}"
 
 
 def _registry_workflow_id(*, user_id: str, workflow_prefix: str) -> str:
     digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
     return f"{workflow_prefix}simple-chat-user-{digest}"
+
+
+def _is_missing_external_workflow(err: Exception) -> bool:
+    if not isinstance(err, ApplicationError):
+        return False
+    error_type = (err.type or "").lower()
+    message = str(err).lower()
+    return (
+        "notfound" in error_type
+        or "not_found" in error_type
+        or "not found" in message
+        or "already completed" in message
+        or "not running" in message
+    )

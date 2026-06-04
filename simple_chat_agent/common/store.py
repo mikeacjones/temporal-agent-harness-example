@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -397,6 +398,7 @@ class AppStore:
         mime_type: str,
         content: bytes,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> ArtifactRecord:
         if self._artifact_store is not None:
             return self._artifact_store.create_artifact(
@@ -407,38 +409,58 @@ class AppStore:
                 mime_type=mime_type,
                 content=content,
                 metadata=metadata,
+                idempotency_key=idempotency_key,
             )
         now = _now()
-        artifact_id = f"artifact_{uuid4().hex}"
+        artifact_id = _artifact_id(
+            user_id=user_id,
+            workflow_id=workflow_id,
+            idempotency_key=idempotency_key,
+        )
+        if idempotency_key:
+            existing = self.get_artifact(user_id=user_id, artifact_id=artifact_id)
+            if existing is not None:
+                return existing
         safe_name = _safe_artifact_name(name)
         artifact_path = self._artifact_dir / f"{artifact_id}-{safe_name}"
         artifact_path.write_bytes(content)
 
+        artifact_metadata = dict(metadata or {})
+        if idempotency_key:
+            artifact_metadata["idempotency_key"] = idempotency_key
         metadata_json = json.dumps(
-            _metadata_with_expiration(metadata, created_at=now)
+            _metadata_with_expiration(artifact_metadata, created_at=now)
         )
-        with self._connect() as conn:
-            conn.execute(
-                """
-                insert into artifacts (
-                    artifact_id, user_id, conversation_id, workflow_id, name,
-                    mime_type, size_bytes, path, metadata_json, created_at
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    insert into artifacts (
+                        artifact_id, user_id, conversation_id, workflow_id, name,
+                        mime_type, size_bytes, path, metadata_json, created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        user_id,
+                        conversation_id,
+                        workflow_id,
+                        safe_name,
+                        mime_type,
+                        len(content),
+                        str(artifact_path),
+                        metadata_json,
+                        now,
+                    ),
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    artifact_id,
-                    user_id,
-                    conversation_id,
-                    workflow_id,
-                    safe_name,
-                    mime_type,
-                    len(content),
-                    str(artifact_path),
-                    metadata_json,
-                    now,
-                ),
-            )
+        except sqlite3.IntegrityError:
+            with suppress(FileNotFoundError):
+                artifact_path.unlink()
+            existing = self.get_artifact(user_id=user_id, artifact_id=artifact_id)
+            if existing is not None:
+                return existing
+            raise
 
         return ArtifactRecord(
             artifact_id=artifact_id,
@@ -797,8 +819,17 @@ class S3DynamoArtifactStore:
         mime_type: str,
         content: bytes,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> ArtifactRecord:
-        artifact_id = f"artifact_{uuid4().hex}"
+        artifact_id = _artifact_id(
+            user_id=user_id,
+            workflow_id=workflow_id,
+            idempotency_key=idempotency_key,
+        )
+        if idempotency_key:
+            existing = self.get_artifact(user_id=user_id, artifact_id=artifact_id)
+            if existing is not None:
+                return existing
         safe_name = _safe_artifact_name(name)
         key = f"artifacts/{user_id}/{workflow_id}/{artifact_id}-{safe_name}"
         _s3_client().put_object(
@@ -806,8 +837,11 @@ class S3DynamoArtifactStore:
         )
         now = _now()
         path = f"s3://{self._bucket}/{key}"
+        artifact_metadata = dict(metadata or {})
+        if idempotency_key:
+            artifact_metadata["idempotency_key"] = idempotency_key
         metadata_json = json.dumps(
-            _metadata_with_expiration(metadata, created_at=now)
+            _metadata_with_expiration(artifact_metadata, created_at=now)
         )
         self._table.put_item(
             Item={
@@ -981,6 +1015,20 @@ def _safe_artifact_name(name: str) -> str:
     leaf_name = Path(name.strip()).name
     safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", leaf_name).strip(" .")
     return safe_name[:160] or "artifact.txt"
+
+
+def _artifact_id(
+    *,
+    user_id: str,
+    workflow_id: str,
+    idempotency_key: str | None,
+) -> str:
+    if not idempotency_key:
+        return f"artifact_{uuid4().hex}"
+    digest = hashlib.sha256(
+        f"{user_id}\x1f{workflow_id}\x1f{idempotency_key}".encode("utf-8")
+    ).hexdigest()
+    return f"artifact_{digest[:32]}"
 
 
 def _now() -> str:

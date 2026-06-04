@@ -26,6 +26,7 @@ WORKSPACE_LABEL = "agent-harness-demo-workspace"
 WORKSPACE_SECRET = "agent-harness-workspace-secrets"
 WORKSPACE_TLS_SECRET = "agent-harness-workspace-tls"
 WORKSPACE_SERVICE_ACCOUNT = "agent-harness-workspace"
+WORKSPACE_HTTPS_REDIRECT_MIDDLEWARE = "agent-harness-https-redirect"
 WEB_SERVICE = "agent-harness-web"
 API_SERVICE = "agent-harness-api"
 
@@ -134,6 +135,7 @@ async def deploy_demo_workspace_workloads(
         request.namespace,
         _worker_deployment(source_images["worker"], request.namespace, common_env),
     )
+    client.upsert_middleware(request.namespace, _https_redirect_middleware())
     client.upsert_ingress_route(request.namespace, _ingress_route(request.host, secure=True))
     client.upsert_ingress_route(request.namespace, _ingress_route(request.host, secure=False))
     return {"namespace": request.namespace, "url": request.url}
@@ -288,6 +290,14 @@ class KubernetesClient:
         )
         self._upsert(base, f"{base}/{quote(name)}", body)
 
+    def upsert_middleware(self, namespace: str, body: dict[str, Any]) -> None:
+        name = body["metadata"]["name"]
+        base = (
+            "/apis/traefik.containo.us/v1alpha1/"
+            f"namespaces/{quote(namespace)}/middlewares"
+        )
+        self._upsert(base, f"{base}/{quote(name)}", body)
+
     def get_deployment(self, namespace: str, name: str) -> dict[str, Any]:
         return self.request(
             "GET",
@@ -434,6 +444,7 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         "SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED": "0",
         "SIMPLE_CHAT_GITHUB_TOOLS_ENABLED": "0",
         "SIMPLE_CHAT_TASK_QUEUE": request.task_queue,
+        "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED": "0",
         "SIMPLE_CHAT_WORKFLOW_PREFIX": request.workflow_prefix,
         "SIMPLE_CHAT_PUBLIC_URL": request.url,
         "SIMPLE_CHAT_STREAM_SINK_URL": f"http://{API_SERVICE}",
@@ -633,6 +644,25 @@ def _service(
 def _ingress_route(host: str, *, secure: bool) -> dict[str, Any]:
     suffix = "" if secure else "-http"
     entrypoint = "websecure" if secure else "web"
+    routes = [
+        _route(host, "/api", API_SERVICE),
+        _route(host, "/oauth", API_SERVICE),
+        _route(host, "/internal", API_SERVICE),
+        {
+            "kind": "Rule",
+            "match": f"Host(`{host}`)",
+            "services": [
+                {
+                    "name": WEB_SERVICE,
+                    "passHostHeader": True,
+                    "port": 80,
+                }
+            ],
+        },
+    ]
+    if not secure:
+        for route in routes:
+            route["middlewares"] = [{"name": WORKSPACE_HTTPS_REDIRECT_MIDDLEWARE}]
     route = {
         "apiVersion": "traefik.containo.us/v1alpha1",
         "kind": "IngressRoute",
@@ -642,27 +672,29 @@ def _ingress_route(host: str, *, secure: bool) -> dict[str, Any]:
         },
         "spec": {
             "entryPoints": [entrypoint],
-            "routes": [
-                _route(host, "/api", API_SERVICE),
-                _route(host, "/oauth", API_SERVICE),
-                _route(host, "/internal", API_SERVICE),
-                {
-                    "kind": "Rule",
-                    "match": f"Host(`{host}`)",
-                    "services": [
-                        {
-                            "name": WEB_SERVICE,
-                            "passHostHeader": True,
-                            "port": 80,
-                        }
-                    ],
-                },
-            ],
+            "routes": routes,
         },
     }
     if secure:
         route["spec"]["tls"] = {"secretName": WORKSPACE_TLS_SECRET}
     return route
+
+
+def _https_redirect_middleware() -> dict[str, Any]:
+    return {
+        "apiVersion": "traefik.containo.us/v1alpha1",
+        "kind": "Middleware",
+        "metadata": {
+            "name": WORKSPACE_HTTPS_REDIRECT_MIDDLEWARE,
+            "labels": {"app": WORKSPACE_LABEL},
+        },
+        "spec": {
+            "redirectScheme": {
+                "scheme": "https",
+                "permanent": True,
+            }
+        },
+    }
 
 
 def _route(host: str, prefix: str, service: str) -> dict[str, Any]:

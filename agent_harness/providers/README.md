@@ -3,8 +3,8 @@
 Providers adapt a model vendor's API to the provider-neutral agent loop in
 `agent_harness.agent.Agent`. The agent owns orchestration: context management,
 tool execution, steering, interrupts, guards, continue-as-new, and persistence.
-A provider owns the vendor-specific request shape, response shape, streaming
-events, stop reasons, and SDK call.
+A provider owns the vendor-specific request shape, response shape, raw streaming
+translation, stop reasons, and SDK call.
 
 This split lets an app keep the same workflow, tool, context, approval, and
 attachment behavior while swapping from one model vendor to another.
@@ -55,10 +55,10 @@ A provider module normally contains:
   with the provider.
 - Conversion helpers between `AgentMessage` and the vendor's message schema.
 - A Temporal activity that calls the vendor SDK.
-- Streaming translation helpers that emit provider events into `StreamContext`.
+- Streaming translation helpers that map vendor events into `AgentStreamWriter`.
 
 The Claude implementation in `claude.py` follows this pattern with
-`ClaudeProvider`, `ClaudeRequest`, `ClaudeResponse`, `call_claude`, and the
+`ClaudeProvider`, `ClaudeRequest`, `ClaudeResponse`, `call_agent_api`, and the
 `ClaudeAgent` convenience wrapper.
 
 ## Message Conversion
@@ -89,13 +89,18 @@ The provider activity should:
   requests as non-retryable `ApplicationError`s.
 - Heartbeat during long streaming calls.
 - Honor activity cancellation.
-- Emit streaming events through `StreamContext` using provider-specific kinds
-  such as `claude_text_delta` or equivalent names for the new provider.
+- Emit streaming events through `AgentStreamWriter`; provider code should call
+  helper methods such as `text_delta`, `thinking_delta`,
+  `tool_input_started`, and `agent_completed` instead of choosing raw event
+  names.
 - Return the provider response dataclass with enough data to reconstruct the
   assistant message and usage.
 
 Streaming is intentionally sideband state. The workflow must not depend on
 stream emission succeeding.
+The harness owns the public agent stream event names via
+`AgentStreamEventKind`, so application UIs can consume one `agent_*` protocol
+across providers.
 
 ## Provider-Specific Features
 

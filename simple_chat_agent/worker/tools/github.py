@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from temporalio import activity as temporal_activity
+from temporalio.common import RetryPolicy
+
 from agent_harness.streaming import StreamContext
 from agent_harness.tools import ToolContext, ToolResult, tool
 from agent_harness.tool_types import ToolType
 from simple_chat_agent.common.store import app_store
+
+GITHUB_MUTATION_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    maximum_interval=timedelta(seconds=15),
+    maximum_attempts=3,
+)
+GITHUB_IDEMPOTENCY_MARKER_PREFIX = "agentharnessidempotency"
 
 
 class GitHubProvider:
@@ -110,6 +122,14 @@ class GitHubProvider:
         labels: list[str] | None = None,
     ) -> ToolResult:
         connection_id = self._require_connection_id()
+        issue_labels = labels or []
+        idempotency_key = ctx.idempotency_key(
+            owner.lower(),
+            repo.lower(),
+            title.strip(),
+            body or "",
+            sorted(issue_labels),
+        )
         payload = await ctx.activity(
             _github_open_issue_activity,
             args={
@@ -118,8 +138,12 @@ class GitHubProvider:
                 "repo": repo,
                 "title": title,
                 "body": body,
-                "labels": labels or [],
+                "labels": issue_labels,
+                "idempotency_key": idempotency_key,
             },
+            start_to_close_timeout=timedelta(seconds=45),
+            schedule_to_close_timeout=timedelta(minutes=3),
+            retry_policy=GITHUB_MUTATION_RETRY_POLICY,
         )
         return ToolResult(payload=payload, error="error" in payload)
 
@@ -271,6 +295,106 @@ async def _github_list_issues_activity(
     }
 
 
+async def _find_issue_by_idempotency_marker(
+    *,
+    connection_id: str,
+    owner: str,
+    repo: str,
+    marker: str,
+    stream: StreamContext,
+) -> dict[str, Any]:
+    attempt = _activity_attempt()
+    search_attempts = 2 if attempt > 1 else 1
+    for search_attempt in range(1, search_attempts + 1):
+        await stream.emit(
+            {
+                "repo": f"{owner}/{repo}",
+                "attempt": attempt,
+                "search_attempt": search_attempt,
+            },
+            kind="github_open_issue_idempotency_search_start",
+        )
+        result = await asyncio.to_thread(
+            _github_search_issue_by_marker,
+            connection_id,
+            owner,
+            repo,
+            marker,
+        )
+        if "error" in result:
+            return result
+        if result.get("issue") is not None:
+            await stream.emit(
+                {
+                    "repo": f"{owner}/{repo}",
+                    "found": True,
+                    "number": result["issue"].get("number"),
+                },
+                kind="github_open_issue_idempotency_search_complete",
+            )
+            return result
+        if search_attempt < search_attempts:
+            await asyncio.sleep(2)
+
+    await stream.emit(
+        {"repo": f"{owner}/{repo}", "found": False},
+        kind="github_open_issue_idempotency_search_complete",
+    )
+    return {"issue": None}
+
+
+def _github_search_issue_by_marker(
+    connection_id: str,
+    owner: str,
+    repo: str,
+    marker: str,
+) -> dict[str, Any]:
+    query = f"repo:{owner}/{repo} is:issue in:body {marker}"
+    response = _github_api_get_with_metadata(
+        connection_id,
+        "/search/issues",
+        {
+            "q": query,
+            "per_page": "10",
+        },
+    )
+    if "error" in response:
+        return response
+
+    payload = response.get("data")
+    if not isinstance(payload, dict):
+        return {"error": "GitHub issue search returned an unexpected response."}
+    if payload.get("incomplete_results"):
+        return {
+            "error": (
+                "GitHub issue search returned incomplete results; refusing to "
+                "create a potentially duplicate issue."
+            )
+        }
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return {"issue": None}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "pull_request" in item:
+            continue
+        body = item.get("body")
+        if isinstance(body, str) and marker not in body:
+            continue
+        return {
+            "issue": _issue_summary(item),
+            "pagination": response["pagination"],
+            "rate_limit": response["rate_limit"],
+        }
+    return {
+        "issue": None,
+        "pagination": response["pagination"],
+        "rate_limit": response["rate_limit"],
+    }
+
+
 async def _github_open_issue_activity(
     connection_id: str,
     owner: str,
@@ -278,44 +402,92 @@ async def _github_open_issue_activity(
     title: str,
     body: str,
     labels: list[str],
+    idempotency_key: str,
     *,
     stream: StreamContext,
 ) -> dict[str, Any]:
+    marker = _github_issue_idempotency_marker(idempotency_key)
     await stream.emit(
         {
             "repo": f"{owner}/{repo}",
             "title": title,
             "labels": labels,
+            "attempt": _activity_attempt(),
         },
         kind="github_open_issue_start",
     )
+
+    existing = await _find_issue_by_idempotency_marker(
+        connection_id=connection_id,
+        owner=owner,
+        repo=repo,
+        marker=marker,
+        stream=stream,
+    )
+    if "error" in existing:
+        return existing
+    if existing.get("issue") is not None:
+        issue = existing["issue"]
+        await stream.emit(
+            {
+                "repo": f"{owner}/{repo}",
+                "number": issue.get("number"),
+                "url": issue.get("html_url"),
+                "reused_existing": True,
+            },
+            kind="github_open_issue_complete",
+        )
+        return {
+            "issue": issue,
+            "idempotency": {
+                "reused_existing": True,
+                "method": "github_issue_body_marker",
+            },
+        }
+
     payload = await asyncio.to_thread(
         _github_api_request,
         connection_id,
         f"/repos/{owner}/{repo}/issues",
         method="POST",
-        payload=_issue_payload(title=title, body=body, labels=labels),
+        payload=_issue_payload(
+            title=title,
+            body=_issue_body_with_idempotency_marker(body, marker),
+            labels=labels,
+        ),
     )
     if "error" in payload:
         return payload
 
-    issue = {
-        "number": payload.get("number"),
-        "title": payload.get("title"),
-        "state": payload.get("state"),
-        "html_url": payload.get("html_url"),
-        "user": (payload.get("user") or {}).get("login"),
-        "created_at": payload.get("created_at"),
-    }
+    issue = _issue_summary(payload)
     await stream.emit(
         {
             "repo": f"{owner}/{repo}",
             "number": issue["number"],
             "url": issue["html_url"],
+            "reused_existing": False,
         },
         kind="github_open_issue_complete",
     )
-    return {"issue": issue}
+    return {
+        "issue": issue,
+        "idempotency": {
+            "reused_existing": False,
+            "method": "github_issue_body_marker",
+        },
+    }
+
+
+def _issue_summary(issue: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "number": issue.get("number"),
+        "title": issue.get("title"),
+        "state": issue.get("state"),
+        "html_url": issue.get("html_url"),
+        "user": (issue.get("user") or {}).get("login"),
+        "created_at": issue.get("created_at"),
+        "updated_at": issue.get("updated_at"),
+    }
 
 
 def _github_api_get(
@@ -410,6 +582,28 @@ def _issue_payload(
     if labels:
         issue["labels"] = labels
     return issue
+
+
+def _github_issue_idempotency_marker(idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"{GITHUB_IDEMPOTENCY_MARKER_PREFIX}{digest}"
+
+
+def _issue_body_with_idempotency_marker(body: str, marker: str) -> str:
+    marker_comment = f"<!-- {marker} -->"
+    cleaned = body.rstrip()
+    if marker in cleaned:
+        return cleaned
+    if not cleaned:
+        return marker_comment
+    return f"{cleaned}\n\n{marker_comment}"
+
+
+def _activity_attempt() -> int:
+    try:
+        return int(temporal_activity.info().attempt)
+    except RuntimeError:
+        return 1
 
 
 def _read_http_error(err: HTTPError) -> str:

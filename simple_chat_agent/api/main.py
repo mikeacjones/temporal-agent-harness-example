@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlencode, urlparse
@@ -89,10 +89,6 @@ from simple_chat_agent.common.mcp_auth import (
 )
 from simple_chat_agent.common.mcp_oauth import PendingMcpOAuthFlow
 from simple_chat_agent.common.store import AppStore
-from simple_chat_agent.worker.tools import (
-    configured_research_tool_names,
-    tool_names_for_connections,
-)
 from simple_chat_agent.worker.demo_workspace_workflow import (
     DemoWorkspaceConfig,
     DemoWorkspaceInput,
@@ -334,12 +330,45 @@ async def internal_stream(request: Request) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/internal/stream/event")
+async def internal_stream_event(request: Request) -> dict[str, str]:
+    # Worker -> web: append a named stream event that may be retried by a
+    # workflow activity. The idempotency key lets the broker preserve exactly one
+    # terminal projection event per completed turn while keeping live chunks
+    # best-effort.
+    token = os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip()
+    if not token or request.headers.get("x-stream-token") != token:
+        raise HTTPException(status_code=401, detail="Invalid stream token.")
+    payload = await request.json()
+    stream_id = str(payload.get("stream_id") or "")
+    event = str(payload.get("event") or "")
+    data = payload.get("data")
+    idempotency_key = str(payload.get("idempotency_key") or "")
+    if not stream_id or not event or not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Invalid stream event payload.")
+    cursor = _stream_broker().append_event(
+        stream_id,
+        event,
+        data,
+        idempotency_key=idempotency_key or None,
+    )
+    return {"status": "ok", "cursor": cursor}
+
+
 async def _query_state(workflow_id: str) -> SimpleChatState:
     return await _handle(workflow_id).query(SimpleChatWorkflow.state)
 
 
-async def _query_snapshot(workflow_id: str, *, limit: int) -> SimpleChatSnapshot:
-    return await _handle(workflow_id).query(SimpleChatWorkflow.snapshot, limit)
+async def _query_snapshot(
+    workflow_id: str,
+    *,
+    limit: int,
+    max_bytes: int,
+) -> SimpleChatSnapshot:
+    return await _handle(workflow_id).query(
+        SimpleChatWorkflow.snapshot,
+        args=[limit, max_bytes],
+    )
 
 
 async def _query_transcript_page(
@@ -347,11 +376,11 @@ async def _query_transcript_page(
     *,
     before: int | None,
     limit: int,
+    max_bytes: int,
 ) -> TranscriptPage:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_page,
-        before,
-        limit,
+        args=[before, limit, max_bytes],
     )
 
 
@@ -359,10 +388,11 @@ async def _query_transcript_deltas_since(
     workflow_id: str,
     *,
     after_revision: int,
+    max_bytes: int,
 ) -> TranscriptDeltaResult:
     return await _handle(workflow_id).query(
         SimpleChatWorkflow.transcript_deltas_since,
-        after_revision,
+        args=[after_revision, max_bytes],
     )
 
 
@@ -455,6 +485,7 @@ def _user_email_sa_name() -> str:
 
 
 async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any:
+    await _require_demo_workspace_can_start_registry()
     workflow_id = user_chats_workflow_id(user_id)
     search_attr_name = _user_email_sa_name()
     return await _client().start_workflow(
@@ -473,6 +504,34 @@ async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any
             user_email=user_email,
         ),
     )
+
+
+async def _require_demo_workspace_can_start_registry() -> None:
+    if not demo_workspace_mode():
+        return
+
+    handle = _demo_workspace_parent_workflow()
+    if handle is None:
+        raise HTTPException(
+            status_code=410,
+            detail="Demo workspace is no longer available.",
+        )
+
+    try:
+        state = await handle.query(DemoWorkspaceWorkflow.state)
+    except Exception as err:
+        if _is_demo_workspace_absent(err):
+            raise HTTPException(
+                status_code=410,
+                detail="Demo workspace is no longer available.",
+            ) from err
+        raise
+
+    if state.status not in {"active", "provisioning"}:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Demo workspace is {state.status}.",
+        )
 
 
 async def _ensure_demo_workspace_workflow(user: AuthenticatedUser) -> Any:
@@ -701,27 +760,6 @@ async def _require_conversation_owner(
     return user
 
 
-async def _update_user_workflows_tool_connections(
-    user: AuthenticatedUser,
-) -> None:
-    github_connection_id = _github_connection_id_for_user(user)
-    mcp_servers = await (
-        await _ensure_user_chats_workflow(user.user_id, user.username)
-    ).query(UserChatsWorkflow.list_mcp_servers)
-    available_tool_names = tool_names_for_connections(
-        github_connection_id=github_connection_id,
-        mcp_servers=mcp_servers,
-        research_tool_names=configured_research_tool_names(),
-    )
-
-    for conversation in await _list_user_chats(user.user_id, user.username):
-        with suppress(Exception):
-            await _handle(conversation.workflow_id).signal(
-                SimpleChatWorkflow.update_tool_connections,
-                args=[available_tool_names, github_connection_id, mcp_servers],
-            )
-
-
 async def _upsert_user_mcp_server(
     user: AuthenticatedUser,
     server: HttpMcpServerConfig,
@@ -729,35 +767,7 @@ async def _upsert_user_mcp_server(
     registry = await _ensure_user_chats_workflow(user.user_id, user.username)
     await registry.execute_update(
         UserChatsWorkflow.upsert_mcp_server,
-        UpdateMcpServerRequest(
-            server=server,
-            available_tool_names=tool_names_for_connections(
-                github_connection_id=_github_connection_id_for_user(user),
-                mcp_servers=[
-                    *[
-                        existing
-                        for existing in await registry.query(
-                            UserChatsWorkflow.list_mcp_servers
-                        )
-                        if existing.server_id != server.server_id
-                    ],
-                    server,
-                ],
-                research_tool_names=configured_research_tool_names(),
-            ),
-            github_connection_id=_github_connection_id_for_user(user),
-        ),
-    )
-
-
-async def _available_tool_names_for_user(user: AuthenticatedUser) -> list[str]:
-    mcp_servers = await (
-        await _ensure_user_chats_workflow(user.user_id, user.username)
-    ).query(UserChatsWorkflow.list_mcp_servers)
-    return tool_names_for_connections(
-        github_connection_id=_github_connection_id_for_user(user),
-        mcp_servers=mcp_servers,
-        research_tool_names=configured_research_tool_names(),
+        UpdateMcpServerRequest(server=server),
     )
 
 
@@ -825,11 +835,7 @@ app.include_router(
             store=_store,
             current_user=_current_user,
             ensure_user_chats_workflow=_ensure_user_chats_workflow,
-            update_user_workflows_tool_connections=(
-                _update_user_workflows_tool_connections
-            ),
             upsert_user_mcp_server=_upsert_user_mcp_server,
-            github_connection_id_for_user=_github_connection_id_for_user,
             github_tools_enabled=github_tools_enabled,
             mcp_oauth_flows=_mcp_oauth_flows,
         )

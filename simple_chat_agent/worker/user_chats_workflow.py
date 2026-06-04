@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from temporalio.common import (
     SearchAttributePair,
     TypedSearchAttributes,
 )
+from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -19,7 +21,6 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.providers.claude import ClaudeThinkingConfig
     from simple_chat_agent import TASK_QUEUE
     from simple_chat_agent.worker.workflow import (
-        ChatMessage,
         QueuedChatMessage,
         SimpleChatInput,
         SimpleChatWorkflow,
@@ -112,15 +113,11 @@ class UserDemoWorkspaceRecord:
 @dataclass
 class UpdateMcpServerRequest:
     server: HttpMcpServerConfig
-    available_tool_names: list[str]
-    github_connection_id: str | None = None
 
 
 @dataclass
 class DeleteMcpServerRequest:
     server_id: str
-    available_tool_names: list[str]
-    github_connection_id: str | None = None
 
 
 def user_chats_workflow_id(user_id: str) -> str:
@@ -172,21 +169,34 @@ class UserChatsWorkflow:
         # payload lifecycle can expire; if no update touched this run for a full
         # TTL, close the registry and its tracked chat workflows.
         while True:
-            await workflow.wait_condition(
-                lambda: (
-                    workflow.info().is_continue_as_new_suggested()
-                    or self._checkpoint_due()
+            try:
+                await workflow.wait_condition(
+                    lambda: (
+                        workflow.info().is_continue_as_new_suggested()
+                        or self._checkpoint_due()
+                    )
+                    and workflow.all_handlers_finished(),
+                    timeout=self._time_until_checkpoint(),
                 )
-                and workflow.all_handlers_finished(),
-                timeout=self._time_until_checkpoint(),
-            )
+            except asyncio.TimeoutError:
+                pass
             if not workflow.all_handlers_finished():
                 continue
             if workflow.info().is_continue_as_new_suggested():
-                workflow.continue_as_new(self._continue_as_new_input())
+                workflow.continue_as_new(
+                    self._continue_as_new_input(),
+                    initial_versioning_behavior=(
+                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                    ),
+                )
             if self._checkpoint_due():
                 if self._touched_this_run:
-                    workflow.continue_as_new(self._continue_as_new_input())
+                    workflow.continue_as_new(
+                        self._continue_as_new_input(),
+                        initial_versioning_behavior=(
+                            workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                        ),
+                    )
                 await self._delete_all_chats()
                 return
 
@@ -199,11 +209,6 @@ class UserChatsWorkflow:
             request.initial_message.strip()
             if request.initial_message is not None
             else ""
-        )
-        transcript = (
-            [ChatMessage(role="user", content=initial_message)]
-            if initial_message
-            else []
         )
         pending_messages = (
             [QueuedChatMessage(content=initial_message, transcript_index=0)]
@@ -225,7 +230,6 @@ class UserChatsWorkflow:
                 available_tool_names=list(request.available_tool_names),
                 github_connection_id=request.github_connection_id,
                 mcp_servers=list(request.mcp_servers),
-                transcript=transcript,
                 pending_messages=pending_messages,
                 good_place_censor=request.good_place_censor,
                 last_touched_at=workflow.now().isoformat(),
@@ -282,10 +286,6 @@ class UserChatsWorkflow:
     ) -> list[HttpMcpServerConfig]:
         self._touch()
         self._mcp_servers[request.server.server_id] = request.server
-        await self._broadcast_tool_connections(
-            request.available_tool_names,
-            request.github_connection_id,
-        )
         return self.list_mcp_servers()
 
     @workflow.update
@@ -294,10 +294,6 @@ class UserChatsWorkflow:
     ) -> list[HttpMcpServerConfig]:
         self._touch()
         self._mcp_servers.pop(request.server_id, None)
-        await self._broadcast_tool_connections(
-            request.available_tool_names,
-            request.github_connection_id,
-        )
         return self.list_mcp_servers()
 
     @workflow.update
@@ -321,8 +317,9 @@ class UserChatsWorkflow:
         try:
             await handle.signal(SimpleChatWorkflow.delete)
             await handle.cancel()
-        except Exception:
-            pass
+        except Exception as err:
+            if not _is_missing_external_workflow(err):
+                raise
 
         self._chats.pop(workflow_id, None)
 
@@ -370,28 +367,6 @@ class UserChatsWorkflow:
     def list_mcp_servers(self) -> list[HttpMcpServerConfig]:
         return sorted(self._mcp_servers.values(), key=lambda server: server.label)
 
-    async def _broadcast_tool_connections(
-        self,
-        available_tool_names: list[str],
-        github_connection_id: str | None,
-    ) -> None:
-        mcp_servers = self.list_mcp_servers()
-        for record in self._chats.values():
-            if record.status != "active":
-                continue
-            handle = workflow.get_external_workflow_handle(record.workflow_id)
-            try:
-                await handle.signal(
-                    SimpleChatWorkflow.update_tool_connections,
-                    args=[
-                        available_tool_names,
-                        github_connection_id,
-                        mcp_servers,
-                    ],
-                )
-            except Exception:
-                pass
-
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()
         self._touched_this_run = True
@@ -430,8 +405,9 @@ class UserChatsWorkflow:
             try:
                 await handle.signal(SimpleChatWorkflow.delete)
                 await handle.cancel()
-            except Exception:
-                pass
+            except Exception as err:
+                if not _is_missing_external_workflow(err):
+                    raise
         self._chats.clear()
 
 
@@ -451,3 +427,17 @@ def _conversation_title(message: str) -> str:
     if len(normalized) <= 64:
         return normalized
     return f"{normalized[:61]}..."
+
+
+def _is_missing_external_workflow(err: Exception) -> bool:
+    if not isinstance(err, ApplicationError):
+        return False
+    error_type = (err.type or "").lower()
+    message = str(err).lower()
+    return (
+        "notfound" in error_type
+        or "not_found" in error_type
+        or "not found" in message
+        or "already completed" in message
+        or "not running" in message
+    )

@@ -1,5 +1,9 @@
 import { CodeBlock, MarkdownContent } from "./MarkdownContent.jsx";
 import { inferCodeLanguage } from "../utils/code.js";
+import {
+  AGENT_TOOL_INPUT_EVENT_PREFIX,
+  AgentStreamEventKind,
+} from "../state/streamEvents.js";
 
 export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
   if (!turn) return null;
@@ -55,7 +59,7 @@ function AgentStreamSegment({ segment }) {
   return (
     <div className={`stream-agent-segment ${complete ? "complete" : "streaming"}`}>
       <div className="stream-finished-title">
-        Claude turn {segment.sequence ?? ""} {complete ? "complete" : "streaming"}
+        Agent turn {segment.sequence ?? ""} {complete ? "complete" : "streaming"}
         {complete && segment.stopReason ? ` | ${segment.stopReason}` : ""}
       </div>
       {thinking ? <div className="stream-thinking">{thinking}</div> : null}
@@ -82,7 +86,7 @@ function ToolStreamSegment({ segment }) {
   return (
     <div className={`stream-tool-segment ${complete ? "complete" : "streaming"}`}>
       <div className="stream-finished-title">
-        Tool activity after Claude turn {segment.afterSequence ?? ""}{" "}
+        Tool activity after agent turn {segment.afterSequence ?? ""}{" "}
         {complete ? "complete" : "streaming"}
       </div>
       {segment.events?.length ? (
@@ -114,7 +118,7 @@ function StreamToolEvent({ event, active }) {
   return (
     <div
       className={`stream-tool-event${
-        event.kind?.startsWith("claude_tool_input_") ? " input-streaming" : ""
+        event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX) ? " input-streaming" : ""
       }`}
     >
       <div className="stream-tool-name">
@@ -136,8 +140,8 @@ function StreamToolEvent({ event, active }) {
 
 function streamToolPayloadText(event) {
   const payload = event.payload || {};
-  if (event.kind?.startsWith("claude_tool_input_")) {
-    if (event.kind === "claude_tool_input_complete") {
+  if (event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX)) {
+    if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) {
       return truncateStreamText(
         formatStreamValue(payload.input ?? payload.input_partial ?? payload.input_preview),
       );
@@ -156,7 +160,7 @@ function streamToolPayloadText(event) {
 }
 
 function streamToolLanguage(event, payloadText) {
-  if (event.kind === "claude_tool_input_complete") return "json";
+  if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) return "json";
   if (event.kind?.includes("stdout") || event.kind?.includes("stderr")) {
     return inferCodeLanguage(payloadText) || "text";
   }
@@ -167,7 +171,7 @@ function streamPanelStatus(turn) {
   const count = streamToolEvents(turn).length;
   const toolText = count === 1 ? "1 tool event" : `${count} tool events`;
   const turnCount = turn.segments.filter((segment) => segment.type === "agent").length;
-  const turnText = turnCount === 1 ? "1 Claude turn" : `${turnCount} Claude turns`;
+  const turnText = turnCount === 1 ? "1 agent turn" : `${turnCount} agent turns`;
   if (turn.status === "interrupted") return `interrupted | ${toolText}`;
   if (turn.status === "complete") return `complete | ${turnText} | ${toolText}`;
   if (turn.status === "tooling") return `tool activity | ${turnText} | ${toolText}`;

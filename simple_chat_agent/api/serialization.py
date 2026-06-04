@@ -66,6 +66,9 @@ def snapshot_to_dict(
         int(page.get("revision") or 0),
     )
     state["transcript_length"] = page["total"]
+    state["limited"] = page["limited"]
+    state["byte_limit"] = page["byte_limit"]
+    state["estimated_bytes"] = page["estimated_bytes"]
     return state
 
 
@@ -80,6 +83,9 @@ def transcript_page_to_dict(page: TranscriptPage) -> dict[str, Any]:
         "total": page.total,
         "revision": page.transcript_revision,
         "has_more_before": page.start > 0,
+        "limited": page.limited,
+        "byte_limit": page.byte_limit,
+        "estimated_bytes": page.estimated_bytes,
     }
 
 
@@ -95,6 +101,9 @@ def transcript_delta_result_to_dict(
         "pending_messages": result.pending_messages,
         "active_message_index": result.active_message_index,
         "state_revision": result.state_revision,
+        "limited": result.limited,
+        "byte_limit": result.byte_limit,
+        "estimated_bytes": result.estimated_bytes,
         "deltas": [
             {
                 "revision": delta.revision,
@@ -118,6 +127,14 @@ def set_transcript_headers(response: Response, state: dict[str, Any]) -> None:
     response.headers["X-Transcript-Total"] = str(
         state.get("transcript_total", len(state.get("transcript", [])))
     )
+    if "limited" in state:
+        response.headers["X-Transcript-Limited"] = str(state["limited"]).lower()
+    if "byte_limit" in state:
+        response.headers["X-Transcript-Byte-Limit"] = str(state["byte_limit"])
+    if "estimated_bytes" in state:
+        response.headers["X-Transcript-Estimated-Bytes"] = str(
+            state["estimated_bytes"]
+        )
 
 
 def record_timing(

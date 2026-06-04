@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from temporalio import workflow
-from temporalio.exceptions import is_cancelled_exception
+from temporalio.exceptions import ActivityError, ApplicationError, is_cancelled_exception
 
 from .activity_options import DEFAULT_ACTIVITY_OPTIONS, ActivityOptions
 from .attachments import AttachmentRef
@@ -18,6 +18,7 @@ from .context_manager import (
     DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
     DEFAULT_MAX_CONTEXT_TOKENS,
 )
+from .errors import UserFacingToolError
 from .llm_guards import (
     LlmGuardAction,
     LlmGuardFn,
@@ -30,7 +31,13 @@ from .messages import (
     tool_use_blocks,
     visible_user_message_text,
 )
-from .providers.interface import AgentProvider, ProviderResponse, start_provider_activity
+from .providers.interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+    start_provider_activity,
+)
 from .sliding_window_context_manager import SlidingWindowContextManager
 from .tools import ToolResult, ToolSet
 
@@ -42,6 +49,12 @@ InterruptPartialResponsePolicy = Literal["discard"]
 @dataclass(frozen=True)
 class ContinueAsNewPolicy:
     enabled: bool = True
+
+
+CONTEXT_OVERFLOW_RECOVERY_ATTEMPTS = 1
+CONTEXT_OVERFLOW_RETRY_CHARS_PER_TOKEN = 2.5
+CONTEXT_OVERFLOW_RETRY_SAFETY_MARGIN_MULTIPLIER = 4
+CONTEXT_OVERFLOW_RETRY_MIN_SAFETY_MARGIN_TOKENS = 16_000
 
 
 class Agent:
@@ -129,6 +142,10 @@ class Agent:
 
         self._pending_interrupts.append(message)
         self._interrupt_requested = True
+
+    @property
+    def interrupt_requested(self) -> bool:
+        return self._interrupt_requested
 
     async def run(
         self,
@@ -223,12 +240,15 @@ class Agent:
                 continue
 
             if self._should_return_continue_as_new():
+                continuation_budget = self._context_token_budget(tool_schemas)
                 return AgentResult(
                     message=response_message,
                     stop_reason=response.stop_reason,
                     turns=turn,
                     continuation_state=AgentState(
-                        context_snapshot=self._context.snapshot(),
+                        context_snapshot=await self._context.continuation_context_snapshot(
+                            continuation_budget,
+                        ),
                         turns=turn,
                         llm_guard_state=dict(self._llm_guard_state),
                     ),
@@ -261,31 +281,43 @@ class Agent:
             return None
         return visible_user_message_text(messages[index])
 
+    def restore_idle_state(self, state: AgentState) -> None:
+        self._context.restore(state.context_snapshot)
+        self._context_initialized = True
+        self._llm_guard_state = dict(state.llm_guard_state)
+
+    def context_snapshot(self) -> ContextSnapshot:
+        if not self._context_initialized:
+            return {"version": 2, "messages": []}
+        return self._context.full_context_snapshot()
+
+    async def compacted_state(self) -> AgentState:
+        tool_schemas = self._tools.tool_schemas(self._tool_names)
+        return AgentState(
+            context_snapshot=await self._context.continuation_context_snapshot(
+                self._context_token_budget(tool_schemas),
+            ),
+            turns=0,
+            llm_guard_state=dict(self._llm_guard_state),
+        )
+
     async def _call_provider(
         self, tool_schemas: list[dict[str, Any]]
     ) -> ProviderResponse | None:
         self._provider_call_sequence += 1
         tool_params = [dict(tool) for tool in tool_schemas]
-        context_budget = ContextTokenBudget(
-            max_context_tokens=self._max_context_tokens,
-            reserved_output_tokens=self._max_tokens,
-            reserved_input_tokens=self._provider.estimate_request_tokens(
-                system_prompt=self._system_prompt,
-                tools=tool_params,
-            ),
-            safety_margin_tokens=self._context_safety_margin_tokens,
-            chars_per_token=self._context_chars_per_token,
-        )
         # Guards see the FULL durable history (un-windowed) so they can inspect
         # and mutate the whole conversation.
         guard_request = self._provider.create_request(
             system_prompt=self._system_prompt,
             model=self._model,
             max_tokens=self._max_tokens,
+            context_token_limit=self._max_context_tokens,
             tools=tool_params,
             chat_history=await self._context.full_messages(),
             stream_id=self._stream_id,
             stream_sequence=self._provider_call_sequence,
+            stream_attempt=1,
         )
 
         pre_guard_execution = await self._llm_guards.execute_pre(
@@ -308,26 +340,18 @@ class Agent:
             self._provider.request_chat_history(guarded)
         )
 
-        request = self._provider.replace_request_chat_history(
-            guarded,
-            chat_history=await self._context.messages_for_model(context_budget),
-        )
-
-        provider_handle = start_provider_activity(self._provider, request)
-
         try:
-            await workflow.wait_condition(
-                lambda: self._interrupt_requested or provider_handle.done()
+            response = await self._call_provider_with_context_recovery(
+                guarded,
+                tool_params,
             )
-            if self._interrupt_requested:
-                await self._discard_interrupted_provider_call(provider_handle)
+            if response is None:
                 return None
 
-            response = await provider_handle
             post_guard_execution = await self._llm_guards.execute_post(
                 request=self._provider.request_to_dict(
                     self._provider.replace_request_chat_history(
-                        request,
+                        guarded,
                         chat_history=await self._context.full_messages(),
                     )
                 ),
@@ -352,6 +376,98 @@ class Agent:
             if self._interrupt_requested and is_cancelled_exception(err):
                 return None
             raise
+
+    async def _call_provider_with_context_recovery(
+        self,
+        guarded_request: ProviderRequest,
+        tool_params: list[dict[str, Any]],
+    ) -> ProviderResponse | None:
+        context_budget = self._context_token_budget(tool_params)
+        stream_attempt = 1
+        context_overflow_retries = 0
+
+        while True:
+            request = self._provider.replace_request_chat_history(
+                guarded_request,
+                chat_history=await self._context.messages_for_model(context_budget),
+            )
+            request = self._provider.replace_request_stream_attempt(
+                request,
+                stream_attempt,
+            )
+
+            try:
+                return await self._run_provider_activity(request)
+            except BaseException as err:
+                if self._interrupt_requested and is_cancelled_exception(err):
+                    return None
+                if (
+                    context_overflow_retries < CONTEXT_OVERFLOW_RECOVERY_ATTEMPTS
+                    and _is_context_window_exceeded(err)
+                ):
+                    context_overflow_retries += 1
+                    stream_attempt += 1
+                    context_budget = self._context_token_budget(
+                        tool_params,
+                        context_overflow_retry=True,
+                    )
+                    continue
+                raise
+
+    async def _run_provider_activity(
+        self,
+        request: ProviderRequest,
+    ) -> ProviderResponse | None:
+        provider_handle = start_provider_activity(self._provider, request)
+
+        await workflow.wait_condition(
+            lambda: self._interrupt_requested or provider_handle.done()
+        )
+        if self._interrupt_requested:
+            await self._discard_interrupted_provider_call(provider_handle)
+            return None
+
+        return await provider_handle
+
+    def _context_token_budget(
+        self,
+        tool_schemas: list[dict[str, Any]],
+        *,
+        context_overflow_retry: bool = False,
+    ) -> ContextTokenBudget:
+        reserved_input_tokens = self._provider.estimate_request_tokens(
+            system_prompt=self._system_prompt,
+            tools=tool_schemas,
+        )
+        safety_margin_tokens = self._context_safety_margin_tokens
+        chars_per_token = self._context_chars_per_token
+        if context_overflow_retry:
+            safety_margin_tokens = max(
+                safety_margin_tokens * CONTEXT_OVERFLOW_RETRY_SAFETY_MARGIN_MULTIPLIER,
+                CONTEXT_OVERFLOW_RETRY_MIN_SAFETY_MARGIN_TOKENS,
+            )
+            max_safety_margin = (
+                self._max_context_tokens
+                - self._max_tokens
+                - reserved_input_tokens
+                - 1
+            )
+            safety_margin_tokens = min(
+                safety_margin_tokens,
+                max(0, max_safety_margin),
+            )
+            chars_per_token = min(
+                chars_per_token,
+                CONTEXT_OVERFLOW_RETRY_CHARS_PER_TOKEN,
+            )
+
+        return ContextTokenBudget(
+            max_context_tokens=self._max_context_tokens,
+            reserved_output_tokens=self._max_tokens,
+            reserved_input_tokens=reserved_input_tokens,
+            safety_margin_tokens=safety_margin_tokens,
+            chars_per_token=chars_per_token,
+        )
 
     async def _discard_interrupted_provider_call(
         self, provider_handle: workflow.ActivityHandle[ProviderResponse]
@@ -420,16 +536,28 @@ class Agent:
             and workflow.info().is_continue_as_new_suggested()
         )
 
-    async def _execute_tool(self, tool_name: str, **kwargs: Any) -> ToolResult:
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        *,
+        tool_call_id: str | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         if self._tool_names is not None and tool_name not in self._tool_names:
             return ToolResult(
                 payload={"error": f"Tool is not available to this agent: {tool_name}"},
+                error=True,
+            )
+        if tool_name not in self._tools.tool_names():
+            return ToolResult(
+                payload={"error": f"Unknown tool requested: {tool_name}"},
                 error=True,
             )
         return await self._tools.execute_tool(
             tool_name,
             kwargs,
             stream_id=self._stream_id,
+            tool_call_id=tool_call_id,
             activity_options=self._activity_options,
         )
 
@@ -483,10 +611,21 @@ class Agent:
         tool_use_id = cast(str, block["id"])
 
         try:
-            result = await self._execute_tool(tool_name, **tool_input)
-        except Exception as err:
+            result = await self._execute_tool(
+                tool_name,
+                tool_call_id=tool_use_id,
+                **tool_input,
+            )
+        except UserFacingToolError as err:
             result = ToolResult(
-                payload={"error": str(err), "type": type(err).__name__},
+                payload=err.to_tool_payload(),
+                error=True,
+            )
+        except Exception as err:
+            if is_cancelled_exception(err):
+                raise
+            result = ToolResult(
+                payload=_tool_exception_payload(tool_name, err),
                 error=True,
             )
 
@@ -528,6 +667,67 @@ class Agent:
 class ToolExecutionResult:
     tool_results: list[dict]
     interrupted: bool = False
+
+
+def _tool_exception_payload(tool_name: str, err: Exception) -> dict[str, Any]:
+    causes = [_exception_summary(cause) for cause in _exception_chain(err)]
+    root = causes[-1] if causes else _exception_summary(err)
+    return {
+        "error": root["message"] or "Tool execution failed.",
+        "type": "ToolExecutionFailed",
+        "tool_name": tool_name,
+        "exception_type": type(err).__name__,
+        "cause_type": root["type"],
+        "message": (
+            "The tool failed after any configured retries. Treat this as the "
+            "tool result and continue if possible."
+        ),
+        "causes": causes,
+    }
+
+
+def _is_context_window_exceeded(err: BaseException) -> bool:
+    return any(
+        isinstance(cause, ApplicationError)
+        and cause.type == CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE
+        for cause in _exception_chain(err)
+    )
+
+
+def _exception_chain(err: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = err
+    while current is not None and id(current) not in seen and len(chain) < 6:
+        chain.append(current)
+        seen.add(id(current))
+        next_err = current.__cause__ or current.__context__
+        current = next_err if next_err is not current else None
+    return chain
+
+
+def _exception_summary(err: BaseException) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "type": type(err).__name__,
+        "message": _exception_message(err),
+    }
+    if isinstance(err, ApplicationError):
+        summary["application_type"] = err.type
+        summary["non_retryable"] = err.non_retryable
+    if isinstance(err, ActivityError):
+        summary["activity_type"] = err.activity_type
+        summary["activity_id"] = err.activity_id
+        summary["retry_state"] = (
+            err.retry_state.name if err.retry_state is not None else None
+        )
+    return summary
+
+
+def _exception_message(err: BaseException) -> str:
+    message = getattr(err, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    return str(err)
 
 
 @dataclass

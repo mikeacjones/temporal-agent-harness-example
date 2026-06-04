@@ -17,13 +17,13 @@ The main design choice is to separate reusable harness behavior from application
 | `agent_harness` | The provider-neutral agent loop, provider interfaces and adapters, context management, tool and guard registration, guard enforcement, generic activity routing, activity summary conventions, continuation snapshots, interrupt/steering semantics, and a streaming protocol. | Product auth, OAuth flows, UI state, user/session persistence, business workflows, concrete streaming transports, or provider-specific app state. |
 | Application workflow | Durable conversation orchestration, signal/query/update surface, agent construction, tool availability, approval state, continue-as-new policy, and how returned harness state is carried forward. | Direct network I/O, UI rendering, or provider login flows. |
 | Tools and guards | Business capabilities and policy. They run in workflow context, can call child workflows, wait on signals/timers, and use `ctx.activity(...)` for side effects. | Hidden side effects from workflow code. Durable side effects should go through activities or child workflows. |
-| Activities | Non-deterministic work: Claude calls, API calls, database writes, emails, OAuth-token-backed provider calls, and long-running side effects. | Agent policy decisions that need to replay deterministically. |
+| Activities | Non-deterministic work: provider API calls, API calls, database writes, emails, OAuth-token-backed provider calls, and long-running side effects. | Agent policy decisions that need to replay deterministically. |
 | Worker process | Registration of workflows, activities, generic routers, data converter/codecs, and optional sideband stream sinks. | Per-user product state beyond what the application explicitly loads. |
 | UI / API server | Login, OAuth, chat selection, signals, queries, event-stream display, and approval controls. | Durable agent memory or hidden changes to workflow state. |
 
 This boundary is intentionally strict. For example, GitHub OAuth belongs to the simple chat application, not the harness. The workflow can receive a stable connection id or session id and let activities resolve the actual token. Passing a JWT or OAuth token through workflow history would make the wrong thing durable.
 
-Sideband streaming follows the same rule. The harness defines a protocol and emits best-effort events when a sink is configured. The UI chooses how to transport and render those events. Partial streamed text is not durable conversation state until the Claude activity completes and the workflow commits the assistant message.
+Sideband streaming follows the same rule. The harness defines a protocol and emits best-effort events when a sink is configured. The UI chooses how to transport and render those events. Partial streamed text is not durable conversation state until the provider API activity completes and the workflow commits the assistant message.
 
 ## Turn Flow
 
@@ -35,7 +35,7 @@ sequenceDiagram
     participant Registry as User Chats Workflow
     participant WF as Application Agent Workflow
     participant Harness as Agent Harness
-    participant ClaudeAct as call_claude Activity
+    participant AgentApiAct as call_agent_api Activity
     participant Claude as Claude API
     participant Tool as Tool / Guard Workflow Code
     participant Router as Generic Tool/Guard Activity
@@ -47,13 +47,13 @@ sequenceDiagram
     UI->>WF: Signal chat input or control event
     UI->>WF: Query durable state
     WF->>Harness: agent.run(user_message)
-    Harness->>ClaudeAct: Execute Claude activity
-    ClaudeAct->>Claude: Create or stream message
+    Harness->>AgentApiAct: Execute provider API activity
+    AgentApiAct->>Claude: Create or stream message
     opt Stream sink configured
-        ClaudeAct-->>Stream: Token deltas and Claude lifecycle events
+        AgentApiAct-->>Stream: Token deltas and provider lifecycle events
     end
-    ClaudeAct-->>Harness: Claude response
-    alt Claude requests tools
+    AgentApiAct-->>Harness: Provider response
+    alt Provider requests tools
         Harness->>Tool: Execute requested tools in workflow context
         Tool->>Tool: Run pre-guards sequentially
         Tool->>Router: ctx.activity(..., summary="tool:step")
@@ -64,7 +64,7 @@ sequenceDiagram
         Router-->>Tool: Activity result
         Tool->>Tool: Run post-guards sequentially
         Tool-->>Harness: ToolResult or guarded failure payload
-        Harness->>ClaudeAct: Next Claude call with tool_result blocks
+        Harness->>AgentApiAct: Next provider API call with tool_result blocks
     else Final assistant response
         Harness-->>WF: AgentResult and continuation state
         WF-->>UI: Committed transcript via query/SSE
@@ -75,22 +75,30 @@ sequenceDiagram
 ## What This Shows
 
 - Agent loops can be ordinary Temporal workflow code.
-- Claude calls can be isolated in one activity.
+- Provider API calls can be isolated in one activity.
 - Tool and guard code can run in workflow context while side effects route through generic activities.
 - Tool categories can require pre-guards or post-guards at runtime.
 - Event history can stay readable even when all tools share generic activity names.
 - Context can be owned by the agent, snapshotted, restored, and reduced before each model call.
-- Tool calls can run concurrently when Claude requests multiple tools in one turn.
+- Tool calls can run concurrently when the provider requests multiple tools in one turn.
 - Users can steer or interrupt an in-progress agent without treating partial streamed text as durable state.
 - Sideband streaming can provide best-effort product UX without coupling that stream to Temporal history.
 
 ## Core Shape
 
-The Claude call is an activity. Tool execution happens from workflow code. If a tool needs side effects, it calls through `ctx.activity(...)`, which routes through a generic activity while setting a useful Temporal summary.
+The provider API call is an activity. Tool execution happens from workflow code. If a tool needs side effects, it calls through `ctx.activity(...)`, which routes through a generic activity while setting a useful Temporal summary.
 
 ```python
+from datetime import timedelta
+
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import ToolContext, ToolResult, ToolSet, tool
+from agent_harness.tools import (
+    ToolActivityContext,
+    ToolContext,
+    ToolResult,
+    ToolSet,
+    tool,
+)
 
 
 @tool(
@@ -126,6 +134,79 @@ await ctx.activity(_update_customer, step="update")
 ```
 
 This keeps the activity type generic while making Temporal history useful to humans.
+
+Long-running tool activity functions can opt into Temporal heartbeats by setting
+`heartbeat_timeout` on `ctx.activity(...)`. The generic tool activity router
+sends conservative liveness heartbeats while the function runs. Tool authors can
+also request an activity-side `ToolActivityContext` when they have meaningful
+progress details:
+
+```python
+async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
+    result = await ctx.activity(
+        _export_report_activity,
+        args={"report_id": report_id},
+        start_to_close_timeout=timedelta(minutes=10),
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    return ToolResult(payload=result, error=False)
+
+
+async def _export_report_activity(
+    report_id: str,
+    *,
+    activity_ctx: ToolActivityContext,
+) -> dict:
+    activity_ctx.heartbeat({"phase": "loading"})
+    # do work
+    activity_ctx.heartbeat({"phase": "writing"})
+    # do work
+    return {"report_id": report_id, "status": "exported"}
+```
+
+The author heartbeat API is coalesced, and the automatic router heartbeat skips
+sends when a manual heartbeat happened recently. Use the sideband stream for
+high-frequency user-visible progress; use heartbeats for liveness, cancellation,
+and coarse retry progress.
+
+## Tool Idempotency
+
+Temporal Activities may be retried when a worker crashes, a network write fails,
+or a completion is lost. The harness can give a tool a stable
+`ctx.idempotency_key(...)` derived from the provider's durable tool-call id, but
+the tool author owns how that key is enforced. Mutating tools should pass the key
+to the system they mutate, use it as an upsert key in application storage, or
+disable retries when the side effect cannot be made safe.
+
+```python
+@tool(
+    name="export_report",
+    description="Export a customer report.",
+    tool_type=ToolType.MUTATING,
+    pre_guards=["mutating_tool_approval"],
+)
+async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
+    idempotency_key = ctx.idempotency_key(report_id)
+    result = await ctx.activity(
+        _export_report_activity,
+        args={
+            "report_id": report_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    return ToolResult(payload=result, error=False)
+```
+
+Read-only tools usually do not need this. Tools that call arbitrary user code or
+third-party APIs without an idempotency primitive should say so in their tool
+description or use a conservative retry policy.
+
+## Tool Failure Semantics
+
+Expected tool failures should be returned as data with
+`ToolResult(payload={...}, error=True)`. During agent execution, unexpected tool
+exceptions are converted into LLM-visible tool errors so the workflow can keep
+running and the model can recover. Cancellations still propagate.
 
 ## Registration
 
@@ -223,7 +304,7 @@ agent = ClaudeAgent(
 result = await agent.run(user_message, max_turns=20)
 ```
 
-The default `SlidingWindowContextManager` keeps recent context, preserves the initial user message, removes stale tool-result blocks from older rounds, and fits the model input into a conservative token budget before each Claude call. The latest tool result is preserved in full for the next model call.
+The default `SlidingWindowContextManager` keeps recent context, preserves the initial user message, removes stale tool-result blocks from older rounds, and fits the model input into a conservative token budget before each provider call. The latest tool result is preserved in full for the next model call.
 
 Applications can replace the context manager by passing `context_manager_factory=...`.
 
@@ -250,15 +331,15 @@ agent.steer(
 )
 ```
 
-`mode="immediate"` inserts steering before the next Claude call. `mode="after_next_tool_result"` inserts it after the next tool result is recorded.
+`mode="immediate"` inserts steering before the next provider call. `mode="after_next_tool_result"` inserts it after the next tool result is recorded.
 
-Hard interrupts cancel the in-flight Claude activity and add replacement context:
+Hard interrupts cancel the in-flight provider API activity and add replacement context:
 
 ```python
 agent.interrupt("Stop that path. Check the customer's latest order first.")
 ```
 
-The current policy discards partial assistant output. This matters when the UI streams tokens: streamed text is product UX, not durable conversation state, until the Claude activity completes.
+The current policy discards partial assistant output. This matters when the UI streams tokens: streamed text is product UX, not durable conversation state, until the provider API activity completes.
 
 ## Sideband Streaming
 
@@ -576,11 +657,11 @@ From Claude's point of view, `substitute_item` is one tool call. From the applic
 
 ## Worker Registration
 
-Applications using this harness should register the Claude activity plus the generic tool and guard routers:
+Applications using this harness should register the provider API activity plus the generic tool and guard routers:
 
 ```python
 from agent_harness.guards import run_guard_activity
-from agent_harness.providers.claude import call_claude
+from agent_harness.providers.claude import call_agent_api
 from agent_harness.tools import run_tool_activity
 from my_agent.workflows.customer_confirmation_workflow import (
     CustomerConfirmationWorkflow,
@@ -588,7 +669,7 @@ from my_agent.workflows.customer_confirmation_workflow import (
 )
 
 activities = [
-    call_claude,
+    call_agent_api,
     run_tool_activity,
     run_guard_activity,
     send_customer_confirmation_email,

@@ -30,7 +30,13 @@ class ContextManager(Protocol):
     def restore(self, snapshot: ContextSnapshot) -> None:
         pass
 
-    def snapshot(self) -> ContextSnapshot:
+    def full_context_snapshot(self) -> ContextSnapshot:
+        pass
+
+    async def continuation_context_snapshot(
+        self,
+        token_budget: ContextTokenBudget | None = None,
+    ) -> ContextSnapshot:
         pass
 
     async def messages_for_model(

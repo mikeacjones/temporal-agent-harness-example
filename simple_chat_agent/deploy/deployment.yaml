@@ -125,6 +125,8 @@ spec:
               value: temporal-michaelj-agent-harness-demo-artifacts
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_WORKER_VERSION
+              value: "1.0.0"
             - name: SIMPLE_CHAT_SEARXNG_BASE_URL
               value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED
@@ -218,6 +220,8 @@ spec:
               value: temporal-michaelj-agent-harness-demo-artifacts
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_WORKER_VERSION
+              value: "1.0.0"
             - name: SIMPLE_CHAT_SEARXNG_BASE_URL
               value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: PYTHON_SANDBOX_LAMBDA_FUNCTION

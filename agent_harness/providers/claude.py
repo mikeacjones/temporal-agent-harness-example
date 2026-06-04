@@ -27,6 +27,8 @@ from ..llm_guards import LlmGuardExecution, LlmGuardFn
 from ..messages import (
     AgentBlock,
     AgentMessage,
+    CONTEXT_COMPACTION_MARKER,
+    CONTEXT_COMPACTION_MARKER_TEXT,
     ToolUseBlock,
     message as agent_message,
     message_text,
@@ -36,9 +38,19 @@ from ..messages import (
     tool_use_block,
 )
 from ..sliding_window_context_manager import estimate_token_count
-from ..streaming import StreamContext
+from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
-from .interface import AgentProvider, ProviderRequest, ProviderResponse
+from .errors import (
+    counted_context_window_message,
+    counted_tokens_exceed_context,
+    status_error_is_context_window_exceeded,
+)
+from .interface import (
+    CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+    AgentProvider,
+    ProviderRequest,
+    ProviderResponse,
+)
 
 ClaudeStopReason = Literal[
     "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
@@ -76,12 +88,14 @@ class ClaudeRequest:
     system_prompt: str
     model: str
     max_tokens: int
+    context_token_limit: int | None
     tools: list[dict]
     chat_history: list[dict]
     thinking: dict | None = None
     output_config: dict | None = None
     stream_id: str | None = None
     stream_sequence: int | None = None
+    stream_attempt: int | None = None
 
 
 @dataclass
@@ -115,7 +129,7 @@ class ClaudeProvider(AgentProvider):
 
     @property
     def activity(self) -> Any:
-        return call_claude
+        return call_agent_api
 
     @property
     def activity_options(self) -> ActivityOptions:
@@ -138,19 +152,23 @@ class ClaudeProvider(AgentProvider):
         system_prompt: str,
         model: str,
         max_tokens: int,
+        context_token_limit: int | None,
         tools: list[dict[str, Any]],
         chat_history: list[AgentMessage],
         stream_id: str | None,
         stream_sequence: int | None,
+        stream_attempt: int | None,
     ) -> "ClaudeRequest":
         return ClaudeRequest(
             system_prompt=system_prompt,
             model=model,
             max_tokens=max_tokens,
+            context_token_limit=context_token_limit,
             tools=tools,
             chat_history=_agent_messages_to_claude_messages(chat_history),
             stream_id=stream_id,
             stream_sequence=stream_sequence,
+            stream_attempt=stream_attempt,
             **_thinking_request_params(self._thinking, max_tokens=max_tokens),
         )
 
@@ -166,6 +184,13 @@ class ClaudeProvider(AgentProvider):
             cast(ClaudeRequest, request),
             chat_history=_agent_messages_to_claude_messages(chat_history),
         )
+
+    def replace_request_stream_attempt(
+        self,
+        request: ProviderRequest,
+        stream_attempt: int | None,
+    ) -> "ClaudeRequest":
+        return replace(cast(ClaudeRequest, request), stream_attempt=stream_attempt)
 
     def request_to_dict(self, request: ProviderRequest) -> dict[str, Any]:
         return _claude_request_to_dict(cast(ClaudeRequest, request))
@@ -260,11 +285,13 @@ def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
         "system_prompt": request.system_prompt,
         "model": request.model,
         "max_tokens": request.max_tokens,
+        "context_token_limit": request.context_token_limit,
         "thinking": _copy_optional_mapping(request.thinking),
         "tools": [_copy_mapping(tool) for tool in request.tools],
         "chat_history": [_copy_mapping(message) for message in request.chat_history],
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
+        "stream_attempt": request.stream_attempt,
         "output_config": _copy_optional_mapping(request.output_config),
     }
 
@@ -274,12 +301,14 @@ def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
         system_prompt=cast(str, request["system_prompt"]),
         model=cast(str, request["model"]),
         max_tokens=cast(int, request["max_tokens"]),
+        context_token_limit=cast(int | None, request.get("context_token_limit")),
         thinking=_copy_optional_mapping(request.get("thinking")),
         output_config=_copy_optional_mapping(request.get("output_config")),
         tools=_mapping_list(request.get("tools", [])),
         chat_history=_mapping_list(request.get("chat_history", [])),
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
+        stream_attempt=cast(int | None, request.get("stream_attempt")),
     )
 
 
@@ -332,8 +361,8 @@ def _claude_response_from_guard_execution(
     return _claude_response_from_dict(response)
 
 
-@activity.defn
-async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
+@activity.defn(name="call_agent_api")
+async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
     create_params: dict[str, Any] = {
         "model": request.model,
         "max_tokens": request.max_tokens,
@@ -349,13 +378,26 @@ async def call_claude(request: ClaudeRequest) -> ClaudeResponse:
 
     try:
         async with AsyncAnthropic(max_retries=0) as client:
+            if _should_count_request_tokens(request):
+                await _raise_if_claude_context_too_large(
+                    client,
+                    request,
+                    create_params,
+                )
             response = await _stream_claude_message(
                 client,
                 create_params,
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
+                stream_attempt=request.stream_attempt,
             )
     except APIStatusError as err:
+        if _anthropic_error_is_context_window_exceeded(err):
+            raise ApplicationError(
+                str(err),
+                type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         if _anthropic_status_is_non_retryable(err.status_code):
             raise ApplicationError(
                 str(err),
@@ -384,18 +426,73 @@ def _anthropic_status_is_non_retryable(status_code: int) -> bool:
     return 400 <= status_code < 500
 
 
+def _anthropic_error_is_context_window_exceeded(err: APIStatusError) -> bool:
+    return status_error_is_context_window_exceeded(err.status_code, str(err))
+
+
+def _should_count_request_tokens(request: ClaudeRequest) -> bool:
+    return bool(
+        request.context_token_limit is not None
+        and request.stream_attempt is not None
+        and request.stream_attempt > 1
+    )
+
+
+async def _raise_if_claude_context_too_large(
+    client: AsyncAnthropic,
+    request: ClaudeRequest,
+    create_params: dict[str, Any],
+) -> None:
+    count_params: dict[str, Any] = {
+        "model": create_params["model"],
+        "messages": create_params["messages"],
+        "system": create_params["system"],
+    }
+    if request.tools:
+        count_params["tools"] = create_params["tools"]
+    if request.thinking is not None:
+        count_params["thinking"] = create_params["thinking"]
+    if request.output_config is not None:
+        count_params["output_config"] = create_params["output_config"]
+
+    token_count = await client.messages.count_tokens(**count_params)
+    input_tokens = int(token_count.input_tokens)
+    if not counted_tokens_exceed_context(
+        input_tokens=input_tokens,
+        max_output_tokens=request.max_tokens,
+        context_token_limit=request.context_token_limit,
+    ):
+        return
+
+    raise ApplicationError(
+        counted_context_window_message(
+            provider="Claude",
+            input_tokens=input_tokens,
+            max_output_tokens=request.max_tokens,
+            context_token_limit=cast(int, request.context_token_limit),
+        ),
+        type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
+        non_retryable=True,
+    )
+
+
 async def _stream_claude_message(
     client: AsyncAnthropic,
     create_params: dict[str, Any],
     *,
     stream_id: str | None,
     stream_sequence: int | None,
+    stream_attempt: int | None,
 ) -> Any:
-    stream = StreamContext(stream_id=stream_id, tool_name="claude")
+    stream = AgentStreamWriter.for_provider(
+        stream_id=stream_id,
+        provider="claude",
+        attempt=stream_attempt,
+    )
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))
-    await stream.emit({"sequence": stream_sequence}, kind="claude_start")
+    await stream.agent_started(sequence=stream_sequence)
 
     try:
         async with client.messages.stream(
@@ -420,10 +517,7 @@ async def _stream_claude_message(
                         next_event_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await next_event_task
-                        await stream.emit(
-                            {"sequence": stream_sequence},
-                            kind="claude_cancelled",
-                        )
+                        await stream.agent_cancelled(sequence=stream_sequence)
                         raise asyncio.CancelledError()
 
                     try:
@@ -450,25 +544,19 @@ async def _stream_claude_message(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
 
-    await stream.emit(
-        {
-            "id": response.id,
-            "model": response.model,
-            "sequence": stream_sequence,
-            "stop_reason": response.stop_reason,
-            "stop_details": _optional_object_to_dict(
-                getattr(response, "stop_details", None)
-            ),
-            "text": _response_display_text(
-                response.stop_reason,
-                response.content,
-                stop_details=_optional_object_to_dict(
-                    getattr(response, "stop_details", None)
-                ),
-            ),
-            "usage": response.usage.to_dict(),
-        },
-        kind="claude_complete",
+    stop_details = _optional_object_to_dict(getattr(response, "stop_details", None))
+    await stream.agent_completed(
+        id=response.id,
+        model=response.model,
+        sequence=stream_sequence,
+        stop_reason=response.stop_reason,
+        stop_details=stop_details,
+        text=_response_display_text(
+            response.stop_reason,
+            response.content,
+            stop_details=stop_details,
+        ),
+        usage=response.usage.to_dict(),
     )
     heartbeat_state.phase = "complete"
     heartbeat_state.stop_reason = cast(str | None, response.stop_reason)
@@ -490,7 +578,8 @@ class _ClaudeHeartbeatState:
 
     def payload(self, heartbeat_reason: str) -> dict[str, Any]:
         return {
-            "kind": "claude_stream",
+            "kind": "agent_stream",
+            "provider": "claude",
             "heartbeat_reason": heartbeat_reason,
             "sequence": self.sequence,
             "phase": self.phase,
@@ -514,7 +603,7 @@ def _streaming_extra_headers(create_params: dict[str, Any]) -> dict[str, str] | 
 
 async def _emit_claude_raw_stream_event(
     *,
-    stream: StreamContext,
+    stream: AgentStreamWriter,
     event: Any,
     stream_sequence: int | None,
     tool_input_blocks: dict[int, _ToolInputStreamState],
@@ -526,12 +615,9 @@ async def _emit_claude_raw_stream_event(
         block = _object_to_dict(getattr(event, "content_block", None))
         block_type = block.get("type")
         if block_type == "thinking":
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                },
-                kind="claude_thinking_start",
+            await stream.thinking_started(
+                sequence=stream_sequence,
+                content_block_index=block_index,
             )
             return
 
@@ -543,15 +629,12 @@ async def _emit_claude_raw_stream_event(
                 tool_type=cast(str | None, block_type),
             )
             tool_input_blocks[block_index] = state
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                    "tool_use_id": state.tool_use_id,
-                    "tool_name": state.tool_name,
-                    "tool_type": state.tool_type,
-                },
-                kind="claude_tool_input_start",
+            await stream.tool_input_started(
+                sequence=stream_sequence,
+                content_block_index=block_index,
+                tool_use_id=state.tool_use_id,
+                tool_name=state.tool_name,
+                tool_type=state.tool_type,
             )
         return
 
@@ -561,27 +644,21 @@ async def _emit_claude_raw_stream_event(
         if delta_type == "text_delta":
             text = delta.get("text")
             if isinstance(text, str) and text:
-                await stream.emit(
-                    {"sequence": stream_sequence, "text": text},
-                    kind="claude_text_delta",
-                )
+                await stream.text_delta(sequence=stream_sequence, text=text)
             return
 
         if delta_type == "refusal_delta":
             text = delta.get("refusal")
             if isinstance(text, str) and text:
-                await stream.emit(
-                    {"sequence": stream_sequence, "text": text},
-                    kind="claude_text_delta",
-                )
+                await stream.text_delta(sequence=stream_sequence, text=text)
             return
 
         if delta_type == "thinking_delta":
             thinking = delta.get("thinking")
             if isinstance(thinking, str) and thinking:
-                await stream.emit(
-                    {"sequence": stream_sequence, "thinking": thinking},
-                    kind="claude_thinking_delta",
+                await stream.thinking_delta(
+                    sequence=stream_sequence,
+                    thinking=thinking,
                 )
             return
 
@@ -593,16 +670,13 @@ async def _emit_claude_raw_stream_event(
                 return
 
             state.partial_json += partial_json
-            await stream.emit(
-                {
-                    "sequence": stream_sequence,
-                    "content_block_index": block_index,
-                    "tool_use_id": state.tool_use_id,
-                    "tool_name": state.tool_name,
-                    "tool_type": state.tool_type,
-                    "partial_json": partial_json,
-                },
-                kind="claude_tool_input_delta",
+            await stream.tool_input_delta(
+                sequence=stream_sequence,
+                content_block_index=block_index,
+                tool_use_id=state.tool_use_id,
+                tool_name=state.tool_name,
+                tool_type=state.tool_type,
+                partial_json=partial_json,
             )
         return
 
@@ -614,17 +688,14 @@ async def _emit_claude_raw_stream_event(
 
         block = _object_to_dict(getattr(event, "content_block", None))
         input_value = block.get("input", state.partial_json)
-        await stream.emit(
-            {
-                "sequence": stream_sequence,
-                "content_block_index": block_index,
-                "tool_use_id": state.tool_use_id,
-                "tool_name": state.tool_name,
-                "tool_type": state.tool_type,
-                "input": input_value,
-                "input_preview": _json_preview(input_value),
-            },
-            kind="claude_tool_input_complete",
+        await stream.tool_input_completed(
+            sequence=stream_sequence,
+            content_block_index=block_index,
+            tool_use_id=state.tool_use_id,
+            tool_name=state.tool_name,
+            tool_type=state.tool_type,
+            input=input_value,
+            input_preview=_json_preview(input_value),
         )
 
 
@@ -680,6 +751,11 @@ def _agent_block_to_claude_block(block: AgentBlock) -> dict[str, Any] | None:
     block_type = block.get("type")
     if block_type == "text":
         return {"type": "text", "text": str(block.get("text") or "")}
+    if block_type == CONTEXT_COMPACTION_MARKER:
+        return {
+            "type": "text",
+            "text": str(block.get("text") or CONTEXT_COMPACTION_MARKER_TEXT),
+        }
     if block_type == "tool_use":
         return _agent_tool_use_to_claude_block(cast(ToolUseBlock, block))
     if block_type == "tool_result":

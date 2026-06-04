@@ -66,6 +66,7 @@ class ArtifactProvider:
                 "content": content,
                 "mime_type": mime_type,
                 "encoding": encoding,
+                "idempotency_key": ctx.idempotency_key(name),
             },
         )
         return ToolResult(payload=payload, error="error" in payload)
@@ -79,6 +80,7 @@ async def _create_artifact_activity(
     content: str,
     mime_type: str,
     encoding: ArtifactEncoding,
+    idempotency_key: str,
     *,
     stream: StreamContext,
 ) -> dict[str, Any]:
@@ -111,6 +113,7 @@ async def _create_artifact_activity(
         mime_type=mime_type,
         content=artifact_bytes,
         metadata={"encoding": encoding},
+        idempotency_key=idempotency_key,
     )
     payload = {
         "artifact": {

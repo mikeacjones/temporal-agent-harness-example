@@ -44,11 +44,9 @@ from simple_chat_agent.worker.tools import (
     GITHUB_TOOL_NAMES,
     PYTHON_SANDBOX_TOOL,
     configured_research_tool_names,
-    tool_names_for_connections,
 )
 from simple_chat_agent.worker.user_chats_workflow import (
     DeleteMcpServerRequest,
-    UpdateMcpServerRequest,
     UserChatsWorkflow,
 )
 
@@ -58,9 +56,7 @@ class ToolRouteDeps:
     store: Callable[[], AppStore]
     current_user: Callable[[Request], AuthenticatedUser]
     ensure_user_chats_workflow: Callable[..., Any]
-    update_user_workflows_tool_connections: Callable[..., Any]
     upsert_user_mcp_server: Callable[..., Any]
-    github_connection_id_for_user: Callable[[AuthenticatedUser], str | None]
     github_tools_enabled: Callable[[], bool]
     mcp_oauth_flows: Callable[[], dict[str, PendingMcpOAuthFlow]]
 
@@ -171,7 +167,6 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
             user_id=user.user_id,
             provider=GITHUB_PROVIDER,
         )
-        await deps.update_user_workflows_tool_connections(user)
         return {"status": "ok"}
 
     @router.get("/api/mcp-servers")
@@ -276,22 +271,9 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
     async def delete_mcp_server(request: Request, server_id: str) -> dict[str, str]:
         user = deps.current_user(request)
         registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
-        remaining_servers = [
-            server
-            for server in await registry.query(UserChatsWorkflow.list_mcp_servers)
-            if server.server_id != server_id
-        ]
         await registry.execute_update(
             UserChatsWorkflow.delete_mcp_server,
-            DeleteMcpServerRequest(
-                server_id=server_id,
-                available_tool_names=tool_names_for_connections(
-                    github_connection_id=deps.github_connection_id_for_user(user),
-                    mcp_servers=remaining_servers,
-                    research_tool_names=configured_research_tool_names(),
-                ),
-                github_connection_id=deps.github_connection_id_for_user(user),
-            ),
+            DeleteMcpServerRequest(server_id=server_id),
         )
         deps.store().delete_oauth_connection(
             user_id=user.user_id,
@@ -409,9 +391,6 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
                 if github_user.get("login") is not None
                 else None
             ),
-        )
-        await deps.update_user_workflows_tool_connections(
-            AuthenticatedUser(user_id=user_id, username="")
         )
         return RedirectResponse("/?github=connected")
 
