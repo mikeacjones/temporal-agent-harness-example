@@ -179,7 +179,7 @@ def _load_anthropic_model_catalog() -> AnthropicModelCatalog:
 
 
 def _fetch_anthropic_models(api_key: str) -> list[AnthropicModelOption]:
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key, **_anthropic_client_kwargs())
     first_page = client.models.list(limit=1000, timeout=10)
     models: list[AnthropicModelOption] = []
     for page in first_page.iter_pages():
@@ -198,6 +198,13 @@ def _fetch_anthropic_models(api_key: str) -> list[AnthropicModelOption]:
                 )
             )
     return models
+
+
+def _anthropic_client_kwargs() -> dict[str, str]:
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not base_url:
+        return {}
+    return {"base_url": base_url}
 
 
 def _fallback_catalog(error: str | None = None) -> AnthropicModelCatalog:

@@ -688,7 +688,9 @@ workflows = [
 ]
 ```
 
-The Anthropic SDK reads credentials from `ANTHROPIC_API_KEY`.
+The Anthropic SDK reads credentials from `ANTHROPIC_API_KEY`. Set
+`ANTHROPIC_BASE_URL` to point Anthropic SDK calls at a compatible gateway such
+as LiteLLM.
 
 ## What This Unlocks
 
