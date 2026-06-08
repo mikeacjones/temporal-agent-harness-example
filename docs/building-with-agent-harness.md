@@ -81,6 +81,23 @@ Keep workflow orchestration in `workflow.py`, tool declarations in `tools.py`,
 and worker registration in `worker.py`. Add an API or UI later only if the
 product needs one.
 
+## Define Tool Categories
+
+The harness ships with a built-in `ToolType` enum for simple projects, but a
+real application can define its own string-compatible categories. This keeps the
+harness generic while letting the app own its risk model.
+
+```python
+from enum import StrEnum
+
+
+class FileToolCategory(StrEnum):
+    READ_FILE = "read_file"
+    WRITE_FILE = "write_file"
+```
+
+Use those categories in your guard policy, guards, and tools.
+
 ## Define Tools
 
 Tools are workflow functions decorated with `@tool(...)`. A tool can make
@@ -88,14 +105,16 @@ deterministic decisions directly, but side effects should go through
 `ctx.activity(...)`.
 
 ```python
-from agent_harness.tool_types import ToolType
+from agent_harness.guards import GuardContext, GuardResult
 from agent_harness.tools import ToolContext, ToolResult, tool
+from agent_harness.tools import guard
+from my_agent.tool_categories import FileToolCategory
 
 
 @tool(
     name="read_file",
     description="Read a UTF-8 file from the workspace.",
-    tool_type=ToolType.READ,
+    tool_type=FileToolCategory.READ_FILE,
 )
 async def read_file(ctx: ToolContext, path: str) -> ToolResult:
     payload = await ctx.activity(
@@ -113,10 +132,18 @@ For mutating tools, generate an idempotency key and pass it to the downstream
 system when possible:
 
 ```python
+@guard(name="approve_file_write", fulfills=FileToolCategory.WRITE_FILE)
+async def approve_file_write(ctx: GuardContext) -> GuardResult:
+    # This tutorial guard is intentionally too trusting. A real guard should
+    # check the path, content, user, workspace policy, or approval state.
+    return GuardResult(passed=True)
+
+
 @tool(
     name="write_file",
     description="Write a UTF-8 file to the workspace.",
-    tool_type=ToolType.MUTATING,
+    tool_type=FileToolCategory.WRITE_FILE,
+    pre_guards=[approve_file_write],
 )
 async def write_file(ctx: ToolContext, path: str, content: str) -> ToolResult:
     payload = await ctx.activity(
@@ -146,6 +173,7 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.messages import message_text
     from agent_harness.providers.claude import ClaudeAgent
     from agent_harness.tools import ToolSet
+    from my_agent.tool_categories import FileToolCategory
     from my_agent.tools import read_file, write_file
 
 
@@ -169,7 +197,7 @@ class FileAgentWorkflow:
     async def run(self, request: AgentRequest) -> AgentResult:
         tools = ToolSet(
             guard_policy=GuardPolicy(
-                required_pre=frozenset(),
+                required_pre=frozenset({FileToolCategory.WRITE_FILE}),
                 required_post=frozenset(),
             )
         )
@@ -190,9 +218,8 @@ class FileAgentWorkflow:
         )
 ```
 
-The example disables required mutating-tool guards to keep the first project
-small. For a real project, keep the default guard policy and attach a pre-guard
-to mutating, admin, or MCP tools.
+This policy says the app's `WRITE_FILE` category requires a pre-guard. A real
+project should attach that guard to every tool in that category.
 
 The example also disables continue-as-new handling. For long-running or
 multi-turn agents, keep continue-as-new enabled and carry
@@ -372,6 +399,34 @@ Required provider methods:
 
 Provider convenience classes live under `agent_harness.providers`.
 
+### Tool Categories
+
+Module: `agent_harness.tool_types`
+
+`ToolCategory` is the harness category type. At runtime it is a string.
+
+The harness also provides `ToolType`, a built-in convenience `StrEnum` with
+these default categories:
+
+- `READ`
+- `MUTATING`
+- `MCP`
+- `ADMIN`
+
+Apps can use `ToolType`, plain strings, or their own `StrEnum` values:
+
+```python
+from enum import StrEnum
+
+
+class BillingToolCategory(StrEnum):
+    READ_INVOICE = "read_invoice"
+    MODIFY_INVOICE = "modify_invoice"
+```
+
+The harness normalizes category values to strings when tools, guards, and guard
+policies are registered.
+
 ### Tools
 
 Module: `agent_harness.tools`
@@ -382,7 +437,7 @@ Use `@tool(...)` to mark a workflow function as a model tool.
 @tool(
     name="tool_name",
     description="Clear model-visible description.",
-    tool_type=ToolType.READ,
+    tool_type="read_customer",
     pre_guards=[...],
     post_guards=[...],
 )
@@ -446,20 +501,11 @@ heartbeat timeout, and `heartbeat(details=None, force=False)`.
 If the activity has a heartbeat timeout, the generic router also sends
 conservative automatic heartbeats. Manual heartbeats are coalesced.
 
-### Tool Types And Guard Policy
-
-Module: `agent_harness.tool_types`
-
-`ToolType` values:
-
-- `READ`
-- `MUTATING`
-- `MCP`
-- `ADMIN`
+### Guard Policy
 
 Module: `agent_harness.guards`
 
-`GuardPolicy` controls which tool types require guards:
+`GuardPolicy` controls which tool categories require guards:
 
 ```python
 from agent_harness.guards import GuardPolicy
@@ -473,7 +519,7 @@ tools = ToolSet(guard_policy=policy)
 ```
 
 The default policy requires pre-guards for `MUTATING`, `MCP`, and `ADMIN`
-tools.
+tools. Override it when your app has its own category vocabulary.
 
 ### Tool Guards
 
@@ -484,10 +530,10 @@ Use `@guard(...)` to create a pre/post tool guard:
 ```python
 from agent_harness.guards import GuardContext, GuardResult
 from agent_harness.tools import guard
-from agent_harness.tool_types import ToolType
+from my_agent.tool_categories import FileToolCategory
 
 
-@guard(name="allow_write", fulfills=ToolType.MUTATING)
+@guard(name="allow_write", fulfills=FileToolCategory.WRITE_FILE)
 async def allow_write(ctx: GuardContext) -> GuardResult:
     return GuardResult(passed=True)
 ```
@@ -498,7 +544,7 @@ Attach it to a tool:
 @tool(
     name="write_file",
     description="Write a file.",
-    tool_type=ToolType.MUTATING,
+    tool_type=FileToolCategory.WRITE_FILE,
     pre_guards=[allow_write],
 )
 async def write_file(...):

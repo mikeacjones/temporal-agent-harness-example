@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from agent_harness.tool_types import ToolType
 from agent_harness.tools import ToolContext, ToolResult, tool
+from basic_file_agent.guards import approve_file_write
+from basic_file_agent.tool_types import BasicFileToolType
 
 
 WORKSPACE_ROOT_ENV = "BASIC_FILE_AGENT_WORKSPACE"
@@ -19,7 +20,7 @@ DEFAULT_MAX_READ_CHARS = 20_000
         "Read a UTF-8 text file from the agent workspace. The path must be "
         "relative to the workspace root."
     ),
-    tool_type=ToolType.READ,
+    tool_type=BasicFileToolType.READ_FILE,
 )
 async def read_file(
     ctx: ToolContext,
@@ -39,7 +40,8 @@ async def read_file(
         "Write UTF-8 text to a file in the agent workspace. The path must be "
         "relative to the workspace root. Existing files are overwritten."
     ),
-    tool_type=ToolType.MUTATING,
+    tool_type=BasicFileToolType.WRITE_FILE,
+    pre_guards=[approve_file_write],
 )
 async def write_file(ctx: ToolContext, path: str, content: str) -> ToolResult:
     payload = await ctx.activity(

@@ -14,6 +14,8 @@ workflow result.
 | File | Purpose |
 | --- | --- |
 | `workflow.py` | Temporal workflow and request/result dataclasses. |
+| `tool_types.py` | App-owned tool category vocabulary for this example. |
+| `guards.py` | Demo write-file approval guard. |
 | `tools.py` | Two harness tools plus their file-system activities. |
 | `worker.py` | Worker entrypoint that registers the workflow, provider activity, and generic tool/guard routers. |
 | `start_workflow.py` | Small CLI client for starting the workflow. |
@@ -54,9 +56,13 @@ Override that with `BASIC_FILE_AGENT_WORKSPACE`.
 
 ## What It Intentionally Leaves Out
 
-This example disables required tool guards so the mutating `write_file` tool can
-stay small. Production-style agents should attach pre-guards to mutating,
-admin, or external MCP tools.
+This example defines custom `ReadFile` and `WriteFile` tool categories in
+`tool_types.py`. Its guard policy requires a pre-guard for `WriteFile`, and
+`write_file` attaches `approve_file_write`.
+
+The demo guard always approves so the example stays runnable without a UI or
+human approval workflow. Production-style guards should check the path, content,
+user, workspace policy, approval state, or whatever the mutation requires.
 
 This example also disables continue-as-new handling. A long-running or
 multi-turn workflow should carry `AgentResult.continuation_state` into a new run

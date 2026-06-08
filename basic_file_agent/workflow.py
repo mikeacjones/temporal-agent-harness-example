@@ -10,6 +10,7 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.messages import message_text
     from agent_harness.providers.claude import ClaudeAgent
     from agent_harness.tools import ToolSet
+    from basic_file_agent.tool_types import BasicFileToolType
     from basic_file_agent.tools import read_file, write_file
 
 
@@ -45,7 +46,7 @@ class BasicFileAgentWorkflow:
     async def run(self, request: BasicFileAgentRequest) -> BasicFileAgentResult:
         tools = ToolSet(
             guard_policy=GuardPolicy(
-                required_pre=frozenset(),
+                required_pre=frozenset({BasicFileToolType.WRITE_FILE}),
                 required_post=frozenset(),
             )
         )

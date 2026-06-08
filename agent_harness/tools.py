@@ -34,7 +34,7 @@ from .guards import (
     GuardTiming,
 )
 from .streaming import StreamContext
-from .tool_types import ToolType
+from .tool_types import ToolCategory, normalize_tool_category
 
 ToolFn = Callable[..., Awaitable["ToolResult"]]
 DynamicToolFn = Callable[["ToolContext", dict[str, Any]], Awaitable["ToolResult"]]
@@ -50,7 +50,7 @@ _GUARD_METADATA_ATTR = "__agent_harness_guard__"
 class ToolMetadata:
     name: str
     description: str
-    tool_type: ToolType
+    tool_type: ToolCategory
     pre_guards: tuple[GuardReference, ...] = ()
     post_guards: tuple[GuardReference, ...] = ()
 
@@ -58,14 +58,14 @@ class ToolMetadata:
 @dataclass(frozen=True)
 class GuardMetadata:
     name: str
-    fulfills: ToolType | Iterable[ToolType]
+    fulfills: ToolCategory | Iterable[ToolCategory]
 
 
 def tool(
     *,
     name: str,
     description: str,
-    tool_type: ToolType,
+    tool_type: ToolCategory,
     pre_guards: Iterable[GuardReference] | None = None,
     post_guards: Iterable[GuardReference] | None = None,
 ):
@@ -76,7 +76,7 @@ def tool(
             ToolMetadata(
                 name=name,
                 description=description,
-                tool_type=tool_type,
+                tool_type=normalize_tool_category(tool_type),
                 pre_guards=tuple(pre_guards or ()),
                 post_guards=tuple(post_guards or ()),
             ),
@@ -89,7 +89,7 @@ def tool(
 def guard(
     *,
     name: str,
-    fulfills: ToolType | Iterable[ToolType],
+    fulfills: ToolCategory | Iterable[ToolCategory],
 ):
     def decorator(fn: GuardFn) -> GuardFn:
         setattr(fn, _GUARD_METADATA_ATTR, GuardMetadata(name=name, fulfills=fulfills))
@@ -209,7 +209,7 @@ class ToolActivityRequest:
 @dataclass
 class ToolDef:
     schema: ToolParam
-    tool_type: ToolType
+    tool_type: ToolCategory
     fn: ToolFn | DynamicToolFn
     pre_guards: list[GuardDef]
     post_guards: list[GuardDef]
@@ -315,7 +315,7 @@ class ToolSet:
         name: str,
         description: str,
         input_schema: dict[str, Any],
-        tool_type: ToolType,
+        tool_type: ToolCategory,
         fn: DynamicToolFn,
         pre_guards: Iterable[GuardReference] | None = None,
         post_guards: Iterable[GuardReference] | None = None,
@@ -413,7 +413,7 @@ class ToolSet:
         *,
         name: str,
         description: str,
-        tool_type: ToolType,
+        tool_type: ToolCategory,
         fn: ToolFn | DynamicToolFn,
         pre_guards: list[GuardDef],
         post_guards: list[GuardDef],
@@ -434,7 +434,7 @@ class ToolSet:
                 "description": description,
                 "input_schema": schema_input,
             },
-            tool_type=tool_type,
+            tool_type=normalize_tool_category(tool_type),
             fn=fn,
             pre_guards=pre_guards,
             post_guards=post_guards,

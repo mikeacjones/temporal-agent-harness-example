@@ -54,7 +54,8 @@ configured MCP servers, and enabled research providers.
 
 ## Tool Types And Approval
 
-Tool categories come from `agent_harness.tool_types.ToolType`.
+This demo uses the built-in categories from `agent_harness.tool_types.ToolType`.
+Other applications can define their own string-compatible tool categories.
 
 | Type | Meaning in this app |
 | --- | --- |

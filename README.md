@@ -12,6 +12,9 @@ Want to run this locally without setting up Google OAuth? Start here:
 Want to build your own project on the harness? Start here:
 [Building With `agent_harness`](docs/building-with-agent-harness.md).
 
+Design note on app-owned tool categories:
+[Extensible Tool Categories And Guard Policy](docs/extensible-tool-categories-and-guard-policy.md).
+
 ## Demo Recording
 
 [![Temporal Agent Harness demo recording](docs/demo-video-thumbnail.png)](https://drive.google.com/file/d/1HEwsBnabhiszNh0ULDwCcnAavfNzDcLK/view?usp=sharing)
@@ -385,7 +388,10 @@ If no sink is configured, streaming is a no-op.
 
 ## Guards
 
-Tools are categorized with `ToolType`. The harness can require guards for specific categories. Today, `ToolType.ADMIN` requires a pre-guard by default.
+Tools are categorized with string-compatible categories. The harness provides a
+built-in `ToolType` enum for common categories, and apps can define their own.
+The harness can require guards for specific categories. By default, `MUTATING`,
+`MCP`, and `ADMIN` require a pre-guard.
 
 ```python
 from agent_harness.guards import GuardContext, GuardResult
@@ -440,7 +446,10 @@ This does not make it impossible for a developer to write a bad guard. It does m
 
 ## Reusable Guard Workflow Example
 
-This example shows a reusable customer confirmation guard. `CUSTOMER_CHANGE` is an example company-specific tool category: the point is that a class of tools can require the same guard, while the guard chooses the right confirmation path from the tool context.
+This example shows a reusable customer confirmation guard. `CUSTOMER_CHANGE` is
+an example company-specific tool category: the point is that a class of tools
+can require the same guard, while the guard chooses the right confirmation path
+from the tool context.
 
 The customer confirmation workflow is reusable infrastructure:
 
@@ -539,6 +548,13 @@ class CustomerConfirmationWorkflow:
         )
 ```
 
+Define the app-owned category once:
+
+```python
+# tool_categories.py
+CUSTOMER_CHANGE = "customer_change"
+```
+
 The guard is reusable policy. It maps the current tool call to a confirmation template and starts the child workflow:
 
 ```python
@@ -549,8 +565,8 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from agent_harness.guards import GuardContext, GuardResult
-    from agent_harness.tool_types import ToolType
     from agent_harness.tools import guard
+    from my_agent.tool_categories import CUSTOMER_CHANGE
     from my_agent.workflows.customer_confirmation_workflow import (
         CustomerConfirmationRequest,
         CustomerConfirmationWorkflow,
@@ -582,7 +598,7 @@ def _customer_confirmation_request(ctx: GuardContext) -> CustomerConfirmationReq
     raise ValueError(f"No customer confirmation configured for {ctx.tool_name}")
 
 
-@guard(name="confirm_customer_change", fulfills=ToolType.CUSTOMER_CHANGE)
+@guard(name="confirm_customer_change", fulfills=CUSTOMER_CHANGE)
 async def confirm_customer_change(ctx: GuardContext) -> GuardResult:
     request = _customer_confirmation_request(ctx)
     result = await workflow.execute_child_workflow(
@@ -614,9 +630,9 @@ The tool stays focused on the actual mutation:
 # tools/substitute_item_tool.py
 from datetime import timedelta
 
-from agent_harness.tool_types import ToolType
 from agent_harness.tools import ToolContext, ToolResult, tool
 from my_agent.guards.customer_confirmation_guard import confirm_customer_change
+from my_agent.tool_categories import CUSTOMER_CHANGE
 
 
 async def _apply_substitution(
@@ -634,7 +650,7 @@ async def _apply_substitution(
 @tool(
     name="substitute_item",
     description="Substitute an unavailable order item after customer confirmation.",
-    tool_type=ToolType.CUSTOMER_CHANGE,
+    tool_type=CUSTOMER_CHANGE,
     pre_guards=[confirm_customer_change],
 )
 async def substitute_item(
