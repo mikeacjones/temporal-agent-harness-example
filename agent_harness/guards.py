@@ -19,7 +19,12 @@ from .activity_options import (
 )
 from .activity_router import ActivityFn, call_activity, function_ref, resolve_function_ref
 from .streaming import StreamContext
-from .tool_types import ToolType
+from .tool_types import (
+    ToolCategory,
+    ToolType,
+    normalize_tool_category,
+    tool_category_set,
+)
 
 if TYPE_CHECKING:
     from .tools import ToolResult
@@ -35,10 +40,22 @@ class GuardTiming(StrEnum):
 
 @dataclass(frozen=True)
 class GuardPolicy:
-    required_pre: frozenset[ToolType] = frozenset(
-        {ToolType.ADMIN, ToolType.MUTATING, ToolType.MCP}
+    required_pre: frozenset[ToolCategory] = frozenset(
+        {str(ToolType.ADMIN), str(ToolType.MUTATING), str(ToolType.MCP)}
     )
-    required_post: frozenset[ToolType] = frozenset()
+    required_post: frozenset[ToolCategory] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "required_pre",
+            frozenset(normalize_tool_category(value) for value in self.required_pre),
+        )
+        object.__setattr__(
+            self,
+            "required_post",
+            frozenset(normalize_tool_category(value) for value in self.required_post),
+        )
 
 
 @dataclass
@@ -53,7 +70,7 @@ class GuardResult:
 class GuardContext:
     guard_name: str
     tool_name: str
-    tool_type: ToolType
+    tool_type: ToolCategory
     tool_args: dict
     tool_result: ToolResult | None = None
     stream_id: str | None = None
@@ -140,7 +157,7 @@ class GuardActivityRequest:
 @dataclass
 class GuardDef:
     name: str
-    fulfills: frozenset[ToolType]
+    fulfills: frozenset[ToolCategory]
     fn: GuardFn
 
 
@@ -159,7 +176,7 @@ class GuardSet:
         self,
         *,
         name: str,
-        fulfills: ToolType | Iterable[ToolType],
+        fulfills: ToolCategory | Iterable[ToolCategory],
     ):
         def decorator(fn: GuardFn) -> GuardFn:
             if name in self._guard_registry:
@@ -197,7 +214,7 @@ class GuardSet:
     def validate_tool_guards(
         self,
         *,
-        tool_type: ToolType,
+        tool_type: ToolCategory,
         pre_guards: list[GuardDef],
         post_guards: list[GuardDef],
     ) -> None:
@@ -221,7 +238,7 @@ class GuardSet:
         timing: GuardTiming,
         *,
         tool_name: str,
-        tool_type: ToolType,
+        tool_type: ToolCategory,
         tool_args: dict[str, Any],
         tool_result: ToolResult | None,
         stream_id: str | None,
@@ -269,17 +286,10 @@ async def call_guard(fn: GuardFn, ctx: GuardContext) -> GuardResult:
     return result
 
 
-def tool_type_set(fulfills: ToolType | Iterable[ToolType]) -> frozenset[ToolType]:
-    if isinstance(fulfills, ToolType):
-        return frozenset({fulfills})
-
-    tool_types = frozenset(fulfills)
-    if not tool_types:
-        raise ValueError("Guard must fulfill at least one ToolType")
-    invalid_tool_types = [t for t in tool_types if not isinstance(t, ToolType)]
-    if invalid_tool_types:
-        raise TypeError("Guard fulfills must contain only ToolType values")
-    return tool_types
+def tool_type_set(
+    fulfills: ToolCategory | Iterable[ToolCategory],
+) -> frozenset[ToolCategory]:
+    return tool_category_set(fulfills)
 
 
 def guard_failure_payload(

@@ -41,6 +41,8 @@ Create a repo-root `.env` file:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
+# Optional. Point Anthropic SDK calls at a compatible gateway such as LiteLLM.
+ANTHROPIC_BASE_URL=
 ANTHROPIC_MODEL=claude-sonnet-4-5
 
 SIMPLE_CHAT_JWT_SECRET=replace-me-for-local-dev
@@ -294,7 +296,9 @@ locally before replaying.
   the browser still had an old chat selected. Start a new chat, or delete local
   runtime data.
 - Claude calls fail immediately: check that `ANTHROPIC_API_KEY` is present in
-  the repo-root `.env`, then restart both the worker and web process.
+  the repo-root `.env`. If you are using LiteLLM or another compatible gateway,
+  also check `ANTHROPIC_BASE_URL`. Restart both the worker and web process after
+  changing either value.
 - GitHub stays disconnected: verify the OAuth app callback and the GitHub env
   vars, then restart the web process.
 - The agent does not see a newly added MCP server: start a new chat or make sure

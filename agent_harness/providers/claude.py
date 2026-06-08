@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -340,6 +341,13 @@ def _claude_response_from_dict(response: dict[str, Any]) -> ClaudeResponse:
     )
 
 
+def _anthropic_client_kwargs() -> dict[str, str]:
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not base_url:
+        return {}
+    return {"base_url": base_url}
+
+
 def _claude_response_from_guard_execution(
     execution: LlmGuardExecution,
     *,
@@ -377,7 +385,7 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
         create_params["output_config"] = request.output_config
 
     try:
-        async with AsyncAnthropic(max_retries=0) as client:
+        async with AsyncAnthropic(max_retries=0, **_anthropic_client_kwargs()) as client:
             if _should_count_request_tokens(request):
                 await _raise_if_claude_context_too_large(
                     client,

@@ -116,9 +116,11 @@ Guards follow the same pattern with `@guard(...)` and:
 agent_harness.run_guard_activity
 ```
 
-`ToolType` drives guard requirements. By default, `MUTATING`, `MCP`, and
-`ADMIN` tools require a pre-guard. This demo uses that to require approval for
-mutating tools and third-party MCP tools.
+Tool categories drive guard requirements. The harness ships with a built-in
+`ToolType` enum for `READ`, `MUTATING`, `MCP`, and `ADMIN`, but applications can
+also define their own string-compatible categories. By default, `MUTATING`,
+`MCP`, and `ADMIN` tools require a pre-guard. This demo uses that to require
+approval for mutating tools and third-party MCP tools.
 
 Tool authors own idempotency. The harness can generate a stable
 `ctx.idempotency_key(...)` from the stream, tool name, provider tool call id,
