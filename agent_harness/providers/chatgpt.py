@@ -38,6 +38,20 @@ from ..sliding_window_context_manager import estimate_token_count
 from ..streaming import AgentStreamWriter
 from ..tools import ToolSet
 from .errors import status_error_is_context_window_exceeded
+from ._shared import (
+    copy_mapping as _copy_mapping,
+    copy_optional_mapping as _copy_optional_mapping,
+    guard_response_dict,
+    json_object as _json_object,
+    json_preview as _json_preview,
+    mapping_list as _mapping_list,
+    needs_refusal_fallback,
+    non_retryable_http_status,
+    object_to_dict as _object_to_dict,
+    provider_data as _shared_provider_data,
+    provider_metadata as _shared_provider_metadata,
+    refusal_fallback_text as _shared_refusal_fallback_text,
+)
 from .interface import (
     CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
     AgentProvider,
@@ -272,6 +286,7 @@ class _ChatGPTStreamState:
     text_parts: list[str] | None = None
     reasoning_parts: list[str] | None = None
     output_items: list[dict[str, Any]] | None = None
+    output_item_indices: dict[int, int] | None = None
     usage: dict[str, Any] | None = None
     stop_reason: str | None = None
     stop_details: dict[str, Any] | None = None
@@ -285,10 +300,30 @@ class _ChatGPTStreamState:
             self.reasoning_parts = []
         if self.output_items is None:
             self.output_items = []
+        if self.output_item_indices is None:
+            self.output_item_indices = {}
         if self.usage is None:
             self.usage = {}
 
     def message(self) -> dict[str, Any]:
+        if not self.output_items and self.text_parts:
+            return {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "".join(self.text_parts),
+                                "annotations": [],
+                            }
+                        ],
+                        "status": "completed",
+                    }
+                ],
+            }
         return {
             "role": "assistant",
             "content": [_copy_mapping(item) for item in self.output_items or []],
@@ -383,33 +418,30 @@ def _chatgpt_response_from_guard_execution(
     *,
     model: str,
 ) -> ChatGPTResponse:
-    response = execution.response or {
-        "id": "guard:llm",
-        "model": model,
-        "message": {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "The response was blocked by an LLM guard.",
-                            "annotations": [],
-                        }
-                    ],
-                    "status": "completed",
-                }
-            ],
-        },
-        "stop_reason": "failed",
-        "stop_sequence": None,
-        "usage": {},
-    }
-    response["guard_action"] = execution.action.value
-    response["guard_reason"] = execution.reason
-    return _chatgpt_response_from_dict(response)
+    return _chatgpt_response_from_dict(
+        guard_response_dict(
+            execution,
+            model=model,
+            message={
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "The response was blocked by an LLM guard.",
+                                "annotations": [],
+                            }
+                        ],
+                        "status": "completed",
+                    }
+                ],
+            },
+            stop_reason="failed",
+        )
+    )
 
 
 @activity.defn
@@ -455,7 +487,7 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
                 non_retryable=True,
             ) from err
-        if _openai_status_is_non_retryable(err.status_code):
+        if non_retryable_http_status(err.status_code):
             raise ApplicationError(
                 str(err),
                 type=err.__class__.__name__,
@@ -600,10 +632,11 @@ async def _record_chatgpt_stream_event(
 
     if event_type == "response.output_item.added":
         item = _object_to_dict(getattr(event, "item", None))
+        output_index = cast(int, getattr(event, "output_index", 0))
+        _upsert_output_item(state, output_index=output_index, item=item)
         if item.get("type") != "function_call":
             return
         item_id = cast(str, item.get("id") or "")
-        output_index = cast(int, getattr(event, "output_index", 0))
         state_key = item_id or str(output_index)
         tool_state = _ToolInputStreamState(
             item_id=state_key,
@@ -621,6 +654,12 @@ async def _record_chatgpt_stream_event(
             tool_name=tool_state.tool_name,
             tool_type="function_call",
         )
+        return
+
+    if event_type == "response.output_item.done":
+        item = _object_to_dict(getattr(event, "item", None))
+        output_index = cast(int, getattr(event, "output_index", 0))
+        _upsert_output_item(state, output_index=output_index, item=item)
         return
 
     if event_type == "response.function_call_arguments.delta":
@@ -662,6 +701,11 @@ async def _record_chatgpt_stream_event(
         arguments = cast(str | None, getattr(event, "arguments", None))
         if arguments is not None:
             tool_state.partial_json = arguments
+            _merge_function_call_arguments(
+                state,
+                output_index=output_index,
+                arguments=arguments,
+            )
         input_value = _json_object(tool_state.partial_json)
         await stream.tool_input_completed(
             sequence=state.sequence,
@@ -691,6 +735,44 @@ async def _record_chatgpt_stream_event(
             type=cast(str | None, getattr(event, "code", None)) or "OpenAIStreamError",
             non_retryable=True,
         )
+
+
+def _upsert_output_item(
+    state: _ChatGPTStreamState,
+    *,
+    output_index: int,
+    item: dict[str, Any],
+) -> None:
+    if not item:
+        return
+    if state.output_items is None:
+        state.output_items = []
+    if state.output_item_indices is None:
+        state.output_item_indices = {}
+
+    existing_index = state.output_item_indices.get(output_index)
+    if existing_index is None:
+        state.output_item_indices[output_index] = len(state.output_items)
+        state.output_items.append(_copy_mapping(item))
+        return
+
+    state.output_items[existing_index] = _copy_mapping(item)
+
+
+def _merge_function_call_arguments(
+    state: _ChatGPTStreamState,
+    *,
+    output_index: int,
+    arguments: str,
+) -> None:
+    if state.output_items is None or state.output_item_indices is None:
+        return
+    existing_index = state.output_item_indices.get(output_index)
+    if existing_index is None:
+        return
+    item = state.output_items[existing_index]
+    if item.get("type") == "function_call":
+        item["arguments"] = arguments
 
 
 def _tool_input_state(
@@ -735,12 +817,9 @@ def _record_final_openai_response(response: Any, state: _ChatGPTStreamState) -> 
     output = response_dict.get("output")
     if isinstance(output, list):
         state.output_items = [_copy_mapping(item) for item in output]
-
-
-def _openai_status_is_non_retryable(status_code: int) -> bool:
-    if status_code in {408, 409, 429}:
-        return False
-    return 400 <= status_code < 500
+        state.output_item_indices = {
+            index: index for index in range(len(state.output_items))
+        }
 
 
 def _openai_error_is_context_window_exceeded(err: Any) -> bool:
@@ -1029,21 +1108,15 @@ def _provider_metadata(
     provider_type: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "name": "chatgpt",
-        "type": provider_type,
-        "data": _copy_mapping(data),
-    }
+    return _shared_provider_metadata(
+        provider="chatgpt",
+        provider_type=provider_type,
+        data=data,
+    )
 
 
 def _provider_data(block: Mapping[str, Any]) -> dict[str, Any] | None:
-    provider = block.get("provider")
-    if not isinstance(provider, dict):
-        return None
-    if provider.get("name") != "chatgpt":
-        return None
-    data = provider.get("data")
-    return _copy_mapping(data) if isinstance(data, dict) else None
+    return _shared_provider_data(block, provider="chatgpt")
 
 
 def _response_with_visible_refusal(response: ChatGPTResponse) -> ChatGPTResponse:
@@ -1072,18 +1145,20 @@ def _response_with_visible_refusal(response: ChatGPTResponse) -> ChatGPTResponse
 
 
 def _needs_refusal_fallback(response: ChatGPTResponse) -> bool:
-    if response.stop_reason not in OPENAI_REFUSAL_STOP_REASONS:
-        return False
-    if response.guard_action is not None:
-        return False
-    return not message_text(_chatgpt_message_to_agent_message(response.message)).strip()
+    return needs_refusal_fallback(
+        stop_reason=response.stop_reason,
+        refusal_stop_reasons=OPENAI_REFUSAL_STOP_REASONS,
+        guard_action=response.guard_action,
+        response_text=message_text(_chatgpt_message_to_agent_message(response.message)),
+    )
 
 
 def _refusal_fallback_text(stop_details: dict[str, Any] | None = None) -> str:
-    details = _refusal_details_text(stop_details)
-    if not details:
-        return PROVIDER_REFUSAL_FALLBACK
-    return f"{PROVIDER_REFUSAL_FALLBACK}\n\n{details}"
+    return _shared_refusal_fallback_text(
+        fallback=PROVIDER_REFUSAL_FALLBACK,
+        stop_details=stop_details,
+        details_text=_refusal_details_text(stop_details),
+    )
 
 
 def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
@@ -1101,52 +1176,3 @@ def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
             return f"Incomplete reason: {reason}."
     return ""
 
-
-def _mapping_list(value: Any) -> list[dict[str, Any]]:
-    return [_copy_mapping(item) for item in cast(list[Any], value)]
-
-
-def _copy_optional_mapping(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    return _copy_mapping(value)
-
-
-def _object_to_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(cast(Mapping[str, Any], value))
-    if hasattr(value, "to_dict"):
-        return cast(dict[str, Any], value.to_dict())
-    if hasattr(value, "model_dump"):
-        return cast(
-            dict[str, Any],
-            value.model_dump(mode="json", by_alias=False, exclude_none=True),
-        )
-    return {}
-
-
-def _copy_mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(cast(Mapping[str, Any], value))
-    return _object_to_dict(value)
-
-
-def _json_object(value: str) -> dict[str, Any]:
-    if not value:
-        return {}
-    with suppress(json.JSONDecodeError):
-        decoded = json.loads(value)
-        return _copy_mapping(decoded) if isinstance(decoded, dict) else {}
-    return {}
-
-
-def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:
-    try:
-        encoded = json.dumps(value, sort_keys=True)
-    except TypeError:
-        encoded = repr(value)
-    if len(encoded) <= max_chars:
-        return encoded
-    return encoded[-max_chars:]

@@ -45,6 +45,19 @@ from .errors import (
     counted_tokens_exceed_context,
     status_error_is_context_window_exceeded,
 )
+from ._shared import (
+    copy_mapping as _copy_mapping,
+    copy_optional_mapping as _copy_optional_mapping,
+    guard_response_dict,
+    json_preview as _json_preview,
+    mapping_list as _mapping_list,
+    needs_refusal_fallback,
+    non_retryable_http_status,
+    object_to_dict as _model_to_dict,
+    provider_data as _shared_provider_data,
+    provider_metadata as _shared_provider_metadata,
+    refusal_fallback_text as _shared_refusal_fallback_text,
+)
 from .interface import (
     CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
     AgentProvider,
@@ -53,6 +66,7 @@ from .interface import (
 )
 
 GeminiStopReason = str
+GeminiThinkingLevel = Literal["minimal", "low", "medium", "high"]
 
 DEFAULT_GEMINI_ACTIVITY_OPTIONS = ActivityOptions(
     start_to_close_timeout=timedelta(minutes=10),
@@ -77,6 +91,7 @@ PROVIDER_REFUSAL_FALLBACK = (
 class GeminiThinkingConfig:
     include_thoughts: bool = False
     thinking_budget: int | None = None
+    thinking_level: GeminiThinkingLevel | None = None
 
 
 @dataclass
@@ -389,24 +404,21 @@ def _gemini_response_from_guard_execution(
     *,
     model: str,
 ) -> GeminiResponse:
-    response = execution.response or {
-        "id": "guard:llm",
-        "model": model,
-        "message": {
-            "role": "model",
-            "parts": [
-                {
-                    "text": "The response was blocked by an LLM guard.",
-                }
-            ],
-        },
-        "stop_reason": "SAFETY",
-        "stop_sequence": None,
-        "usage": {},
-    }
-    response["guard_action"] = execution.action.value
-    response["guard_reason"] = execution.reason
-    return _gemini_response_from_dict(response)
+    return _gemini_response_from_dict(
+        guard_response_dict(
+            execution,
+            model=model,
+            message={
+                "role": "model",
+                "parts": [
+                    {
+                        "text": "The response was blocked by an LLM guard.",
+                    }
+                ],
+            },
+            stop_reason="SAFETY",
+        )
+    )
 
 
 @activity.defn
@@ -426,7 +438,10 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
     ]
 
     try:
-        async with genai.Client(api_key=api_key).aio as client:
+        async with genai.Client(
+            api_key=api_key,
+            http_options=_gemini_http_options(),
+        ).aio as client:
             if _should_count_request_tokens(request):
                 await _raise_if_gemini_context_too_large(
                     client,
@@ -450,7 +465,7 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
                 type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
                 non_retryable=True,
             ) from err
-        if _google_status_is_non_retryable(
+        if non_retryable_http_status(
             cast(int | None, getattr(err, "code", None))
         ):
             raise ApplicationError(
@@ -468,6 +483,12 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
         stop_sequence=None,
         usage=state.usage or {},
         stop_details=state.stop_details,
+    )
+
+
+def _gemini_http_options() -> genai_types.HttpOptions:
+    return genai_types.HttpOptions(
+        retry_options=genai_types.HttpRetryOptions(attempts=1),
     )
 
 
@@ -720,12 +741,6 @@ async def _record_gemini_part(
         )
 
 
-def _google_status_is_non_retryable(status_code: int | None) -> bool:
-    if status_code is None or status_code in {408, 409, 429}:
-        return False
-    return 400 <= status_code < 500
-
-
 def _google_error_is_context_window_exceeded(err: Any) -> bool:
     return status_error_is_context_window_exceeded(
         cast(int | None, getattr(err, "code", None)),
@@ -950,21 +965,15 @@ def _provider_metadata(
     provider_type: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "name": "gemini",
-        "type": provider_type,
-        "data": _copy_mapping(data),
-    }
+    return _shared_provider_metadata(
+        provider="gemini",
+        provider_type=provider_type,
+        data=data,
+    )
 
 
 def _provider_data(block: Mapping[str, Any]) -> dict[str, Any] | None:
-    provider = block.get("provider")
-    if not isinstance(provider, dict):
-        return None
-    if provider.get("name") != "gemini":
-        return None
-    data = provider.get("data")
-    return _copy_mapping(data) if isinstance(data, dict) else None
+    return _shared_provider_data(block, provider="gemini")
 
 
 def _gemini_tools_from_agent_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1023,6 +1032,8 @@ def _thinking_config_to_gemini(
     config: dict[str, Any] = {"include_thoughts": thinking.include_thoughts}
     if thinking.thinking_budget is not None:
         config["thinking_budget"] = thinking.thinking_budget
+    if thinking.thinking_level is not None:
+        config["thinking_level"] = thinking.thinking_level
     return config
 
 
@@ -1039,18 +1050,20 @@ def _response_with_visible_refusal(response: GeminiResponse) -> GeminiResponse:
 
 
 def _needs_refusal_fallback(response: GeminiResponse) -> bool:
-    if response.stop_reason not in GEMINI_REFUSAL_STOP_REASONS:
-        return False
-    if response.guard_action is not None:
-        return False
-    return not message_text(_gemini_content_to_agent_message(response.message)).strip()
+    return needs_refusal_fallback(
+        stop_reason=response.stop_reason,
+        refusal_stop_reasons=GEMINI_REFUSAL_STOP_REASONS,
+        guard_action=response.guard_action,
+        response_text=message_text(_gemini_content_to_agent_message(response.message)),
+    )
 
 
 def _refusal_fallback_text(stop_details: dict[str, Any] | None = None) -> str:
-    details = _refusal_details_text(stop_details)
-    if not details:
-        return PROVIDER_REFUSAL_FALLBACK
-    return f"{PROVIDER_REFUSAL_FALLBACK}\n\n{details}"
+    return _shared_refusal_fallback_text(
+        fallback=PROVIDER_REFUSAL_FALLBACK,
+        stop_details=stop_details,
+        details_text=_refusal_details_text(stop_details),
+    )
 
 
 def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
@@ -1062,41 +1075,6 @@ def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
     return ""
 
 
-def _mapping_list(value: Any) -> list[dict[str, Any]]:
-    return [_copy_mapping(item) for item in cast(list[Any], value)]
-
-
-def _copy_optional_mapping(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    return _copy_mapping(value)
-
-
-def _model_to_dict(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
-        return cast(
-            dict[str, Any],
-            value.model_dump(mode="json", by_alias=False, exclude_none=True),
-        )
-    return _copy_mapping(value)
-
-
 def _enum_value(value: Any) -> str:
     raw_value = getattr(value, "value", value)
     return raw_value if isinstance(raw_value, str) else str(raw_value)
-
-
-def _copy_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    return dict(cast(Mapping[str, Any], value))
-
-
-def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:
-    try:
-        encoded = json.dumps(value, sort_keys=True)
-    except TypeError:
-        encoded = repr(value)
-    if len(encoded) <= max_chars:
-        return encoded
-    return encoded[-max_chars:]

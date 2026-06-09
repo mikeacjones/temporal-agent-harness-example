@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Any, Literal, Mapping, cast
+from typing import Any, Literal, cast
 
 from anthropic import APIStatusError, AsyncAnthropic
 from temporalio import activity
@@ -45,6 +44,20 @@ from .errors import (
     counted_context_window_message,
     counted_tokens_exceed_context,
     status_error_is_context_window_exceeded,
+)
+from ._shared import (
+    copy_mapping as _copy_mapping,
+    copy_optional_mapping as _copy_optional_mapping,
+    guard_response_dict,
+    json_preview as _json_preview,
+    mapping_list as _mapping_list,
+    needs_refusal_fallback,
+    non_retryable_http_status,
+    object_to_dict as _object_to_dict,
+    optional_object_to_dict as _optional_object_to_dict,
+    provider_data as _shared_provider_data,
+    provider_metadata as _shared_provider_metadata,
+    refusal_fallback_text as _shared_refusal_fallback_text,
 )
 from .interface import (
     CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
@@ -353,20 +366,17 @@ def _claude_response_from_guard_execution(
     *,
     model: str,
 ) -> ClaudeResponse:
-    response = execution.response or {
-        "id": "guard:llm",
-        "model": model,
-        "message": {
-            "role": "assistant",
-            "content": "The response was blocked by an LLM guard.",
-        },
-        "stop_reason": "refusal",
-        "stop_sequence": None,
-        "usage": {},
-    }
-    response["guard_action"] = execution.action.value
-    response["guard_reason"] = execution.reason
-    return _claude_response_from_dict(response)
+    return _claude_response_from_dict(
+        guard_response_dict(
+            execution,
+            model=model,
+            message={
+                "role": "assistant",
+                "content": "The response was blocked by an LLM guard.",
+            },
+            stop_reason="refusal",
+        )
+    )
 
 
 @activity.defn(name="call_agent_api")
@@ -406,7 +416,7 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
                 type=CONTEXT_WINDOW_EXCEEDED_ERROR_TYPE,
                 non_retryable=True,
             ) from err
-        if _anthropic_status_is_non_retryable(err.status_code):
+        if non_retryable_http_status(err.status_code):
             raise ApplicationError(
                 str(err),
                 type=err.__class__.__name__,
@@ -426,12 +436,6 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
         usage=response.usage.to_dict(),
         stop_details=_optional_object_to_dict(getattr(response, "stop_details", None)),
     )
-
-
-def _anthropic_status_is_non_retryable(status_code: int) -> bool:
-    if status_code in {408, 409, 429}:
-        return False
-    return 400 <= status_code < 500
 
 
 def _anthropic_error_is_context_window_exceeded(err: APIStatusError) -> bool:
@@ -840,41 +844,19 @@ def _provider_metadata(
     provider_type: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "name": "claude",
-        "type": provider_type,
-        "data": _copy_mapping(data),
-    }
+    return _shared_provider_metadata(
+        provider="claude",
+        provider_type=provider_type,
+        data=data,
+    )
 
 
-def _provider_data(block: Mapping[str, Any]) -> dict[str, Any] | None:
-    provider = block.get("provider")
-    if not isinstance(provider, dict):
-        return None
-    if provider.get("name") != "claude":
-        return None
-    data = provider.get("data")
-    return _copy_mapping(data) if isinstance(data, dict) else None
+def _provider_data(block: dict[str, Any]) -> dict[str, Any] | None:
+    return _shared_provider_data(block, provider="claude")
 
 
 def _claude_message_text(message: dict[str, Any]) -> str:
     return message_text(_claude_message_to_agent_message(message))
-
-
-def _mapping_list(value: Any) -> list[dict[str, Any]]:
-    return [_copy_mapping(item) for item in cast(list[Any], value)]
-
-
-def _copy_optional_mapping(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    return _copy_mapping(value)
-
-
-def _copy_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    return dict(cast(Mapping[str, Any], value))
 
 
 def _thinking_request_params(
@@ -917,23 +899,6 @@ def _block_to_dict(block: Any) -> dict[str, Any]:
     return _object_to_dict(block)
 
 
-def _object_to_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(cast(Mapping[str, Any], value))
-    if hasattr(value, "to_dict"):
-        return cast(dict[str, Any], value.to_dict())
-    if hasattr(value, "model_dump"):
-        return cast(dict[str, Any], value.model_dump(mode="json"))
-    return {}
-
-
-def _optional_object_to_dict(value: Any) -> dict[str, Any] | None:
-    result = _object_to_dict(value)
-    return result or None
-
-
 def _response_with_visible_refusal(response: ClaudeResponse) -> ClaudeResponse:
     if not _needs_refusal_fallback(response):
         return response
@@ -948,11 +913,12 @@ def _response_with_visible_refusal(response: ClaudeResponse) -> ClaudeResponse:
 
 
 def _needs_refusal_fallback(response: ClaudeResponse) -> bool:
-    if response.stop_reason != "refusal":
-        return False
-    if response.guard_action is not None:
-        return False
-    return not _claude_message_text(response.message).strip()
+    return needs_refusal_fallback(
+        stop_reason=response.stop_reason,
+        refusal_stop_reasons={"refusal"},
+        guard_action=response.guard_action,
+        response_text=_claude_message_text(response.message),
+    )
 
 
 def _response_display_text(
@@ -970,10 +936,11 @@ def _response_display_text(
 
 
 def _refusal_fallback_text(stop_details: dict[str, Any] | None = None) -> str:
-    details = _refusal_details_text(stop_details)
-    if not details:
-        return PROVIDER_REFUSAL_FALLBACK
-    return f"{PROVIDER_REFUSAL_FALLBACK}\n\n{details}"
+    return _shared_refusal_fallback_text(
+        fallback=PROVIDER_REFUSAL_FALLBACK,
+        stop_details=stop_details,
+        details_text=_refusal_details_text(stop_details),
+    )
 
 
 def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
@@ -1010,12 +977,3 @@ def _text_from_block_dict(block: Any) -> str:
         return refusal if isinstance(refusal, str) else ""
     return ""
 
-
-def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:
-    try:
-        encoded = json.dumps(value, sort_keys=True)
-    except TypeError:
-        encoded = repr(value)
-    if len(encoded) <= max_chars:
-        return encoded
-    return encoded[-max_chars:]

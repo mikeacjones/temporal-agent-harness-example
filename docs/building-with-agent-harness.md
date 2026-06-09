@@ -320,7 +320,7 @@ documentation for the vendored harness, not a generated API reference.
 Module: `agent_harness.agent`
 
 `Agent` is the provider-neutral loop. Most apps construct a provider-specific
-subclass such as `ClaudeAgent`, `ChatGptAgent`, or `GeminiAgent`.
+subclass such as `ClaudeAgent`, `ChatGPTAgent`, or `GeminiAgent`.
 
 Constructor concepts:
 
@@ -397,7 +397,41 @@ Required provider methods:
 | `response_message(...)` | Convert provider response into generic assistant message. |
 | `stop_reason_for_max_turns()` | Stop reason used when `max_turns` is reached. |
 
-Provider convenience classes live under `agent_harness.providers`.
+Provider convenience classes live under `agent_harness.providers`. They keep
+provider-specific options provider-specific while letting workflow code create
+the same generic `Agent` shape:
+
+```python
+from agent_harness.providers.claude import ClaudeAgent, ClaudeThinkingConfig
+from agent_harness.providers.chatgpt import ChatGPTAgent, ChatGPTReasoningConfig
+from agent_harness.providers.gemini import GeminiAgent, GeminiThinkingConfig
+
+claude_agent = ClaudeAgent(
+    system_prompt,
+    tools,
+    model="claude-sonnet-4-5",
+    thinking=ClaudeThinkingConfig(enabled=True),
+)
+
+chatgpt_agent = ChatGPTAgent(
+    system_prompt,
+    tools,
+    model="gpt-5.1",
+    reasoning=ChatGPTReasoningConfig(effort="low"),
+)
+
+gemini_agent = GeminiAgent(
+    system_prompt,
+    tools,
+    model="gemini-2.5-flash",
+    thinking=GeminiThinkingConfig(include_thoughts=True),
+)
+```
+
+Provider conversion methods run in workflow code and must stay deterministic.
+Provider SDK calls run only in the provider activity. See
+[`agent_harness/providers/README.md`](../agent_harness/providers/README.md) for
+the provider implementation lifecycle and checklist.
 
 ### Tool Categories
 
@@ -720,8 +754,8 @@ Register these activities based on the features you use:
 | Feature | Worker registration |
 | --- | --- |
 | Claude provider | `agent_harness.providers.claude.call_agent_api` |
-| ChatGPT provider | ChatGPT provider activity from `providers/chatgpt.py` |
-| Gemini provider | Gemini provider activity from `providers/gemini.py` |
+| ChatGPT provider | `agent_harness.providers.chatgpt.call_chatgpt` |
+| Gemini provider | `agent_harness.providers.gemini.call_gemini` |
 | Tools using `ctx.activity(...)` | `agent_harness.tools.run_tool_activity` |
 | Tool guards or LLM guards using `ctx.activity(...)` | `agent_harness.guards.run_guard_activity` |
 | Durable application settlement events | App-specific activity, not harness-owned |
