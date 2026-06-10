@@ -1,24 +1,23 @@
 from __future__ import annotations
 
 import copy
-import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 from typing import Any, Callable
 
-from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from .activity_options import (
     DEFAULT_ACTIVITY_OPTIONS,
     ActivityOptions,
-    activity_options_with_overrides,
 )
 from .activity_router import ActivityFn, function_ref
 from .guards import GuardActivityRequest, RUN_GUARD_ACTIVITY_NAME
+from .invocation import maybe_await
+from .workflow_activities import execute_routed_activity, record_routed_activity_call
 
 LlmGuardFn = Callable[["LlmGuardContext"], Any]
 
@@ -121,10 +120,26 @@ class LlmGuardContext:
         versioning_intent: VersioningIntent | None = None,
         priority: Priority | None = None,
     ) -> Any:
-        guard_step = self.guard_name if step is None else f"{self.guard_name}:{step}"
-        summary = f"llm_guard:{self.timing.value}:{guard_step}"
-        options = activity_options_with_overrides(
-            self.activity_options,
+        self._activity_count, self._used_unstepped_activity = (
+            record_routed_activity_call(
+                owner=f"LLM guard {self.guard_name}",
+                step=step,
+                activity_count=self._activity_count,
+                used_unstepped_activity=self._used_unstepped_activity,
+            )
+        )
+        return await execute_routed_activity(
+            activity_name=RUN_GUARD_ACTIVITY_NAME,
+            request=GuardActivityRequest(
+                function_ref=function_ref(fn),
+                args=args or {},
+                guard_name=self.guard_name,
+                step=step,
+                stream_id=self.stream_id,
+            ),
+            summary_base=f"llm_guard:{self.timing.value}:{self.guard_name}",
+            step=step,
+            defaults=self.activity_options,
             activity_options=activity_options,
             task_queue=task_queue,
             schedule_to_close_timeout=schedule_to_close_timeout,
@@ -133,43 +148,10 @@ class LlmGuardContext:
             heartbeat_timeout=heartbeat_timeout,
             retry_policy=retry_policy,
             cancellation_type=cancellation_type,
+            activity_id=activity_id,
             versioning_intent=versioning_intent,
             priority=priority,
         )
-        activity_kwargs = options.to_execute_activity_kwargs()
-        if activity_id is not None:
-            activity_kwargs["activity_id"] = activity_id
-
-        self._record_activity_call(step)
-
-        return await workflow.execute_activity(
-            RUN_GUARD_ACTIVITY_NAME,
-            GuardActivityRequest(
-                function_ref=function_ref(fn),
-                args=args or {},
-                guard_name=self.guard_name,
-                step=step,
-                stream_id=self.stream_id,
-            ),
-            summary=summary,
-            **activity_kwargs,
-        )
-
-    def _record_activity_call(self, step: str | None) -> None:
-        if step is None and self._activity_count > 0:
-            raise ValueError(
-                f"LLM guard {self.guard_name} called multiple activities; "
-                "pass step=..."
-            )
-        if step is not None and self._used_unstepped_activity:
-            raise ValueError(
-                f"LLM guard {self.guard_name} mixed an unstepped activity with "
-                "stepped activities"
-            )
-
-        self._activity_count += 1
-        if step is None:
-            self._used_unstepped_activity = True
 
 
 @dataclass
@@ -307,9 +289,7 @@ async def call_llm_guard(
     fn: LlmGuardFn,
     ctx: LlmGuardContext,
 ) -> LlmGuardResult:
-    result = fn(ctx)
-    if inspect.isawaitable(result):
-        result = await result
+    result = await maybe_await(fn(ctx))
 
     if result is None:
         return LlmGuardResult.allow()

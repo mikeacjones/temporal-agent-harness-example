@@ -11,7 +11,7 @@ from temporalio.exceptions import ApplicationError
 
 from agent_harness.streaming import StreamContext
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import ToolActivityContext, ToolContext, ToolResult, tool
+from agent_harness.tools import RoutedActivityContext, ToolContext, ToolResult, tool
 from simple_chat_agent.worker.sandbox.runtime import (
     DEFAULT_TIMEOUT_SECONDS,
     LAMBDA_MAX_TIMEOUT_SECONDS,
@@ -65,7 +65,7 @@ async def _run_python_sandbox_activity(
     timeout_seconds: int,
     *,
     stream: StreamContext,
-    activity_ctx: ToolActivityContext,
+    activity_ctx: RoutedActivityContext,
 ) -> dict[str, Any]:
     timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
     activity_ctx.heartbeat(

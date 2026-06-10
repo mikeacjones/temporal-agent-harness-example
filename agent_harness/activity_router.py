@@ -1,30 +1,34 @@
 import asyncio
 import contextlib
-import inspect
 import importlib
 import time
-from typing import Any, Callable, cast, get_type_hints
+from typing import Any, Callable, cast
 
 from temporalio import activity as temporal_activity
 from temporalio.exceptions import ApplicationError, CancelledError
 
+from .invocation import bind_keyword_arguments, maybe_await
 from .streaming import StreamContext
 
 ActivityFn = Callable[..., Any]
 
 
-class ToolActivityContext:
-    """Activity-runtime context for routed tool activity implementations."""
+class RoutedActivityContext:
+    """Activity-runtime context for functions called through ``ctx.activity``."""
 
     def __init__(
         self,
         *,
-        tool_name: str | None,
+        route_name: str | None = None,
+        route_kind: str = "tool",
+        tool_name: str | None = None,
         step: str | None,
         stream_id: str | None,
     ) -> None:
         info = temporal_activity.info()
-        self.tool_name = tool_name
+        self.route_name = route_name if route_name is not None else tool_name
+        self.route_kind = route_kind
+        self.tool_name = self.route_name
         self.step = step
         self.stream_id = stream_id
         self.activity_id = info.activity_id
@@ -68,8 +72,10 @@ class ToolActivityContext:
 
     def _send(self, reason: str) -> None:
         payload = {
-            "source": "agent_harness.tool_activity",
+            "source": self._heartbeat_source(),
             "reason": reason,
+            "route_kind": self.route_kind,
+            "route_name": self.route_name,
             "tool_name": self.tool_name,
             "step": self.step,
             "stream_id": self.stream_id,
@@ -81,20 +87,29 @@ class ToolActivityContext:
         temporal_activity.heartbeat(payload)
         self._last_sent_at = time.monotonic()
 
+    def _heartbeat_source(self) -> str:
+        if self.route_kind == "tool":
+            return "agent_harness.tool_activity"
+        if self.route_kind == "guard":
+            return "agent_harness.guard_activity"
+        return "agent_harness.routed_activity"
+
+
+ToolActivityContext = RoutedActivityContext
+
 
 async def call_activity(
     fn: ActivityFn,
     args: dict[str, Any],
     stream: StreamContext,
     *,
-    activity_context: ToolActivityContext | None = None,
+    activity_context: RoutedActivityContext | None = None,
 ) -> Any:
     heartbeat_task = _start_auto_heartbeat(activity_context)
     try:
-        result = fn(**_kwargs_for_activity(fn, stream, args, activity_context))
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await maybe_await(
+            fn(**_kwargs_for_activity(fn, stream, args, activity_context))
+        )
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
@@ -147,48 +162,27 @@ def _kwargs_for_activity(
     fn: ActivityFn,
     stream: StreamContext,
     args: dict[str, Any],
-    activity_context: ToolActivityContext | None = None,
+    activity_context: RoutedActivityContext | None = None,
 ) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    type_hints = get_type_hints(fn)
-    kwargs: dict[str, Any] = {}
-    consumed_args: set[str] = set()
+    special_values: dict[Any, Any] = {StreamContext: stream}
+    if activity_context is not None:
+        special_values[RoutedActivityContext] = activity_context
 
-    for name, parameter in signature.parameters.items():
-        if name in ("self", "cls"):
-            continue
-
-        annotation = type_hints.get(name, parameter.annotation)
-        if annotation is StreamContext:
-            kwargs[name] = stream
-            continue
-
-        if annotation is ToolActivityContext:
-            if activity_context is None:
-                raise TypeError(
-                    f"{fn.__name__}.{name} requires a tool activity context"
-                )
-            kwargs[name] = activity_context
-            continue
-
-        if name in args:
-            kwargs[name] = args[name]
-            consumed_args.add(name)
-        elif parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"Missing required activity argument {fn.__name__}.{name}")
-
-    unexpected_args = set(args) - consumed_args
-    if unexpected_args:
-        names = ", ".join(sorted(unexpected_args))
-        raise TypeError(
-            f"Unexpected activity argument(s) for {fn.__name__}: {names}"
-        )
-
-    return kwargs
+    return bind_keyword_arguments(
+        fn,
+        args,
+        special_values=special_values,
+        missing_special_errors={
+            RoutedActivityContext: (
+                "{function}.{parameter} requires a routed activity context"
+            ),
+        },
+        argument_label="activity",
+    )
 
 
 def _start_auto_heartbeat(
-    activity_context: ToolActivityContext | None,
+    activity_context: RoutedActivityContext | None,
 ) -> asyncio.Task[None] | None:
     if activity_context is None or activity_context.heartbeat_timeout is None:
         return None
@@ -209,7 +203,7 @@ def _start_auto_heartbeat(
 
 
 async def _auto_heartbeat_loop(
-    activity_context: ToolActivityContext,
+    activity_context: RoutedActivityContext,
     interval_seconds: float,
     activity_task: asyncio.Task[Any],
 ) -> None:

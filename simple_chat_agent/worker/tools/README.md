@@ -128,12 +128,15 @@ inside the sandbox.
 
 Long-running tool activities should set `heartbeat_timeout`. The generic router
 will send conservative liveness heartbeats, and activity implementations can
-accept a `ToolActivityContext` parameter to send meaningful progress details:
+accept a `RoutedActivityContext` parameter to send meaningful progress details:
 
 ```python
+from agent_harness.activity_router import RoutedActivityContext
+
+
 async def _activity(
     *,
-    activity_ctx: ToolActivityContext,
+    activity_ctx: RoutedActivityContext,
 ) -> dict:
     activity_ctx.heartbeat({"phase": "loading"})
     ...

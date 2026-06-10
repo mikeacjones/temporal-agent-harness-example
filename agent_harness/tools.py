@@ -10,17 +10,16 @@ from typing import Any, Awaitable, Callable, Literal, cast, get_type_hints
 
 from pydantic import create_model
 from temporalio import activity as temporal_activity
-from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from .activity_options import (
     DEFAULT_ACTIVITY_OPTIONS,
     ActivityOptions,
-    activity_options_with_overrides,
 )
 from .activity_router import (
     ActivityFn,
+    RoutedActivityContext,
     ToolActivityContext,
     call_activity,
     function_ref,
@@ -29,12 +28,16 @@ from .activity_router import (
 from .guards import (
     GuardDef,
     GuardFn,
-    GuardSet,
     GuardPolicy,
+    GuardSet,
     GuardTiming,
+    guard,
+    guard_metadata,
 )
+from .invocation import bind_keyword_arguments, maybe_await
 from .streaming import StreamContext
 from .tool_types import ToolCategory, normalize_tool_category
+from .workflow_activities import execute_routed_activity, record_routed_activity_call
 
 ToolFn = Callable[..., Awaitable["ToolResult"]]
 DynamicToolFn = Callable[["ToolContext", dict[str, Any]], Awaitable["ToolResult"]]
@@ -43,7 +46,6 @@ ToolParam = dict
 ToolArgsMode = Literal["signature", "raw"]
 RUN_TOOL_ACTIVITY_NAME = "agent_harness.run_tool_activity"
 _TOOL_METADATA_ATTR = "__agent_harness_tool__"
-_GUARD_METADATA_ATTR = "__agent_harness_guard__"
 
 
 @dataclass(frozen=True)
@@ -53,12 +55,6 @@ class ToolMetadata:
     tool_type: ToolCategory
     pre_guards: tuple[GuardReference, ...] = ()
     post_guards: tuple[GuardReference, ...] = ()
-
-
-@dataclass(frozen=True)
-class GuardMetadata:
-    name: str
-    fulfills: ToolCategory | Iterable[ToolCategory]
 
 
 def tool(
@@ -81,18 +77,6 @@ def tool(
                 post_guards=tuple(post_guards or ()),
             ),
         )
-        return fn
-
-    return decorator
-
-
-def guard(
-    *,
-    name: str,
-    fulfills: ToolCategory | Iterable[ToolCategory],
-):
-    def decorator(fn: GuardFn) -> GuardFn:
-        setattr(fn, _GUARD_METADATA_ATTR, GuardMetadata(name=name, fulfills=fulfills))
         return fn
 
     return decorator
@@ -142,9 +126,26 @@ class ToolContext:
         versioning_intent: VersioningIntent | None = None,
         priority: Priority | None = None,
     ) -> Any:
-        summary = self.tool_name if step is None else f"{self.tool_name}:{step}"
-        options = activity_options_with_overrides(
-            self.activity_options,
+        self._activity_count, self._used_unstepped_activity = (
+            record_routed_activity_call(
+                owner=f"Tool {self.tool_name}",
+                step=step,
+                activity_count=self._activity_count,
+                used_unstepped_activity=self._used_unstepped_activity,
+            )
+        )
+        return await execute_routed_activity(
+            activity_name=RUN_TOOL_ACTIVITY_NAME,
+            request=ToolActivityRequest(
+                function_ref=function_ref(fn),
+                args=args or {},
+                tool_name=self.tool_name,
+                step=step,
+                stream_id=self.stream_id,
+            ),
+            summary_base=self.tool_name,
+            step=step,
+            defaults=self.activity_options,
             activity_options=activity_options,
             task_queue=task_queue,
             schedule_to_close_timeout=schedule_to_close_timeout,
@@ -153,43 +154,10 @@ class ToolContext:
             heartbeat_timeout=heartbeat_timeout,
             retry_policy=retry_policy,
             cancellation_type=cancellation_type,
+            activity_id=activity_id,
             versioning_intent=versioning_intent,
             priority=priority,
         )
-        activity_kwargs = options.to_execute_activity_kwargs()
-        if activity_id is not None:
-            activity_kwargs["activity_id"] = activity_id
-
-        self._record_activity_call(step)
-
-        return await workflow.execute_activity(
-            RUN_TOOL_ACTIVITY_NAME,
-            ToolActivityRequest(
-                function_ref=function_ref(fn),
-                args=args or {},
-                tool_name=self.tool_name,
-                step=step,
-                stream_id=self.stream_id,
-            ),
-            summary=summary,
-            **activity_kwargs,
-        )
-
-    def _record_activity_call(self, step: str | None) -> None:
-        if step is None and self._activity_count > 0:
-            raise ValueError(
-                f"Tool {self.tool_name} called multiple activities; pass step=..."
-            )
-        if step is not None and self._used_unstepped_activity:
-            raise ValueError(
-                f"Tool {self.tool_name} mixed an unstepped activity with stepped "
-                "activities"
-            )
-
-        self._activity_count += 1
-        if step is None:
-            self._used_unstepped_activity = True
-
 
 @dataclass
 class ToolResult:
@@ -217,9 +185,25 @@ class ToolDef:
 
 
 class ToolSet:
-    def __init__(self, *, guard_policy: GuardPolicy | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        guard_policy: GuardPolicy | None = None,
+        tools: Iterable[ToolFn] | None = None,
+        guards: Iterable[GuardFn] | None = None,
+        providers: Iterable[object] | None = None,
+        mcp_providers: Iterable[object] | None = None,
+    ) -> None:
         self._tool_registry: dict[str, ToolDef] = {}
         self._guards = GuardSet(guard_policy=guard_policy)
+        if guards is not None:
+            self.add_guard(*guards)
+        for provider in providers or ():
+            self.add_provider(provider)
+        for provider in mcp_providers or ():
+            self.add_mcp_provider(provider)
+        if tools is not None:
+            self.add_tool(*tools)
 
     def tool_names(self) -> list[str]:
         return list(self._tool_registry)
@@ -245,7 +229,7 @@ class ToolSet:
         methods = list(_provider_methods(provider))
 
         for method in methods:
-            metadata = _guard_metadata(method)
+            metadata = guard_metadata(method)
             if metadata is None:
                 continue
             guard_defs[metadata.name] = self._register_guard(method)
@@ -301,11 +285,11 @@ class ToolSet:
 
     def add_guard(self, *guards: GuardFn) -> None:
         for fn in guards:
-            metadata = _guard_metadata(fn)
+            metadata = guard_metadata(fn)
             if metadata is None:
                 raise ValueError(
                     f"Guard {fn.__name__} is missing @guard metadata; decorate it "
-                    "with agent_harness.tools.guard before registering it"
+                    "with agent_harness.guards.guard before registering it"
                 )
             self._register_guard(fn)
 
@@ -463,11 +447,11 @@ class ToolSet:
         except ValueError:
             pass
 
-        metadata = _guard_metadata(fn)
+        metadata = guard_metadata(fn)
         if metadata is None:
             raise ValueError(
                 f"Guard {fn.__name__} is not registered; decorate it with "
-                "agent_harness.tools.guard before using it in a tool"
+                "agent_harness.guards.guard before using it in a tool"
             )
 
         registered_guard = self._guards.guard(
@@ -483,9 +467,9 @@ def _provider_methods(provider: object) -> Iterable[Callable[..., Any]]:
         for name, value in vars(cls).items():
             if name in seen:
                 continue
-            seen.add(name)
-            if _tool_metadata(value) is None and _guard_metadata(value) is None:
+            if _tool_metadata(value) is None and guard_metadata(value) is None:
                 continue
+            seen.add(name)
             method = getattr(provider, name)
             if not callable(method):
                 raise TypeError(
@@ -499,13 +483,6 @@ def _tool_metadata(fn: Any) -> ToolMetadata | None:
     return cast(
         ToolMetadata | None,
         _decorator_metadata(fn, _TOOL_METADATA_ATTR),
-    )
-
-
-def _guard_metadata(fn: Any) -> GuardMetadata | None:
-    return cast(
-        GuardMetadata | None,
-        _decorator_metadata(fn, _GUARD_METADATA_ATTR),
     )
 
 
@@ -578,7 +555,8 @@ async def run_tool_activity(request: ToolActivityRequest) -> Any:
         step=request.step,
     )
     activity_context = ToolActivityContext(
-        tool_name=request.tool_name,
+        route_kind="tool",
+        route_name=request.tool_name,
         step=request.step,
         stream_id=request.stream_id,
     )
@@ -594,47 +572,21 @@ async def _call_tool(
     fn: ToolFn, ctx: ToolContext, args: dict[str, Any]
 ) -> ToolResult:
     kwargs = _kwargs_for_tool(fn, ctx, args)
-    result = fn(**kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    return await maybe_await(fn(**kwargs))
 
 
 async def _call_dynamic_tool(
     fn: DynamicToolFn, ctx: ToolContext, args: dict[str, Any]
 ) -> ToolResult:
-    result = fn(ctx, args)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    return await maybe_await(fn(ctx, args))
 
 
 def _kwargs_for_tool(
     fn: ToolFn, ctx: ToolContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    type_hints = get_type_hints(fn)
-    kwargs: dict[str, Any] = {}
-    consumed_args: set[str] = set()
-
-    for name, parameter in signature.parameters.items():
-        if name in ("self", "cls"):
-            continue
-
-        annotation = type_hints.get(name, parameter.annotation)
-        if annotation is ToolContext:
-            kwargs[name] = ctx
-            continue
-
-        if name in args:
-            kwargs[name] = args[name]
-            consumed_args.add(name)
-        elif parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"Missing required tool argument {fn.__name__}.{name}")
-
-    unexpected_args = set(args) - consumed_args
-    if unexpected_args:
-        names = ", ".join(sorted(unexpected_args))
-        raise TypeError(f"Unexpected tool argument(s) for {fn.__name__}: {names}")
-
-    return kwargs
+    return bind_keyword_arguments(
+        fn,
+        args,
+        special_values={ToolContext: ctx},
+        argument_label="tool",
+    )

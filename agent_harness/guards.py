@@ -1,23 +1,27 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable, get_type_hints
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from temporalio import activity as temporal_activity
-from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from .activity_options import (
     DEFAULT_ACTIVITY_OPTIONS,
     ActivityOptions,
-    activity_options_with_overrides,
 )
-from .activity_router import ActivityFn, call_activity, function_ref, resolve_function_ref
+from .activity_router import (
+    ActivityFn,
+    RoutedActivityContext,
+    call_activity,
+    function_ref,
+    resolve_function_ref,
+)
+from .invocation import bind_keyword_arguments, maybe_await
 from .streaming import StreamContext
 from .tool_types import (
     ToolCategory,
@@ -25,12 +29,15 @@ from .tool_types import (
     normalize_tool_category,
     tool_category_set,
 )
+from .workflow_activities import execute_routed_activity
+from .workflow_activities import record_routed_activity_call
 
 if TYPE_CHECKING:
     from .tools import ToolResult
 
 GuardFn = Callable[..., Any]
 RUN_GUARD_ACTIVITY_NAME = "agent_harness.run_guard_activity"
+_GUARD_METADATA_ATTR = "__agent_harness_guard__"
 
 
 class GuardTiming(StrEnum):
@@ -39,11 +46,66 @@ class GuardTiming(StrEnum):
 
 
 @dataclass(frozen=True)
+class GuardMetadata:
+    name: str
+    fulfills: ToolCategory | Iterable[ToolCategory]
+
+
+def guard(
+    *,
+    name: str,
+    fulfills: ToolCategory | Iterable[ToolCategory],
+):
+    def decorator(fn: GuardFn) -> GuardFn:
+        setattr(fn, _GUARD_METADATA_ATTR, GuardMetadata(name=name, fulfills=fulfills))
+        return fn
+
+    return decorator
+
+
+def guard_metadata(fn: Any) -> GuardMetadata | None:
+    return cast(
+        GuardMetadata | None,
+        _decorator_metadata(fn, _GUARD_METADATA_ATTR),
+    )
+
+
+@dataclass(frozen=True)
 class GuardPolicy:
     required_pre: frozenset[ToolCategory] = frozenset(
         {str(ToolType.ADMIN), str(ToolType.MUTATING), str(ToolType.MCP)}
     )
     required_post: frozenset[ToolCategory] = frozenset()
+
+    @classmethod
+    def require(
+        cls,
+        *,
+        pre: ToolCategory | object | Iterable[ToolCategory | object] = (),
+        post: ToolCategory | object | Iterable[ToolCategory | object] = (),
+    ) -> "GuardPolicy":
+        return cls(
+            required_pre=_optional_category_set(pre),
+            required_post=_optional_category_set(post),
+        )
+
+    @classmethod
+    def require_pre(
+        cls,
+        *categories: ToolCategory | object,
+    ) -> "GuardPolicy":
+        return cls(required_pre=tool_category_set(categories), required_post=frozenset())
+
+    @classmethod
+    def require_post(
+        cls,
+        *categories: ToolCategory | object,
+    ) -> "GuardPolicy":
+        return cls(required_pre=frozenset(), required_post=tool_category_set(categories))
+
+    @classmethod
+    def allow_all(cls) -> "GuardPolicy":
+        return cls(required_pre=frozenset(), required_post=frozenset())
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -96,9 +158,26 @@ class GuardContext:
         versioning_intent: VersioningIntent | None = None,
         priority: Priority | None = None,
     ) -> Any:
-        summary = self.guard_name if step is None else f"{self.guard_name}:{step}"
-        options = activity_options_with_overrides(
-            self.activity_options,
+        self._activity_count, self._used_unstepped_activity = (
+            record_routed_activity_call(
+                owner=f"Guard {self.guard_name}",
+                step=step,
+                activity_count=self._activity_count,
+                used_unstepped_activity=self._used_unstepped_activity,
+            )
+        )
+        return await execute_routed_activity(
+            activity_name=RUN_GUARD_ACTIVITY_NAME,
+            request=GuardActivityRequest(
+                function_ref=function_ref(fn),
+                args=args or {},
+                guard_name=self.guard_name,
+                step=step,
+                stream_id=self.stream_id,
+            ),
+            summary_base=self.guard_name,
+            step=step,
+            defaults=self.activity_options,
             activity_options=activity_options,
             task_queue=task_queue,
             schedule_to_close_timeout=schedule_to_close_timeout,
@@ -107,42 +186,10 @@ class GuardContext:
             heartbeat_timeout=heartbeat_timeout,
             retry_policy=retry_policy,
             cancellation_type=cancellation_type,
+            activity_id=activity_id,
             versioning_intent=versioning_intent,
             priority=priority,
         )
-        activity_kwargs = options.to_execute_activity_kwargs()
-        if activity_id is not None:
-            activity_kwargs["activity_id"] = activity_id
-
-        self._record_activity_call(step)
-
-        return await workflow.execute_activity(
-            RUN_GUARD_ACTIVITY_NAME,
-            GuardActivityRequest(
-                function_ref=function_ref(fn),
-                args=args or {},
-                guard_name=self.guard_name,
-                step=step,
-                stream_id=self.stream_id,
-            ),
-            summary=summary,
-            **activity_kwargs,
-        )
-
-    def _record_activity_call(self, step: str | None) -> None:
-        if step is None and self._activity_count > 0:
-            raise ValueError(
-                f"Guard {self.guard_name} called multiple activities; pass step=..."
-            )
-        if step is not None and self._used_unstepped_activity:
-            raise ValueError(
-                f"Guard {self.guard_name} mixed an unstepped activity with stepped "
-                "activities"
-            )
-
-        self._activity_count += 1
-        if step is None:
-            self._used_unstepped_activity = True
 
 
 @dataclass
@@ -202,7 +249,7 @@ class GuardSet:
         except KeyError as err:
             raise ValueError(
                 f"Guard {guard.__name__} is not registered; decorate it with "
-                "agent_harness.tools.guard and register it before using it in a tool"
+                "agent_harness.guards.guard and register it before using it in a tool"
             ) from err
 
     def get_guard(self, name: str) -> GuardDef:
@@ -271,14 +318,23 @@ async def run_guard_activity(request: GuardActivityRequest) -> Any:
         tool_name=request.guard_name,
         step=request.step,
     )
-    return await call_activity(fn, request.args, stream)
+    activity_context = RoutedActivityContext(
+        route_kind="guard",
+        route_name=request.guard_name,
+        step=request.step,
+        stream_id=request.stream_id,
+    )
+    return await call_activity(
+        fn,
+        request.args,
+        stream,
+        activity_context=activity_context,
+    )
 
 
 async def call_guard(fn: GuardFn, ctx: GuardContext) -> GuardResult:
     kwargs = _kwargs_for_guard(fn, ctx)
-    result = fn(**kwargs)
-    if inspect.isawaitable(result):
-        result = await result
+    result = await maybe_await(fn(**kwargs))
 
     if not isinstance(result, GuardResult):
         raise TypeError(f"Guard {fn.__name__} must return GuardResult")
@@ -290,6 +346,20 @@ def tool_type_set(
     fulfills: ToolCategory | Iterable[ToolCategory],
 ) -> frozenset[ToolCategory]:
     return tool_category_set(fulfills)
+
+
+def _optional_category_set(
+    values: ToolCategory | object | Iterable[ToolCategory | object],
+) -> frozenset[ToolCategory]:
+    if isinstance(values, str):
+        return tool_category_set(values)
+    try:
+        values_list = list(values)
+    except TypeError:
+        return tool_category_set(values)
+    if not values_list:
+        return frozenset()
+    return tool_category_set(values_list)
 
 
 def guard_failure_payload(
@@ -304,20 +374,19 @@ def guard_failure_payload(
 
 
 def _kwargs_for_guard(fn: GuardFn, ctx: GuardContext) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    type_hints = get_type_hints(fn)
-    kwargs: dict[str, Any] = {}
+    return bind_keyword_arguments(
+        fn,
+        special_values={GuardContext: ctx},
+        argument_label="guard",
+    )
 
-    for name, parameter in signature.parameters.items():
-        if name in ("self", "cls"):
-            continue
 
-        annotation = type_hints.get(name, parameter.annotation)
-        if annotation is GuardContext:
-            kwargs[name] = ctx
-            continue
+def _decorator_metadata(fn: Any, attr: str) -> Any:
+    metadata = getattr(fn, attr, None)
+    if metadata is not None:
+        return metadata
 
-        if parameter.default is inspect.Parameter.empty:
-            raise TypeError(f"Missing required guard argument {fn.__name__}.{name}")
-
-    return kwargs
+    wrapped = getattr(fn, "__func__", None)
+    if wrapped is None:
+        return None
+    return getattr(wrapped, attr, None)
