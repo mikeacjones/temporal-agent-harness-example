@@ -97,6 +97,13 @@ class QueuedChatMessage:
 
 
 @dataclass
+class ActiveTurn:
+    message: str | None
+    attachments: list[AttachmentRef]
+    settle_after_revision: int
+
+
+@dataclass
 class ChatSignalRequest:
     message: str
     attachments: list[AttachmentRef] = field(default_factory=list)
@@ -573,6 +580,41 @@ class SimpleChatWorkflow:
 
     @workflow.run
     async def run(self, chat_input: SimpleChatInput) -> None:
+        resume_agent_state = self._restore_from_input(chat_input)
+        self._agent = self._build_agent(chat_input)
+
+        # Idle state restores the compacted context before waiting for a new
+        # user message. Hot resume state is passed into the agent run below.
+        if (
+            chat_input.agent_context_state is not None
+            and chat_input.agent_state is None
+        ):
+            self._agent.restore_idle_state(chat_input.agent_context_state)
+        self._status = "idle"
+        self._record_state_change()
+
+        while True:
+            if resume_agent_state is None:
+                if not await self._wait_for_next_queued_message(chat_input):
+                    return
+                turn = self._activate_next_queued_message()
+            else:
+                turn = ActiveTurn(
+                    message=None,
+                    attachments=[],
+                    settle_after_revision=self._active_settle_after_revision,
+                )
+
+            continue_as_new_state = await self._run_active_turn(
+                chat_input,
+                turn,
+                resume_agent_state,
+            )
+            resume_agent_state = None
+            if continue_as_new_state is not None:
+                await self._continue_as_new(chat_input, continue_as_new_state)
+
+    def _restore_from_input(self, chat_input: SimpleChatInput) -> AgentState | None:
         self._run_started_at = workflow.now()
         self._last_touched_at = _parse_datetime(chat_input.last_touched_at)
         if self._last_touched_at is None:
@@ -580,14 +622,18 @@ class SimpleChatWorkflow:
             self._touched_this_run = True
         else:
             self._touched_this_run = self._last_touched_at > self._run_started_at
+
         self._pending_messages = list(chat_input.pending_messages)
         if self._pending_messages or chat_input.agent_state is not None:
             self._last_touched_at = self._run_started_at
             self._touched_this_run = True
+
         self._active_message_index = chat_input.active_message_index
         self._active_settle_after_revision = chat_input.active_settle_after_revision
         self._active_message = None
-        self._agent_context_state = chat_input.agent_context_state or chat_input.agent_state
+        self._agent_context_state = (
+            chat_input.agent_context_state or chat_input.agent_state
+        )
         self._approval_memory = set(chat_input.approval_memory)
         self._approval_counter = chat_input.approval_counter
         self._state_revision = chat_input.state_revision
@@ -607,6 +653,9 @@ class SimpleChatWorkflow:
                 mcp_servers=chat_input.mcp_servers,
             )
         )
+        return chat_input.agent_state
+
+    def _build_agent(self, chat_input: SimpleChatInput) -> ClaudeAgent:
         tools = build_tools(
             available_tool_names=lambda: self._available_tool_names,
             user_ref=lambda: self._user_ref,
@@ -617,7 +666,7 @@ class SimpleChatWorkflow:
             default_model=lambda: chat_input.model,
             request_mutating_tool_approval=self._request_tool_approval,
         )
-        self._agent = ClaudeAgent(
+        return ClaudeAgent(
             chat_input.system_prompt,
             tools,
             model=chat_input.model,
@@ -625,115 +674,131 @@ class SimpleChatWorkflow:
             max_context_tokens=chat_input.max_context_tokens,
             thinking=chat_input.thinking,
             stream_id=self._stream_id,
-            pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,
-            post_llm_guards=[good_place_post_guard] if chat_input.good_place_censor else None,
+            pre_llm_guards=(
+                [good_place_pre_guard] if chat_input.good_place_censor else None
+            ),
+            post_llm_guards=(
+                [good_place_post_guard] if chat_input.good_place_censor else None
+            ),
         )
-        # Idle state restores the compacted context before waiting for a new
-        # user message. Hot resume state is passed into the agent run below.
-        if chat_input.agent_context_state is not None and chat_input.agent_state is None:
-            self._agent.restore_idle_state(chat_input.agent_context_state)
+
+    async def _wait_for_next_queued_message(
+        self,
+        chat_input: SimpleChatInput,
+    ) -> bool:
+        while True:
+            if await self._finish_or_checkpoint_if_needed(chat_input):
+                return False
+            if self._pending_messages:
+                return True
+
+            try:
+                await workflow.wait_condition(
+                    lambda: self._delete_requested
+                    or len(self._pending_messages) > 0
+                    or self._runtime_checkpoint_ready(),
+                    timeout=self._time_until_checkpoint(),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+            if self._delete_requested:
+                return False
+
+    async def _finish_or_checkpoint_if_needed(
+        self,
+        chat_input: SimpleChatInput,
+    ) -> bool:
+        if not workflow.all_handlers_finished():
+            return False
+        if self._runtime_checkpoint_requested():
+            await self._continue_as_new(chat_input, None)
+        if self._checkpoint_due():
+            if self._touched_this_run:
+                await self._continue_as_new(chat_input, None)
+            return True
+        return False
+
+    def _runtime_checkpoint_ready(self) -> bool:
+        return workflow.all_handlers_finished() and self._runtime_checkpoint_requested()
+
+    def _activate_next_queued_message(self) -> ActiveTurn:
+        queued_message = self._pending_messages.pop(0)
+        self._active_message_index = queued_message.transcript_index
+        self._active_message = queued_message
+        self._active_settle_after_revision = queued_message.settle_after_revision
+        self._apply_queued_tool_config(queued_message)
+        return ActiveTurn(
+            message=queued_message.content,
+            attachments=list(queued_message.attachments),
+            settle_after_revision=queued_message.settle_after_revision,
+        )
+
+    async def _run_active_turn(
+        self,
+        chat_input: SimpleChatInput,
+        turn: ActiveTurn,
+        resume_agent_state: AgentState | None,
+    ) -> AgentState | None:
+        self._status = "responding"
+        self._record_state_change()
+        should_emit_settled = False
+        continue_as_new_state: AgentState | None = None
+
+        try:
+            result = await self._run_agent_turn(
+                message=turn.message,
+                attachments=turn.attachments,
+                state=resume_agent_state,
+                max_turns=chat_input.max_turns,
+            )
+            await self._record_effective_user_prompt_if_needed(
+                chat_input.good_place_censor
+            )
+            if result.needs_continue_as_new:
+                continue_as_new_state = result.continuation_state
+                self._agent_context_state = continue_as_new_state
+            else:
+                self._agent_context_state = await self._agent.compacted_state()
+            self._record_latest_rendered_message_change()
+            should_emit_settled = True
+        except UserFacingAgentError as err:
+            self._record_system_message(err.message)
+            should_emit_settled = True
+        finally:
+            self._clear_active_turn()
+            if should_emit_settled:
+                await self._emit_turn_settled(turn.settle_after_revision)
+
+        return continue_as_new_state
+
+    async def _record_effective_user_prompt_if_needed(self, enabled: bool) -> None:
+        if not enabled or self._active_message_index is None or self._agent is None:
+            return
+
+        effective = await self._agent.effective_user_prompt()
+        if effective is None:
+            return
+
+        self._record_transcript_change(
+            self._active_message_index,
+            ChatMessage(
+                role="user",
+                content=effective,
+                attachments=list(
+                    self._active_message.attachments
+                    if self._active_message is not None
+                    else []
+                ),
+            ),
+        )
+
+    def _clear_active_turn(self) -> None:
+        self._active_message_index = None
+        self._active_message = None
+        self._active_settle_after_revision = 0
         self._status = "idle"
         self._record_state_change()
-        resume_agent_state = chat_input.agent_state
-
-        while True:
-            settle_after_revision = self._active_settle_after_revision
-            if resume_agent_state is None:
-                if (
-                    workflow.all_handlers_finished()
-                    and self._runtime_checkpoint_requested()
-                ):
-                    await self._continue_as_new(chat_input, None)
-                if self._checkpoint_due() and workflow.all_handlers_finished():
-                    if self._touched_this_run:
-                        await self._continue_as_new(chat_input, None)
-                    return
-                try:
-                    await workflow.wait_condition(
-                        lambda: self._delete_requested
-                        or len(self._pending_messages) > 0
-                        or (
-                            workflow.all_handlers_finished()
-                            and self._runtime_checkpoint_requested()
-                        ),
-                        timeout=self._time_until_checkpoint(),
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                if self._delete_requested:
-                    return
-                if (
-                    workflow.all_handlers_finished()
-                    and self._runtime_checkpoint_requested()
-                ):
-                    await self._continue_as_new(chat_input, None)
-                if self._checkpoint_due() and workflow.all_handlers_finished():
-                    if self._touched_this_run:
-                        await self._continue_as_new(chat_input, None)
-                    return
-                if not self._pending_messages:
-                    continue
-                queued_message = self._pending_messages.pop(0)
-                message = queued_message.content
-                attachments = queued_message.attachments
-                self._active_message_index = queued_message.transcript_index
-                self._active_message = queued_message
-                settle_after_revision = queued_message.settle_after_revision
-                self._active_settle_after_revision = settle_after_revision
-                self._apply_queued_tool_config(queued_message)
-            else:
-                message = None
-                attachments = []
-            self._status = "responding"
-            self._record_state_change()
-            should_emit_settled = False
-            continue_as_new_state: AgentState | None = None
-            try:
-                result = await self._run_agent_turn(
-                    message=message,
-                    attachments=attachments,
-                    state=resume_agent_state,
-                    max_turns=chat_input.max_turns,
-                )
-                resume_agent_state = None
-                if (
-                    chat_input.good_place_censor
-                    and self._active_message_index is not None
-                ):
-                    effective = await self._agent.effective_user_prompt()
-                    if effective is not None:
-                        self._record_transcript_change(
-                            self._active_message_index,
-                            ChatMessage(
-                                role="user",
-                                content=effective,
-                                attachments=list(
-                                    self._active_message.attachments
-                                    if self._active_message is not None
-                                    else []
-                                ),
-                            ),
-                        )
-                if result.needs_continue_as_new:
-                    continue_as_new_state = result.continuation_state
-                    self._agent_context_state = continue_as_new_state
-                else:
-                    self._agent_context_state = await self._agent.compacted_state()
-                self._record_latest_rendered_message_change()
-                should_emit_settled = True
-            except UserFacingAgentError as err:
-                self._record_system_message(err.message)
-                should_emit_settled = True
-            finally:
-                self._active_message_index = None
-                self._active_message = None
-                self._active_settle_after_revision = 0
-                self._status = "idle"
-                self._record_state_change()
-                if should_emit_settled:
-                    await self._emit_turn_settled(settle_after_revision)
-            if continue_as_new_state is not None:
-                await self._continue_as_new(chat_input, continue_as_new_state)
 
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()

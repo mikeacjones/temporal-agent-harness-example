@@ -80,6 +80,17 @@ The workflow deliberately distinguishes two agent continuation states:
 That distinction lets an agent run continue across workflow runs without
 pretending it received a new user message.
 
+The `run` method is organized around four steps:
+
+1. restore carried workflow and agent state;
+2. wait for a queued message or a safe checkpoint point;
+3. activate one turn and run the agent;
+4. clear active state, emit settlement, and continue as new when requested.
+
+Signal handlers should continue to stay small: update workflow state, enqueue
+work, or record approval decisions. The main loop reacts to that state and is
+the place that schedules provider/tool activity work.
+
 ## UserChatsWorkflow
 
 `UserChatsWorkflow` is an entity workflow keyed by user id. It creates chat
@@ -120,7 +131,7 @@ The worker registers three broad activity categories:
 
 Workflow code should schedule activities with explicit timeouts. Long-running
 activities should set `heartbeat_timeout` and either rely on the generic router
-auto-heartbeat or call `ToolActivityContext.heartbeat(...)` at useful progress
+auto-heartbeat or call `RoutedActivityContext.heartbeat(...)` at useful progress
 points.
 
 ## Worker Versioning
