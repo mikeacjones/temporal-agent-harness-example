@@ -45,12 +45,9 @@ class BasicFileAgentWorkflow:
     @workflow.run
     async def run(self, request: BasicFileAgentRequest) -> BasicFileAgentResult:
         tools = ToolSet(
-            guard_policy=GuardPolicy(
-                required_pre=frozenset({BasicFileToolType.WRITE_FILE}),
-                required_post=frozenset(),
-            )
+            guard_policy=GuardPolicy.require_pre(BasicFileToolType.WRITE_FILE),
+            tools=[read_file, write_file],
         )
-        tools.add_tool(read_file, write_file)
 
         agent = ClaudeAgent(
             request.instructions,

@@ -9,6 +9,11 @@ The workflow receives one prompt plus system instructions, lets the model call
 `read_file` and `write_file`, and returns the final assistant message as the
 workflow result.
 
+Read it in this order when using it as a template: `tool_types.py`,
+`guards.py`, `tools.py`, `workflow.py`, then `worker.py`. That shows the app's
+category vocabulary, policy, side-effect boundaries, workflow construction, and
+worker registration without the larger chat application's product code.
+
 ## Files
 
 | File | Purpose |
@@ -56,9 +61,11 @@ Override that with `BASIC_FILE_AGENT_WORKSPACE`.
 
 ## What It Intentionally Leaves Out
 
-This example defines custom `ReadFile` and `WriteFile` tool categories in
-`tool_types.py`. Its guard policy requires a pre-guard for `WriteFile`, and
-`write_file` attaches `approve_file_write`.
+This example defines custom `READ_FILE` and `WRITE_FILE` tool categories in
+`tool_types.py`. Its workflow uses
+`GuardPolicy.require_pre(BasicFileToolType.WRITE_FILE)`, and `write_file`
+attaches `approve_file_write`. The workflow registers both tools with
+`ToolSet(..., tools=[read_file, write_file])`.
 
 The demo guard always approves so the example stays runnable without a UI or
 human approval workflow. Production-style guards should check the path, content,

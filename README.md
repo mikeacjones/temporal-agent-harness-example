@@ -104,9 +104,9 @@ The provider API call is an activity. Tool execution happens from workflow code.
 ```python
 from datetime import timedelta
 
+from agent_harness.activity_router import RoutedActivityContext
 from agent_harness.tool_types import ToolType
 from agent_harness.tools import (
-    ToolActivityContext,
     ToolContext,
     ToolResult,
     ToolSet,
@@ -127,8 +127,7 @@ async def lookup_customer(ctx: ToolContext, customer_id: str) -> ToolResult:
     return ToolResult(payload=payload, error=False)
 
 
-tools = ToolSet()
-tools.add_tool(lookup_customer)
+tools = ToolSet(tools=[lookup_customer])
 ```
 
 If no `step` is provided, the activity summary is the tool name:
@@ -148,10 +147,10 @@ await ctx.activity(_update_customer, step="update")
 
 This keeps the activity type generic while making Temporal history useful to humans.
 
-Long-running tool activity functions can opt into Temporal heartbeats by setting
-`heartbeat_timeout` on `ctx.activity(...)`. The generic tool activity router
+Long-running routed activity functions can opt into Temporal heartbeats by setting
+`heartbeat_timeout` on `ctx.activity(...)`. The generic routed activity router
 sends conservative liveness heartbeats while the function runs. Tool authors can
-also request an activity-side `ToolActivityContext` when they have meaningful
+also request an activity-side `RoutedActivityContext` when they have meaningful
 progress details:
 
 ```python
@@ -168,7 +167,7 @@ async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
 async def _export_report_activity(
     report_id: str,
     *,
-    activity_ctx: ToolActivityContext,
+    activity_ctx: RoutedActivityContext,
 ) -> dict:
     activity_ctx.heartbeat({"phase": "loading"})
     # do work
@@ -370,7 +369,9 @@ class JsonlSink:
 configure_stream_sink(JsonlSink())
 ```
 
-When a `stream_id` is supplied, Claude token deltas and tool activity progress can be emitted to that sink. Tool activities receive an injectable `StreamContext` only when they ask for it:
+When a `stream_id` is supplied, Claude token deltas and routed activity progress
+can be emitted to that sink. Activity functions receive an injectable
+`StreamContext` only when they ask for it:
 
 ```python
 from agent_harness.streaming import StreamContext
@@ -394,9 +395,9 @@ The harness can require guards for specific categories. By default, `MUTATING`,
 `MCP`, and `ADMIN` require a pre-guard.
 
 ```python
-from agent_harness.guards import GuardContext, GuardResult
+from agent_harness.guards import GuardContext, GuardResult, guard
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import guard, tool
+from agent_harness.tools import tool
 
 
 @guard(name="require_ops_approval", fulfills=ToolType.ADMIN)
@@ -564,8 +565,7 @@ from dataclasses import asdict
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from agent_harness.guards import GuardContext, GuardResult
-    from agent_harness.tools import guard
+    from agent_harness.guards import GuardContext, GuardResult, guard
     from my_agent.tool_categories import CUSTOMER_CHANGE
     from my_agent.workflows.customer_confirmation_workflow import (
         CustomerConfirmationRequest,

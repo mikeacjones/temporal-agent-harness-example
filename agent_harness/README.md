@@ -38,6 +38,24 @@ module converts between generic harness messages and a vendor request/response,
 then calls the vendor SDK in an activity. The `Agent` class should not know
 whether the provider is Claude, Gemini, ChatGPT, or something else.
 
+## Design Review Checklist
+
+Use the repo's `design-guides/` material as the review bar for harness changes:
+
+- workflow code must stay deterministic and side-effect free;
+- provider, tool, and guard side effects must run in activities with explicit
+  timeout/retry choices;
+- mutating activities need an idempotency strategy owned by the tool author;
+- long-running activity work should heartbeat at a useful liveness interval;
+- context snapshots and query payloads should stay bounded;
+- continue-as-new state must carry enough information to resume without
+  relying on old workflow history;
+- cost optimizations should not erase the history needed to debug tool,
+  guard, or provider failures.
+
+If a change makes one of those checks harder to answer, keep the change in the
+application layer or add a smaller harness primitive first.
+
 ## Module Map
 
 | File | Responsibility |
@@ -51,8 +69,10 @@ whether the provider is Claude, Gemini, ChatGPT, or something else.
 | `tools.py` | Tool decorators, `ToolSet`, `ToolContext`, tool activity routing entrypoint, idempotency key helper, and schema generation. |
 | `guards.py` | Guard decorators, guard policy, guard execution, and guard activity routing entrypoint. |
 | `llm_guards.py` | Pre/post LLM guard pipeline for provider requests and responses. |
-| `activity_router.py` | Runtime router for tool/guard activity functions, including optional activity context and heartbeats. |
+| `activity_router.py` | Runtime router for tool/guard activity functions, including `RoutedActivityContext` and heartbeats. |
 | `activity_options.py` | Shared activity option defaults and override helpers. |
+| `invocation.py` | Shared callback invocation helper used by tools, guards, and routed activity functions. |
+| `workflow_activities.py` | Shared workflow-side helper for scheduling routed tool and guard activities with readable summaries. |
 | `streaming.py` | Generic sideband stream protocol and provider-facing `AgentStreamWriter`. |
 | `attachments.py` | Generic attachment reference types. Storage and retrieval are application-owned. |
 | `mcp.py`, `mcp_types.py` | HTTP MCP discovery and dynamic MCP tool adapter. |
@@ -126,6 +146,22 @@ Tool authors own idempotency. The harness can generate a stable
 `ctx.idempotency_key(...)` from the stream, tool name, provider tool call id,
 and any extra parts. The tool still has to enforce that key against the system
 it mutates, or choose conservative retry options when enforcement is impossible.
+
+The smallest useful setup is a workflow-owned `ToolSet` with explicit policy
+and registrations:
+
+```python
+from agent_harness.guards import GuardPolicy
+from agent_harness.tools import ToolSet
+
+tools = ToolSet(
+    guard_policy=GuardPolicy.require_pre("write_file"),
+    tools=[read_file, write_file],
+)
+```
+
+Use `tools.add_tool(...)`, `tools.add_guard(...)`, and `tools.add_provider(...)`
+when the application assembles availability in stages.
 
 ## Provider Boundary
 

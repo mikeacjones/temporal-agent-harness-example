@@ -26,6 +26,24 @@ The harness owns the provider-neutral agent loop. Your app still owns the
 workflow shape, product state, tools, credentials, auth, deployment, and any UI
 or API.
 
+## Keep Boundaries Straight
+
+Use these checks when deciding where new code belongs:
+
+- Put provider-neutral loop behavior, context management, tool/guard mechanics,
+  generic activity routing, and stream event vocabulary in `agent_harness`.
+- Put durable product orchestration, signal/query/update handlers, approval
+  state, continue-as-new decisions, and agent construction in app workflows.
+- Put business capabilities and policy in app-owned tools and guards. They run
+  in workflow context and must route side effects through activities or child
+  workflows.
+- Put provider request/response conversion and vendor SDK calls in provider
+  adapters. Conversion helpers must be deterministic; SDK calls are activities.
+- Put external I/O, storage writes, OAuth-backed calls, file I/O, and long work
+  in activities with explicit timeout, retry, heartbeat, and idempotency choices.
+- Put login, OAuth, UI state, artifact browsing, chat selection, and stream
+  transport in the API/UI layer, not in the harness.
+
 ## Start A New `uv` Project
 
 Create a Python 3.12 project:
@@ -105,9 +123,8 @@ deterministic decisions directly, but side effects should go through
 `ctx.activity(...)`.
 
 ```python
-from agent_harness.guards import GuardContext, GuardResult
+from agent_harness.guards import GuardContext, GuardResult, guard
 from agent_harness.tools import ToolContext, ToolResult, tool
-from agent_harness.tools import guard
 from my_agent.tool_categories import FileToolCategory
 
 
@@ -196,12 +213,9 @@ class FileAgentWorkflow:
     @workflow.run
     async def run(self, request: AgentRequest) -> AgentResult:
         tools = ToolSet(
-            guard_policy=GuardPolicy(
-                required_pre=frozenset({FileToolCategory.WRITE_FILE}),
-                required_post=frozenset(),
-            )
+            guard_policy=GuardPolicy.require_pre(FileToolCategory.WRITE_FILE),
+            tools=[read_file, write_file],
         )
-        tools.add_tool(read_file, write_file)
 
         agent = ClaudeAgent(
             request.instructions,
@@ -294,7 +308,8 @@ file is a complete tiny client.
 
 ## Production Readiness Checklist
 
-Before turning a small example into a real product, decide these up front:
+Before turning a small example into a real product, decide these up front. The
+repo's `design-guides/` directory expands on the same review criteria.
 
 - How workflows continue as new and what state is carried forward.
 - Which tools are mutating and how each mutating activity is made idempotent.
@@ -310,6 +325,20 @@ Before turning a small example into a real product, decide these up front:
 - How workflow histories are replay-tested before deployment.
 - How worker versioning and task queues are managed.
 
+Keep these implementation defaults unless you have a specific reason to do
+otherwise:
+
+- keep workflow code deterministic and make signal handlers state-only;
+- pass references, not large blobs, through workflow history;
+- set `start_to_close_timeout` for every activity and add `heartbeat_timeout`
+  for long-running work;
+- prefer regular activities over local activities unless the work is very
+  short-lived and high-volume;
+- use child workflows for lifecycle or history partitioning, not code
+  organization;
+- optimize Temporal Cloud Actions only after the failure boundaries and
+  observability are clear.
+
 ## Appendix: Harness API Reference
 
 This appendix documents the public shape used by the example. It is source-level
@@ -320,7 +349,7 @@ documentation for the vendored harness, not a generated API reference.
 Module: `agent_harness.agent`
 
 `Agent` is the provider-neutral loop. Most apps construct a provider-specific
-subclass such as `ClaudeAgent`, `ChatGptAgent`, or `GeminiAgent`.
+subclass such as `ClaudeAgent`, `ChatGPTAgent`, or `GeminiAgent`.
 
 Constructor concepts:
 
@@ -397,7 +426,41 @@ Required provider methods:
 | `response_message(...)` | Convert provider response into generic assistant message. |
 | `stop_reason_for_max_turns()` | Stop reason used when `max_turns` is reached. |
 
-Provider convenience classes live under `agent_harness.providers`.
+Provider convenience classes live under `agent_harness.providers`. They keep
+provider-specific options provider-specific while letting workflow code create
+the same generic `Agent` shape:
+
+```python
+from agent_harness.providers.claude import ClaudeAgent, ClaudeThinkingConfig
+from agent_harness.providers.chatgpt import ChatGPTAgent, ChatGPTReasoningConfig
+from agent_harness.providers.gemini import GeminiAgent, GeminiThinkingConfig
+
+claude_agent = ClaudeAgent(
+    system_prompt,
+    tools,
+    model="claude-sonnet-4-5",
+    thinking=ClaudeThinkingConfig(enabled=True),
+)
+
+chatgpt_agent = ChatGPTAgent(
+    system_prompt,
+    tools,
+    model="gpt-5.1",
+    reasoning=ChatGPTReasoningConfig(effort="low"),
+)
+
+gemini_agent = GeminiAgent(
+    system_prompt,
+    tools,
+    model="gemini-2.5-flash",
+    thinking=GeminiThinkingConfig(include_thoughts=True),
+)
+```
+
+Provider conversion methods run in workflow code and must stay deterministic.
+Provider SDK calls run only in the provider activity. See
+[`agent_harness/providers/README.md`](../agent_harness/providers/README.md) for
+the provider implementation lifecycle and checklist.
 
 ### Tool Categories
 
@@ -452,6 +515,10 @@ Pydantic.
 `ToolResult(payload: dict, error: bool)` is the model-visible result. Return
 `error=True` for expected tool failures that the model should handle.
 
+For the common case, construct a set with initial registrations:
+`ToolSet(tools=[read_file], guards=[allow_write], providers=[provider])`.
+The methods below remain useful when tool availability is assembled in stages.
+
 `ToolSet` methods:
 
 | Method | Use |
@@ -480,23 +547,26 @@ versioning intent, and priority.
 Register `run_tool_activity` with the worker whenever a tool calls
 `ctx.activity(...)`.
 
-### Tool Activity Runtime Context
+### Routed Activity Runtime Context
 
 Module: `agent_harness.activity_router`
 
-Activity functions can request `ToolActivityContext` by type annotation:
+Activity functions called through tool, guard, or LLM guard `ctx.activity(...)`
+can request `RoutedActivityContext` by type annotation:
 
 ```python
-from agent_harness.activity_router import ToolActivityContext
+from agent_harness.activity_router import RoutedActivityContext
 
 
-async def long_activity(activity_ctx: ToolActivityContext) -> dict:
+async def long_activity(activity_ctx: RoutedActivityContext) -> dict:
     activity_ctx.heartbeat({"phase": "started"})
     ...
 ```
 
-`ToolActivityContext` exposes tool name, step, stream id, activity id, attempt,
-heartbeat timeout, and `heartbeat(details=None, force=False)`.
+`RoutedActivityContext` exposes route kind, route name, step, stream id,
+activity id, attempt, heartbeat timeout, and
+`heartbeat(details=None, force=False)`. `ToolActivityContext` remains as a
+compatibility alias for existing tool activity implementations.
 
 If the activity has a heartbeat timeout, the generic router also sends
 conservative automatic heartbeats. Manual heartbeats are coalesced.
@@ -511,25 +581,31 @@ Module: `agent_harness.guards`
 from agent_harness.guards import GuardPolicy
 from agent_harness.tool_types import ToolType
 
-policy = GuardPolicy(
-    required_pre=frozenset({ToolType.MUTATING, ToolType.ADMIN}),
-    required_post=frozenset(),
-)
+policy = GuardPolicy.require_pre(ToolType.MUTATING, ToolType.ADMIN)
 tools = ToolSet(guard_policy=policy)
 ```
 
 The default policy requires pre-guards for `MUTATING`, `MCP`, and `ADMIN`
 tools. Override it when your app has its own category vocabulary.
 
+Useful constructors:
+
+| Constructor | Use |
+| --- | --- |
+| `GuardPolicy()` | Default harness policy: pre-guards for `MUTATING`, `MCP`, and `ADMIN`. |
+| `GuardPolicy.require_pre(...)` | Require pre-guards for one or more app-owned categories. |
+| `GuardPolicy.require_post(...)` | Require post-guards for one or more app-owned categories. |
+| `GuardPolicy.require(pre=..., post=...)` | Define both pre- and post-guard requirements explicitly. |
+| `GuardPolicy.allow_all()` | Disable category-level guard requirements. |
+
 ### Tool Guards
 
-Module: `agent_harness.guards` and `agent_harness.tools`
+Module: `agent_harness.guards`
 
 Use `@guard(...)` to create a pre/post tool guard:
 
 ```python
-from agent_harness.guards import GuardContext, GuardResult
-from agent_harness.tools import guard
+from agent_harness.guards import GuardContext, GuardResult, guard
 from my_agent.tool_categories import FileToolCategory
 
 
@@ -720,8 +796,8 @@ Register these activities based on the features you use:
 | Feature | Worker registration |
 | --- | --- |
 | Claude provider | `agent_harness.providers.claude.call_agent_api` |
-| ChatGPT provider | ChatGPT provider activity from `providers/chatgpt.py` |
-| Gemini provider | Gemini provider activity from `providers/gemini.py` |
+| ChatGPT provider | `agent_harness.providers.chatgpt.call_chatgpt` |
+| Gemini provider | `agent_harness.providers.gemini.call_gemini` |
 | Tools using `ctx.activity(...)` | `agent_harness.tools.run_tool_activity` |
 | Tool guards or LLM guards using `ctx.activity(...)` | `agent_harness.guards.run_guard_activity` |
 | Durable application settlement events | App-specific activity, not harness-owned |

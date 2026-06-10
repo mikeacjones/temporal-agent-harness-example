@@ -71,13 +71,13 @@ class MyToolCategory(StrEnum):
 Then use it everywhere the harness asks for a category:
 
 ```python
-policy = GuardPolicy(
-    required_pre=frozenset({MyToolCategory.WRITE_FILE}),
-    required_post=frozenset(),
-)
+policy = GuardPolicy.require_pre(MyToolCategory.WRITE_FILE)
 ```
 
 ```python
+from agent_harness.guards import GuardContext, GuardResult, guard
+
+
 @guard(name="approve_file_write", fulfills=MyToolCategory.WRITE_FILE)
 async def approve_file_write(ctx: GuardContext) -> GuardResult:
     return GuardResult(passed=True)
@@ -115,10 +115,7 @@ It is just a built-in vocabulary.
 Its workflow configures:
 
 ```python
-GuardPolicy(
-    required_pre=frozenset({BasicFileToolType.WRITE_FILE}),
-    required_post=frozenset(),
-)
+GuardPolicy.require_pre(BasicFileToolType.WRITE_FILE)
 ```
 
 `write_file` declares `BasicFileToolType.WRITE_FILE` and attaches

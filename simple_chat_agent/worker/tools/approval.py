@@ -5,9 +5,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 
-from agent_harness.guards import GuardContext, GuardResult
+from agent_harness.guards import GuardContext, GuardResult, guard
 from agent_harness.tool_types import ToolType
-from agent_harness.tools import guard
 
 TOOL_APPROVAL_TIMEOUT = timedelta(hours=1)
 
