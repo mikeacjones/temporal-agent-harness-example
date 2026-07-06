@@ -11,7 +11,7 @@ from typing import Any
 
 
 SESSION_COOKIE = "simple_chat_session"
-DEFAULT_SESSION_SECONDS = 60 * 60 * 24 * 7
+DEFAULT_SESSION_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True)
