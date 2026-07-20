@@ -562,7 +562,13 @@ async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any
     await _require_demo_workspace_can_start_registry()
     workflow_id = user_chats_workflow_id(user_id)
     search_attr_name = _user_email_sa_name()
-    return await _client().start_workflow(
+    # Start for its side effect only, then return a fresh handle. The handle from
+    # start_workflow(USE_EXISTING) pins first_execution_run_id to the run it attached
+    # to; after the registry entity continues-as-new, execute_update forwards that
+    # stale run id as a chain-identity guard and the server returns NOT_FOUND. A
+    # get_workflow_handle by ID carries no first_execution_run_id, so updates keep
+    # working across continue-as-new.
+    await _client().start_workflow(
         UserChatsWorkflow.run,
         UserChatsInput(
             user_id=user_id,
@@ -578,6 +584,7 @@ async def _ensure_user_chats_workflow(user_id: str, user_email: str = "") -> Any
             user_email=user_email,
         ),
     )
+    return _handle(workflow_id)
 
 
 async def _require_demo_workspace_can_start_registry() -> None:
@@ -611,7 +618,12 @@ async def _require_demo_workspace_can_start_registry() -> None:
 async def _ensure_demo_workspace_workflow(user: AuthenticatedUser) -> Any:
     workflow_id = demo_workspace_workflow_id(user.user_id)
     search_attr_name = _user_email_sa_name()
-    return await _client().start_workflow(
+    # Start for its side effect only, then return a fresh handle. Like the user
+    # registry, this controller continues-as-new; a start_workflow(USE_EXISTING)
+    # handle pins first_execution_run_id to the attached run, so execute_update
+    # (e.g. ensure_workspace when re-provisioning a CAN'd controller) would fail
+    # NOT_FOUND. get_workflow_handle by ID carries no such guard.
+    await _client().start_workflow(
         DemoWorkspaceWorkflow.run,
         DemoWorkspaceInput(
             user_id=user.user_id,
@@ -628,6 +640,7 @@ async def _ensure_demo_workspace_workflow(user: AuthenticatedUser) -> Any:
             user_email=user.username,
         ),
     )
+    return _handle(workflow_id)
 
 
 def _demo_workspace_parent_workflow() -> Any | None:
