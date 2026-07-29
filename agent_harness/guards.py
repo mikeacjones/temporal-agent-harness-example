@@ -136,6 +136,7 @@ class GuardContext:
     tool_args: dict
     tool_result: ToolResult | None = None
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
@@ -174,6 +175,7 @@ class GuardContext:
                 guard_name=self.guard_name,
                 step=step,
                 stream_id=self.stream_id,
+                stream_agent=self.stream_agent,
             ),
             summary_base=self.guard_name,
             step=step,
@@ -199,6 +201,7 @@ class GuardActivityRequest:
     guard_name: str | None = None
     step: str | None = None
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
 
 
 @dataclass
@@ -289,6 +292,7 @@ class GuardSet:
         tool_args: dict[str, Any],
         tool_result: ToolResult | None,
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None,
         activity_options: ActivityOptions,
     ) -> GuardFailure | None:
         for guard in guards:
@@ -299,6 +303,7 @@ class GuardSet:
                 tool_args=tool_args,
                 tool_result=tool_result,
                 stream_id=stream_id,
+                stream_agent=stream_agent,
                 activity_options=activity_options,
             )
             result = await call_guard(guard.fn, ctx)
@@ -317,6 +322,7 @@ async def run_guard_activity(request: GuardActivityRequest) -> Any:
         stream_id=request.stream_id,
         tool_name=request.guard_name,
         step=request.step,
+        agent=request.stream_agent,
     )
     activity_context = RoutedActivityContext(
         route_kind="guard",

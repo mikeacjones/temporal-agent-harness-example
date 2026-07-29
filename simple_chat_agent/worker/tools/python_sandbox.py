@@ -116,6 +116,8 @@ async def _invoke_sandbox_lambda(
             "stream_id": stream.stream_id,
             "tool_name": stream.tool_name,
             "step": stream.step,
+            "agent": stream.agent,
+            "tool_call_id": stream.tool_call_id,
         },
     }
     stream_sink = _lambda_stream_sink_config()

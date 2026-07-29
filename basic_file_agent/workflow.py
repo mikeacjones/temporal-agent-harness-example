@@ -54,6 +54,12 @@ class BasicFileAgentWorkflow:
             model=request.model,
             max_tokens=request.max_tokens,
             stream_id=workflow.info().workflow_id,
+            stream_agent={
+                "id": workflow.info().workflow_id,
+                "parent_id": None,
+                "kind": "main",
+                "label": "Main agent",
+            },
         )
 
         if request.agent_state is None:

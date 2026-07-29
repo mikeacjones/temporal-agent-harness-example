@@ -419,106 +419,124 @@ export function handleStreamEventInState(previous, event) {
   if (projectionResult.handled) return projectionResult.state;
 
   const artifactResult = applyArtifactStreamEventInState(previous, event);
-  if (artifactResult.handled) return artifactResult.state;
-
+  const base = artifactResult.handled ? artifactResult.state : previous;
   const next = {
-    ...previous,
-    streamTurn: cloneStreamTurn(previous.streamTurn),
+    ...base,
+    streamTurn: cloneStreamTurn(base.streamTurn),
   };
+  const agent = streamAgentForEvent(event);
   const sequence = agentPayloadSequence(event);
   const attempt = agentPayloadAttempt(event);
 
   if (event.kind === AgentStreamEventKind.AGENT_START) {
-    next.currentAgentSequence = sequence;
-    next.ignoreAgentUntilStart = false;
+    if (agent.kind === "main") {
+      next.currentAgentSequence = sequence;
+      next.ignoreAgentUntilStart = false;
+    }
     if (next.workflowState) {
       next.workflowState = { ...next.workflowState, status: "responding" };
     }
-    const turn = ensureStreamTurn(next, sequence);
-    resetAgentSequenceForNewAttempt(turn, sequence, attempt);
-    completeOpenToolSegments(turn);
-    const agentSegment = ensureAgentSegment(turn, sequence);
+    const turn = ensureStreamTurn(next, agent, sequence);
+    resetAgentSequenceForNewAttempt(turn, agent, sequence, attempt);
+    completeOpenToolSegments(turn, agent.id);
+    const agentSegment = ensureAgentSegment(turn, agent, sequence);
     recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
-    turn.status = "streaming";
-    turn.activeSequence = sequence;
+    if (agent.kind === "main") turn.status = "streaming";
   } else if (event.kind === AgentStreamEventKind.AGENT_TEXT_DELTA && event.payload?.text) {
-    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeAgentSequence(next, sequence);
-    adoptAgentSequence(next, activeSequence);
-    const turn = ensureStreamTurn(next, activeSequence);
-    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
-    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    if (!shouldApplyAgentStreamEvent(next, agent, sequence)) return previous;
+    const turn = ensureStreamTurn(next, agent, sequence);
+    const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+    if (agent.kind === "main") adoptAgentSequence(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, agent, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, agent, activeSequence);
     recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     agentSegment.text += event.payload.text;
-    next.streamTurn.status = "streaming";
+    if (agent.kind === "main") next.streamTurn.status = "streaming";
   } else if (event.kind === AgentStreamEventKind.AGENT_THINKING_START) {
-    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeAgentSequence(next, sequence);
-    adoptAgentSequence(next, activeSequence);
-    const turn = ensureStreamTurn(next, activeSequence);
-    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
-    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    if (!shouldApplyAgentStreamEvent(next, agent, sequence)) return previous;
+    const turn = ensureStreamTurn(next, agent, sequence);
+    const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+    if (agent.kind === "main") adoptAgentSequence(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, agent, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, agent, activeSequence);
     recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
-    next.streamTurn.status = "streaming";
+    if (agent.kind === "main") next.streamTurn.status = "streaming";
   } else if (
     event.kind === AgentStreamEventKind.AGENT_THINKING_DELTA &&
     event.payload?.thinking
   ) {
-    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeAgentSequence(next, sequence);
-    adoptAgentSequence(next, activeSequence);
-    const turn = ensureStreamTurn(next, activeSequence);
-    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
-    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    if (!shouldApplyAgentStreamEvent(next, agent, sequence)) return previous;
+    const turn = ensureStreamTurn(next, agent, sequence);
+    const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+    if (agent.kind === "main") adoptAgentSequence(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, agent, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, agent, activeSequence);
     recordAgentAttempt(agentSegment, attempt);
     agentSegment.status = "streaming";
     agentSegment.thinking += event.payload.thinking;
-    next.streamTurn.status = "streaming";
+    if (agent.kind === "main") next.streamTurn.status = "streaming";
   } else if (event.kind === AgentStreamEventKind.AGENT_CANCELLED) {
-    if (shouldApplyAgentStreamEvent(next, sequence)) {
+    if (agent.kind === "main" && shouldApplyAgentStreamEvent(next, agent, sequence)) {
       return {
         ...markStreamInterruptedInState(next),
         ignoreAgentUntilStart: true,
       };
     }
+    if (agent.kind !== "main") {
+      const turn = ensureStreamTurn(next, agent, sequence);
+      const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+      const agentSegment = ensureAgentSegment(turn, agent, activeSequence);
+      agentSegment.status = "interrupted";
+      agentSegment.completedAt = new Date().toISOString();
+      completeOpenToolSegments(turn, agent.id);
+    }
   } else if (event.kind === AgentStreamEventKind.AGENT_COMPLETE) {
-    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeAgentSequence(next, sequence);
-    adoptAgentSequence(next, activeSequence);
+    if (!shouldApplyAgentStreamEvent(next, agent, sequence)) return previous;
+    const turn = ensureStreamTurn(next, agent, sequence);
+    const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+    if (agent.kind === "main") adoptAgentSequence(next, activeSequence);
     const terminal = isTerminalAgentStop(event.payload || {});
-    const turn =
-      streamTurnForSequence(next.streamTurn, activeSequence) ||
-      ensureStreamTurn(next, activeSequence);
-    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
-    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, agent, activeSequence, attempt);
+    const agentSegment = ensureAgentSegment(turn, agent, activeSequence);
     recordAgentAttempt(agentSegment, attempt);
     finishAgentSegment(agentSegment, event.payload || {});
-    if (terminal) {
+    if (terminal && agent.kind === "main") {
       completeOpenToolSegments(turn);
       turn.status = "complete";
       turn.completedAt = new Date().toISOString();
+    } else if (terminal) {
+      completeOpenToolSegments(turn, agent.id);
     } else {
-      ensureToolSegment(turn, activeSequence);
-      turn.status = "tooling";
+      ensureToolSegment(turn, agent, activeSequence);
     }
+    if (agent.kind === "main" && !terminal) turn.status = "tooling";
     turn.lastAgentCompletedAt = new Date().toISOString();
   } else if (isAgentToolInputEvent(event)) {
-    if (!shouldApplyAgentStreamEvent(next, sequence)) return previous;
-    const activeSequence = activeAgentSequence(next, sequence);
-    adoptAgentSequence(next, activeSequence);
-    const turn = ensureStreamTurn(next, activeSequence);
-    resetAgentSequenceForNewAttempt(turn, activeSequence, attempt);
-    appendStreamToolEvent(turn, event, activeSequence);
-    if (turn.status !== "complete" && turn.status !== "interrupted") {
+    if (!shouldApplyAgentStreamEvent(next, agent, sequence)) return previous;
+    const turn = ensureStreamTurn(next, agent, sequence);
+    const activeSequence = activeAgentSequence(next, turn, agent, sequence);
+    if (agent.kind === "main") adoptAgentSequence(next, activeSequence);
+    resetAgentSequenceForNewAttempt(turn, agent, activeSequence, attempt);
+    appendStreamToolEvent(turn, event, agent, activeSequence);
+    if (
+      agent.kind === "main" &&
+      turn.status !== "complete" &&
+      turn.status !== "interrupted"
+    ) {
       turn.status = "tooling";
     }
   } else if (!event.kind?.startsWith(AGENT_STREAM_EVENT_PREFIX)) {
-    const turn = ensureStreamTurn(next, next.currentAgentSequence);
-    appendStreamToolEvent(turn, event, next.currentAgentSequence);
-    if (turn.status !== "complete" && turn.status !== "interrupted") {
+    const turn = ensureStreamTurn(next, agent, null);
+    const activeSequence = activeAgentSequence(next, turn, agent, null);
+    appendStreamToolEvent(turn, event, agent, activeSequence);
+    if (
+      agent.kind === "main" &&
+      turn.status !== "complete" &&
+      turn.status !== "interrupted"
+    ) {
       turn.status = "tooling";
     }
   }
@@ -535,8 +553,25 @@ function agentPayloadAttempt(event) {
   return Number.isFinite(attempt) ? attempt : null;
 }
 
-function activeAgentSequence(state, eventSequence) {
-  return eventSequence ?? state.currentAgentSequence ?? state.streamTurn?.activeSequence ?? null;
+function streamAgentForEvent(event) {
+  const value = event.agent && typeof event.agent === "object" ? event.agent : {};
+  const kind = value.kind === "subagent" ? "subagent" : "main";
+  return {
+    id: String(value.id || (kind === "main" ? "main" : "subagent:unknown")),
+    parentId: value.parent_id ? String(value.parent_id) : null,
+    kind,
+    label: String(value.label || (kind === "main" ? "Main agent" : "Subagent")),
+  };
+}
+
+function activeAgentSequence(state, turn, agent, eventSequence) {
+  if (eventSequence !== null && eventSequence !== undefined) return eventSequence;
+  const agentSequence = turn.agentSequences?.[agent.id];
+  if (agentSequence !== null && agentSequence !== undefined) return agentSequence;
+  if (agent.kind === "main") {
+    return state.currentAgentSequence ?? turn.activeSequence ?? null;
+  }
+  return null;
 }
 
 function adoptAgentSequence(state, sequence) {
@@ -545,7 +580,8 @@ function adoptAgentSequence(state, sequence) {
   state.currentAgentSequence = sequence;
 }
 
-function shouldApplyAgentStreamEvent(state, eventSequence) {
+function shouldApplyAgentStreamEvent(state, agent, eventSequence) {
+  if (agent.kind !== "main") return true;
   if (state.ignoreAgentUntilStart) return false;
   if (state.currentAgentSequence === null || state.currentAgentSequence === undefined) return true;
   if (eventSequence === null || eventSequence === undefined) return true;
@@ -555,6 +591,7 @@ function shouldApplyAgentStreamEvent(state, eventSequence) {
 export function streamEventNeedsSettledTranscriptDelta(event) {
   return (
     event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+    streamAgentForEvent(event).kind === "main" &&
     isTerminalAgentStop(event.payload || {})
   );
 }
@@ -562,6 +599,7 @@ export function streamEventNeedsSettledTranscriptDelta(event) {
 export function streamEventNeedsWorkflowStateRefresh(event) {
   return (
     event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+    streamAgentForEvent(event).kind === "main" &&
     event.payload?.stop_reason === "tool_use"
   );
 }
@@ -637,19 +675,14 @@ function applyArtifactStreamEventInState(previous, event) {
   };
 }
 
-function ensureStreamTurn(state, sequence) {
+function ensureStreamTurn(state, agent, sequence) {
   if (!isOpenStreamTurn(state.streamTurn)) {
-    state.streamTurn = createStreamTurn(sequence);
+    state.streamTurn = createStreamTurn(agent, sequence);
   } else {
     registerStreamSequence(state.streamTurn, sequence);
+    registerAgentSequence(state.streamTurn, agent, sequence);
   }
   return state.streamTurn;
-}
-
-function streamTurnForSequence(turn, sequence) {
-  if (!isOpenStreamTurn(turn)) return null;
-  if (sequence === null) return turn;
-  return turn.sequences.includes(sequence) ? turn : null;
 }
 
 function isOpenStreamTurn(turn) {
@@ -662,11 +695,26 @@ function registerStreamSequence(turn, sequence) {
   }
 }
 
-function createStreamTurn(sequence) {
+function registerAgentSequence(turn, agent, sequence) {
+  if (!turn.agentSequences) turn.agentSequences = {};
+  if (sequence !== null && sequence !== undefined) {
+    turn.agentSequences[agent.id] = sequence;
+  } else if (!Object.prototype.hasOwnProperty.call(turn.agentSequences, agent.id)) {
+    turn.agentSequences[agent.id] = null;
+  }
+  if (agent.kind === "main" && sequence !== null && sequence !== undefined) {
+    turn.activeSequence = sequence;
+  }
+}
+
+function createStreamTurn(agent, sequence) {
   return {
     sequence,
     sequences: sequence === null ? [] : [sequence],
-    activeSequence: sequence,
+    agentSequences: {
+      [agent.id]: sequence,
+    },
+    activeSequence: agent.kind === "main" ? sequence : null,
     status: "streaming",
     segments: [],
     startedAt: new Date().toISOString(),
@@ -681,6 +729,7 @@ function cloneStreamTurn(turn) {
   return {
     ...turn,
     sequences: [...turn.sequences],
+    agentSequences: { ...(turn.agentSequences || {}) },
     segments: (turn.segments || []).map((segment) => ({
       ...segment,
       events: segment.events ? [...segment.events] : undefined,
@@ -688,15 +737,20 @@ function cloneStreamTurn(turn) {
   };
 }
 
-function ensureAgentSegment(turn, sequence) {
-  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
+function ensureAgentSegment(turn, agent, sequence) {
+  const normalizedSequence =
+    sequence ?? turn.agentSequences?.[agent.id] ?? (agent.kind === "main" ? turn.activeSequence : null);
   registerStreamSequence(turn, normalizedSequence);
-  turn.activeSequence = normalizedSequence;
-  let segment = agentSegmentForSequence(turn, normalizedSequence);
+  registerAgentSequence(turn, agent, normalizedSequence);
+  let segment = agentSegmentForSequence(turn, agent.id, normalizedSequence);
   if (!segment) {
     segment = {
-      id: `agent:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
+      id: `agent:${agent.id}:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
       type: "agent",
+      agentId: agent.id,
+      parentAgentId: agent.parentId,
+      agentKind: agent.kind,
+      agentLabel: agent.label,
       sequence: normalizedSequence,
       status: "streaming",
       text: "",
@@ -711,20 +765,25 @@ function ensureAgentSegment(turn, sequence) {
   return segment;
 }
 
-function agentSegmentForSequence(turn, sequence) {
+function agentSegmentForSequence(turn, agentId, sequence) {
   return turn.segments.find(
-    (candidate) => candidate.type === "agent" && candidate.sequence === sequence,
+    (candidate) =>
+      candidate.type === "agent" &&
+      (candidate.agentId || "main") === agentId &&
+      candidate.sequence === sequence,
   );
 }
 
-function resetAgentSequenceForNewAttempt(turn, sequence, attempt) {
+function resetAgentSequenceForNewAttempt(turn, agent, sequence, attempt) {
   if (attempt === null || attempt === undefined) return;
-  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
-  const segment = agentSegmentForSequence(turn, normalizedSequence);
+  const normalizedSequence =
+    sequence ?? turn.agentSequences?.[agent.id] ?? (agent.kind === "main" ? turn.activeSequence : null);
+  const segment = agentSegmentForSequence(turn, agent.id, normalizedSequence);
   if (!segment) return;
   const previousAttempt = Number(segment.attempt ?? 1);
   if (!Number.isFinite(previousAttempt) || attempt <= previousAttempt) return;
   turn.segments = turn.segments.filter((candidate) => {
+    if ((candidate.agentId || "main") !== agent.id) return true;
     if (candidate.type === "agent") return candidate.sequence !== normalizedSequence;
     if (candidate.type === "tools") return candidate.afterSequence !== normalizedSequence;
     return true;
@@ -736,14 +795,21 @@ function recordAgentAttempt(segment, attempt) {
   segment.attempt = attempt;
 }
 
-function ensureToolSegment(turn, sequence) {
-  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
-  const existing = latestToolSegmentForSequence(turn, normalizedSequence);
+function ensureToolSegment(turn, agent, sequence) {
+  const normalizedSequence =
+    sequence ?? turn.agentSequences?.[agent.id] ?? (agent.kind === "main" ? turn.activeSequence : null);
+  registerStreamSequence(turn, normalizedSequence);
+  registerAgentSequence(turn, agent, normalizedSequence);
+  const existing = latestToolSegmentForSequence(turn, agent.id, normalizedSequence);
   if (existing) return existing;
 
   const segment = {
-    id: `tools:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
+    id: `tools:${agent.id}:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
     type: "tools",
+    agentId: agent.id,
+    parentAgentId: agent.parentId,
+    agentKind: agent.kind,
+    agentLabel: agent.label,
     afterSequence: normalizedSequence,
     status: "streaming",
     events: [],
@@ -754,10 +820,11 @@ function ensureToolSegment(turn, sequence) {
   return segment;
 }
 
-function latestToolSegmentForSequence(turn, sequence) {
+function latestToolSegmentForSequence(turn, agentId, sequence) {
   for (let index = turn.segments.length - 1; index >= 0; index -= 1) {
     const segment = turn.segments[index];
     if (segment.type !== "tools") continue;
+    if ((segment.agentId || "main") !== agentId) continue;
     if (sequence === null || sequence === undefined || segment.afterSequence === sequence) {
       return segment;
     }
@@ -765,9 +832,10 @@ function latestToolSegmentForSequence(turn, sequence) {
   return null;
 }
 
-function completeOpenToolSegments(turn) {
+function completeOpenToolSegments(turn, agentId = null) {
   for (const segment of turn.segments) {
     if (segment.type !== "tools" || segment.status === "complete") continue;
+    if (agentId !== null && (segment.agentId || "main") !== agentId) continue;
     segment.status = "complete";
     segment.completedAt = new Date().toISOString();
   }
@@ -779,13 +847,14 @@ function finishAgentSegment(segment, payload) {
   segment.thinking = String(segment.thinking || "").trim();
   segment.status = "complete";
   segment.stopReason = payload.stop_reason || "unknown";
+  segment.terminal = isTerminalAgentStop(payload);
   segment.stopDetails = payload.stop_details || null;
   segment.usage = payload.usage || null;
   segment.completedAt = new Date().toISOString();
 }
 
-function appendStreamToolEvent(turn, event, sequence) {
-  const toolSegment = ensureToolSegment(turn, sequence);
+function appendStreamToolEvent(turn, event, agent, sequence) {
+  const toolSegment = ensureToolSegment(turn, agent, sequence);
   toolSegment.events = mergeStreamToolEvent(toolSegment.events || [], event);
 }
 
@@ -795,15 +864,15 @@ function isAgentToolInputEvent(event) {
 
 function mergeStreamToolEvent(events, event) {
   if (isPythonSandboxOutputEvent(event)) {
-    return mergePythonSandboxOutputEvent(events, event).slice(-5);
+    return mergePythonSandboxOutputEvent(events, event).slice(-200);
   }
 
   if (isPythonSandboxProgressEvent(event)) {
-    return mergePythonSandboxProgressEvent(events, event).slice(-5);
+    return mergePythonSandboxProgressEvent(events, event).slice(-200);
   }
 
   if (!event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX)) {
-    return [...events, event].slice(-5);
+    return [...events, event].slice(-200);
   }
 
   const key = streamToolInputKey(event);
@@ -820,7 +889,7 @@ function mergeStreamToolEvent(events, event) {
   } else {
     nextEvents.push(merged);
   }
-  return nextEvents.slice(-5);
+  return nextEvents.slice(-200);
 }
 
 function isPythonSandboxOutputEvent(event) {
@@ -998,6 +1067,7 @@ function turnTracesFromStreamEvents(events, workflowState) {
     replayState = handleStreamEventInState(replayState, event);
     if (
       event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
+      streamAgentForEvent(event).kind === "main" &&
       isTerminalAgentStop(event.payload || {}) &&
       replayState.streamTurn
     ) {
@@ -1041,7 +1111,7 @@ function trimTraceTurn(turn) {
         next.thinking = next.thinking.slice(-120_000);
       }
       if (Array.isArray(next.events)) {
-        next.events = next.events.slice(-12).map(trimTraceEvent);
+        next.events = next.events.slice(-200).map(trimTraceEvent);
       }
       return next;
     }),

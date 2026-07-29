@@ -730,6 +730,12 @@ class SimpleChatWorkflow:
             max_context_tokens=chat_input.max_context_tokens,
             thinking=chat_input.thinking,
             stream_id=self._stream_id,
+            stream_agent={
+                "id": workflow.info().workflow_id,
+                "parent_id": None,
+                "kind": "main",
+                "label": "Main agent",
+            },
             pre_llm_guards=(
                 [good_place_pre_guard] if chat_input.good_place_censor else None
             ),

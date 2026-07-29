@@ -93,6 +93,7 @@ class ChatGPTRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
     reasoning: dict | None = None
 
 
@@ -156,6 +157,7 @@ class ChatGPTProvider(AgentProvider):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> ChatGPTRequest:
         return ChatGPTRequest(
             system_prompt=system_prompt,
@@ -167,6 +169,7 @@ class ChatGPTProvider(AgentProvider):
             stream_id=stream_id,
             stream_sequence=stream_sequence,
             stream_attempt=stream_attempt,
+            stream_agent=stream_agent,
             reasoning=_reasoning_config_to_openai(self._reasoning),
         )
 
@@ -231,6 +234,7 @@ class ChatGPTAgent(Agent):
         reasoning: ChatGPTReasoningConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         chatgpt_activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
@@ -254,6 +258,7 @@ class ChatGPTAgent(Agent):
             max_tokens=max_tokens,
             tool_names=tool_names,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
             llm_guard_activity_options=llm_guard_activity_options,
             pre_llm_guards=pre_llm_guards,
@@ -363,6 +368,7 @@ def _chatgpt_request_to_dict(request: ChatGPTRequest) -> dict[str, Any]:
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
         "stream_attempt": request.stream_attempt,
+        "stream_agent": _copy_optional_mapping(request.stream_agent),
         "reasoning": _copy_optional_mapping(request.reasoning),
     }
 
@@ -378,6 +384,10 @@ def _chatgpt_request_from_dict(request: dict[str, Any]) -> ChatGPTRequest:
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
         stream_attempt=cast(int | None, request.get("stream_attempt")),
+        stream_agent=cast(
+            dict[str, str | None] | None,
+            _copy_optional_mapping(request.get("stream_agent")),
+        ),
         reasoning=_copy_optional_mapping(request.get("reasoning")),
     )
 
@@ -476,6 +486,7 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
                 stream_attempt=request.stream_attempt,
+                stream_agent=request.stream_agent,
             )
     except APIStatusError as err:
         if _openai_error_is_context_window_exceeded(err):
@@ -510,11 +521,13 @@ async def _stream_chatgpt_response(
     stream_id: str | None,
     stream_sequence: int | None,
     stream_attempt: int | None,
+    stream_agent: dict[str, str | None] | None,
 ) -> _ChatGPTStreamState:
     stream = AgentStreamWriter.for_provider(
         stream_id=stream_id,
         provider="chatgpt",
         attempt=stream_attempt,
+        agent=stream_agent,
     )
     stream_state = _ChatGPTStreamState(sequence=stream_sequence)
     heartbeat_state = _ChatGPTHeartbeatState(sequence=stream_sequence)

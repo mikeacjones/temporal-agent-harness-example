@@ -88,6 +88,7 @@ class ToolContext:
     _tools: "ToolSet"
     stream_id: str | None = None
     tool_call_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
@@ -142,6 +143,8 @@ class ToolContext:
                 tool_name=self.tool_name,
                 step=step,
                 stream_id=self.stream_id,
+                tool_call_id=self.tool_call_id,
+                stream_agent=self.stream_agent,
             ),
             summary_base=self.tool_name,
             step=step,
@@ -172,6 +175,8 @@ class ToolActivityRequest:
     tool_name: str | None = None
     step: str | None = None
     stream_id: str | None = None
+    tool_call_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
 
 
 @dataclass
@@ -337,6 +342,7 @@ class ToolSet:
         *,
         stream_id: str | None = None,
         tool_call_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
     ) -> ToolResult:
         tool = self.get_tool(name)
@@ -356,6 +362,7 @@ class ToolSet:
             tool_args=tool_args,
             tool_result=None,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=resolved_activity_options,
         )
         if pre_guard_failure is not None:
@@ -366,6 +373,7 @@ class ToolSet:
             _tools=self,
             stream_id=stream_id,
             tool_call_id=tool_call_id,
+            stream_agent=stream_agent,
             activity_options=resolved_activity_options,
         )
         if tool.args_mode == "raw":
@@ -385,6 +393,7 @@ class ToolSet:
             tool_args=tool_args,
             tool_result=tool_result,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=resolved_activity_options,
         )
         if post_guard_failure is not None:
@@ -553,6 +562,8 @@ async def run_tool_activity(request: ToolActivityRequest) -> Any:
         stream_id=request.stream_id,
         tool_name=request.tool_name,
         step=request.step,
+        agent=request.stream_agent,
+        tool_call_id=request.tool_call_id,
     )
     activity_context = ToolActivityContext(
         route_kind="tool",

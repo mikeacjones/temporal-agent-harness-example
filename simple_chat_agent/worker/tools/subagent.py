@@ -213,6 +213,12 @@ class SubagentWorkflow:
             max_tokens=request.max_tokens,
             tool_names=tool_names,
             stream_id=request.stream_id,
+            stream_agent={
+                "id": workflow.info().workflow_id,
+                "parent_id": parent_workflow_id,
+                "kind": "subagent",
+                "label": request.task,
+            },
         )
         if request.agent_state is None:
             result = await agent.run(

@@ -839,7 +839,10 @@ export default function App() {
         const streamEvent = parseStreamEventData(message);
         if (!streamEvent) return;
         enqueueStreamEvent(workflowId, streamEvent);
-        if (streamEvent.kind === AgentStreamEventKind.AGENT_START) {
+        if (
+          streamEvent.kind === AgentStreamEventKind.AGENT_START &&
+          streamEvent.agent?.kind !== "subagent"
+        ) {
           clearWorkflowStateRefresh();
         }
         if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {

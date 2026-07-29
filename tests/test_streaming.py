@@ -36,6 +36,30 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sink.events), 1)
         self.assertEqual(sink.events[0].payload, {"text": "What the fuck?"})
 
+    async def test_stream_event_preserves_agent_and_tool_call_identity(self) -> None:
+        sink = RecordingStreamSink()
+        configure_stream_sink(sink)
+        agent = {
+            "id": "chat-1-subagent-1",
+            "parent_id": "chat-1",
+            "kind": "subagent",
+            "label": "Research conservation policy",
+        }
+
+        await StreamContext(
+            stream_id="chat-1",
+            tool_name="search_web",
+            step="searxng",
+            agent=agent,
+            tool_call_id="tool-use-1",
+        ).emit(
+            {"query": "shark conservation policy"},
+            kind="search_start",
+        )
+
+        self.assertEqual(sink.events[0].agent, agent)
+        self.assertEqual(sink.events[0].tool_call_id, "tool-use-1")
+
     async def test_stream_sink_runs_text_delta_through_llm_guard(self) -> None:
         sink = RecordingStreamSink()
         configure_stream_sink(sink, llm_guard=good_place_post_guard)

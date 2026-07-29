@@ -20,6 +20,8 @@ class StreamEvent:
     kind: str
     payload: object
     sequence: int
+    agent: dict[str, str | None] | None = None
+    tool_call_id: str | None = None
 
 
 class StreamSink(Protocol):
@@ -44,6 +46,8 @@ class StreamContext:
     stream_id: str | None
     tool_name: str | None = None
     step: str | None = None
+    agent: dict[str, str | None] | None = None
+    tool_call_id: str | None = None
     _sequence: int = field(default=0, init=False)
 
     async def emit(self, payload: Any, *, kind: str = "message") -> None:
@@ -59,6 +63,8 @@ class StreamContext:
             kind=kind,
             payload=payload,
             sequence=self._sequence,
+            agent=dict(self.agent) if self.agent is not None else None,
+            tool_call_id=self.tool_call_id,
         )
 
         try:
@@ -103,6 +109,7 @@ class StreamContext:
                         },
                         state={},
                         stream_id=event.stream_id,
+                        stream_agent=event.agent,
                         activity_options=DEFAULT_ACTIVITY_OPTIONS,
                     )
                     guarded_message = (guarded.response or {}).get("message")
@@ -124,6 +131,8 @@ class StreamContext:
                         kind=event.kind,
                         payload=stream_payload,
                         sequence=event.sequence,
+                        agent=event.agent,
+                        tool_call_id=event.tool_call_id,
                     )
 
             result = sink.emit(event)
@@ -148,12 +157,14 @@ class AgentStreamWriter:
         provider: str,
         step: str | None = None,
         attempt: int | None = None,
+        agent: dict[str, str | None] | None = None,
     ) -> "AgentStreamWriter":
         return cls(
             stream=StreamContext(
                 stream_id=stream_id,
                 tool_name="agent",
                 step=step,
+                agent=agent,
             ),
             provider=provider,
             attempt=attempt,
@@ -354,6 +365,8 @@ class EmitStreamEventRequest:
     step: str | None
     kind: str
     payload: object
+    agent: dict[str, str | None] | None = None
+    tool_call_id: str | None = None
 
 
 async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
@@ -361,6 +374,8 @@ async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
         stream_id=request.stream_id,
         tool_name=request.tool_name,
         step=request.step,
+        agent=request.agent,
+        tool_call_id=request.tool_call_id,
     )
     await stream.emit(request.payload, kind=request.kind)
 

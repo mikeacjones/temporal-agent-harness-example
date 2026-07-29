@@ -110,6 +110,7 @@ class ClaudeRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
 
 
 @dataclass
@@ -172,6 +173,7 @@ class ClaudeProvider(AgentProvider):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> "ClaudeRequest":
         return ClaudeRequest(
             system_prompt=system_prompt,
@@ -183,6 +185,7 @@ class ClaudeProvider(AgentProvider):
             stream_id=stream_id,
             stream_sequence=stream_sequence,
             stream_attempt=stream_attempt,
+            stream_agent=stream_agent,
             **_thinking_request_params(self._thinking, max_tokens=max_tokens),
         )
 
@@ -247,6 +250,7 @@ class ClaudeAgent(Agent):
         thinking: ClaudeThinkingConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         claude_activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
@@ -270,6 +274,7 @@ class ClaudeAgent(Agent):
             max_tokens=max_tokens,
             tool_names=tool_names,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
             llm_guard_activity_options=llm_guard_activity_options,
             pre_llm_guards=pre_llm_guards,
@@ -303,6 +308,7 @@ def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
         "stream_attempt": request.stream_attempt,
+        "stream_agent": _copy_optional_mapping(request.stream_agent),
         "output_config": _copy_optional_mapping(request.output_config),
     }
 
@@ -320,6 +326,10 @@ def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
         stream_attempt=cast(int | None, request.get("stream_attempt")),
+        stream_agent=cast(
+            dict[str, str | None] | None,
+            _copy_optional_mapping(request.get("stream_agent")),
+        ),
     )
 
 
@@ -405,6 +415,7 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
                 stream_attempt=request.stream_attempt,
+                stream_agent=request.stream_agent,
             )
     except APIStatusError as err:
         if _anthropic_error_is_context_window_exceeded(err):
@@ -492,11 +503,13 @@ async def _stream_claude_message(
     stream_id: str | None,
     stream_sequence: int | None,
     stream_attempt: int | None,
+    stream_agent: dict[str, str | None] | None,
 ) -> Any:
     stream = AgentStreamWriter.for_provider(
         stream_id=stream_id,
         provider="claude",
         attempt=stream_attempt,
+        agent=stream_agent,
     )
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))

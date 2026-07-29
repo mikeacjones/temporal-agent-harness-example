@@ -68,6 +68,7 @@ class Agent:
         max_tokens: int = 4096,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
         pre_llm_guards: Iterable[LlmGuardFn] | None = None,
@@ -86,6 +87,7 @@ class Agent:
         self._max_tokens = max_tokens
         self._tool_names = tool_names
         self._stream_id = stream_id
+        self._stream_agent = dict(stream_agent) if stream_agent is not None else None
         self._activity_options = activity_options
         self._llm_guard_activity_options = (
             llm_guard_activity_options or activity_options or DEFAULT_ACTIVITY_OPTIONS
@@ -326,12 +328,14 @@ class Agent:
             stream_id=self._stream_id,
             stream_sequence=self._provider_call_sequence,
             stream_attempt=1,
+            stream_agent=self._stream_agent,
         )
 
         pre_guard_execution = await self._llm_guards.execute_pre(
             request=self._provider.request_to_dict(guard_request),
             state=self._llm_guard_state,
             stream_id=self._stream_id,
+            stream_agent=self._stream_agent,
             activity_options=self._llm_guard_activity_options,
         )
         guarded = self._provider.request_from_dict(pre_guard_execution.request)
@@ -366,6 +370,7 @@ class Agent:
                 response=self._provider.response_to_dict(response),
                 state=pre_guard_execution.state,
                 stream_id=self._stream_id,
+                stream_agent=self._stream_agent,
                 activity_options=self._llm_guard_activity_options,
             )
             if post_guard_execution.halted:
@@ -570,6 +575,7 @@ class Agent:
             kwargs,
             stream_id=self._stream_id,
             tool_call_id=tool_call_id,
+            stream_agent=self._stream_agent,
             activity_options=self._activity_options,
         )
 

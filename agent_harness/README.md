@@ -200,6 +200,11 @@ stream emission to succeed for workflow correctness. In this demo, the worker
 emits sideband events to the API, and the API reconciles those events with
 durable workflow snapshot/delta queries.
 
+Agents can attach `stream_agent` metadata with a stable `id`, `parent_id`,
+`kind`, and user-facing `label`. The same metadata follows provider deltas,
+tool and guard activities, and sandbox output so a shared conversation stream
+can be grouped accurately when multiple child agents run concurrently.
+
 ## Attachments
 
 Attachments are represented as `AttachmentRef` values in generic messages. The

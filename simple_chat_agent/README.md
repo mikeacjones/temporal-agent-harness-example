@@ -248,7 +248,10 @@ state only when needed:
 - `stream`: non-durable sideband stream events. Local dev reads the JSONL stream
   file written by `JsonlStreamSink`; deployment receives the same events through
   the API-owned `/internal/stream` endpoint. This is used for Claude token
-  deltas, streamed tool input construction, and tool activity visibility.
+  deltas, streamed tool input construction, and tool activity visibility. Every
+  new event includes main/subagent origin metadata, allowing the UI to show a
+  compact orchestration overview while retaining a fully attributed raw-event
+  debug view.
 - Durable state loads through `/api/sessions/{workflow_id}/snapshot`, older
   messages through `/messages`, settled-message deltas through `/messages/deltas`,
   and small workflow-state patches through `/state/patch`.

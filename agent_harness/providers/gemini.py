@@ -105,6 +105,7 @@ class GeminiRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
     thinking_config: dict | None = None
 
 
@@ -168,6 +169,7 @@ class GeminiProvider(AgentProvider):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> GeminiRequest:
         return GeminiRequest(
             system_prompt=system_prompt,
@@ -179,6 +181,7 @@ class GeminiProvider(AgentProvider):
             stream_id=stream_id,
             stream_sequence=stream_sequence,
             stream_attempt=stream_attempt,
+            stream_agent=stream_agent,
             thinking_config=_thinking_config_to_gemini(self._thinking),
         )
 
@@ -243,6 +246,7 @@ class GeminiAgent(Agent):
         thinking: GeminiThinkingConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         gemini_activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
@@ -266,6 +270,7 @@ class GeminiAgent(Agent):
             max_tokens=max_tokens,
             tool_names=tool_names,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
             llm_guard_activity_options=llm_guard_activity_options,
             pre_llm_guards=pre_llm_guards,
@@ -349,6 +354,7 @@ def _gemini_request_to_dict(request: GeminiRequest) -> dict[str, Any]:
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
         "stream_attempt": request.stream_attempt,
+        "stream_agent": _copy_optional_mapping(request.stream_agent),
         "thinking_config": _copy_optional_mapping(request.thinking_config),
     }
 
@@ -364,6 +370,10 @@ def _gemini_request_from_dict(request: dict[str, Any]) -> GeminiRequest:
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
         stream_attempt=cast(int | None, request.get("stream_attempt")),
+        stream_agent=cast(
+            dict[str, str | None] | None,
+            _copy_optional_mapping(request.get("stream_agent")),
+        ),
         thinking_config=_copy_optional_mapping(request.get("thinking_config")),
     )
 
@@ -454,6 +464,7 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
                 stream_id=request.stream_id,
                 stream_sequence=request.stream_sequence,
                 stream_attempt=request.stream_attempt,
+                stream_agent=request.stream_agent,
             )
     except genai_errors.APIError as err:
         if _google_error_is_context_window_exceeded(err):
@@ -572,11 +583,13 @@ async def _stream_gemini_message(
     stream_id: str | None,
     stream_sequence: int | None,
     stream_attempt: int | None,
+    stream_agent: dict[str, str | None] | None,
 ) -> _GeminiStreamState:
     stream = AgentStreamWriter.for_provider(
         stream_id=stream_id,
         provider="gemini",
         attempt=stream_attempt,
+        agent=stream_agent,
     )
     stream_state = _GeminiStreamState(sequence=stream_sequence, model=model)
     heartbeat_state = _GeminiHeartbeatState(sequence=stream_sequence)

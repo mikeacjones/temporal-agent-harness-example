@@ -98,6 +98,7 @@ class LlmGuardContext:
     response: dict | None = None
     state: dict = field(default_factory=dict)
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
@@ -136,6 +137,7 @@ class LlmGuardContext:
                 guard_name=self.guard_name,
                 step=step,
                 stream_id=self.stream_id,
+                stream_agent=self.stream_agent,
             ),
             summary_base=f"llm_guard:{self.timing.value}:{self.guard_name}",
             step=step,
@@ -187,6 +189,7 @@ class LlmGuardPipeline:
         request: dict[str, Any],
         state: dict[str, Any] | None = None,
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions,
     ) -> LlmGuardExecution:
         return await self._execute(
@@ -196,6 +199,7 @@ class LlmGuardPipeline:
             response=None,
             state=state or {},
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
         )
 
@@ -206,6 +210,7 @@ class LlmGuardPipeline:
         response: dict[str, Any],
         state: dict[str, Any],
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions,
     ) -> LlmGuardExecution:
         return await self._execute(
@@ -215,6 +220,7 @@ class LlmGuardPipeline:
             response=response,
             state=state,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
         )
 
@@ -227,6 +233,7 @@ class LlmGuardPipeline:
         response: dict[str, Any] | None,
         state: dict[str, Any],
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None,
         activity_options: ActivityOptions,
     ) -> LlmGuardExecution:
         current_request = _copy_dict(request)
@@ -244,6 +251,7 @@ class LlmGuardPipeline:
                 else _copy_dict(current_response),
                 state=_copy_dict(current_state),
                 stream_id=stream_id,
+                stream_agent=stream_agent,
                 activity_options=activity_options,
             )
             result = await call_llm_guard(guard, ctx)

@@ -362,6 +362,7 @@ Constructor concepts:
 | `max_tokens` | Provider response token budget. |
 | `tool_names` | Optional allow-list from the registered `ToolSet`. |
 | `stream_id` | Correlation id for sideband stream events. |
+| `stream_agent` | Optional agent identity (`id`, `parent_id`, `kind`, `label`) attached to provider and tool events. |
 | `activity_options` | Default options for tool activity routing. |
 | `llm_guard_activity_options` | Default options for LLM guard activity routing. |
 | `pre_llm_guards` / `post_llm_guards` | Request/response guard functions. |
@@ -763,7 +764,9 @@ Provider activities should use `AgentStreamWriter` and its fixed event kinds:
 - `agent_cancelled`
 
 Tool or guard activities can accept `StreamContext` by annotation and emit their
-own lower-frequency progress events.
+own lower-frequency progress events. `StreamEvent.agent` identifies the main or
+child agent that caused an event, and `StreamEvent.tool_call_id` lets consumers
+roll multiple progress events into one logical tool invocation.
 
 ### Attachments
 
