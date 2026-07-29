@@ -158,6 +158,12 @@ bytes through the artifact store, and gives chat workflows only
 Generated artifacts use the same storage path but are marked as agent-created.
 The UI receives separate lists for generated artifacts and user attachments.
 
+HTML artifacts have a dedicated preview response and render inside a sandboxed
+iframe. The preview allows self-contained HTML, CSS, data images, and inline
+SVG, but blocks scripts, network access, forms, nested frames, browser
+capabilities, and access to the application origin. The normal inline artifact
+route continues to serve HTML as plain text.
+
 Artifact and attachment records expose expiration metadata. If retained bytes
 expire, read/download routes return clear unavailable responses instead of
 pretending the agent can still inspect the original content.

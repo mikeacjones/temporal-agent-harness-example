@@ -624,6 +624,31 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             raise HTTPException(status_code=404, detail="Artifact not found")
         return artifact_response(deps.store(), artifact, disposition="inline")
 
+    @router.get("/api/artifacts/{artifact_id}/preview")
+    async def preview_html_artifact(request: Request, artifact_id: str) -> Response:
+        user = deps.current_user(request)
+        artifact = deps.store().get_artifact(
+            user_id=user.user_id,
+            artifact_id=artifact_id,
+        )
+        if artifact is None or artifact_is_user_attachment(artifact):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        mime_type = artifact.mime_type.lower()
+        name = artifact.name.lower()
+        if (
+            mime_type not in ("text/html", "application/xhtml+xml")
+            and not name.endswith((".html", ".htm", ".xhtml"))
+        ):
+            raise HTTPException(
+                status_code=415,
+                detail="Artifact is not an HTML document",
+            )
+        return artifact_response(
+            deps.store(),
+            artifact,
+            disposition="html-preview",
+        )
+
     @router.get("/api/artifacts/{artifact_id}/download")
     async def download_artifact(request: Request, artifact_id: str) -> Response:
         user = deps.current_user(request)

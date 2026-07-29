@@ -36,6 +36,9 @@ class ArtifactProvider:
             "persist files; use this tool for durable file output. Pass text "
             "content directly with encoding='text', or pass base64 content "
             "with encoding='base64' for binary files. File name should be the name of the file only without path - paths are not supported."
+            " HTML artifacts must be self-contained and work without JavaScript "
+            "or network-loaded assets because the viewer deliberately disables "
+            "both."
         ),
         tool_type=ToolType.MUTATING,
         pre_guards=["mutating_tool_approval"],

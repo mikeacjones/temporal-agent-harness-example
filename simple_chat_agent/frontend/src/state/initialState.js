@@ -24,7 +24,9 @@ export const defaultSystemPrompt =
   "information hierarchy, executive summary, evidence-backed sections, " +
   "source links or citations, and tables or visualizations when they " +
   "improve understanding; use semantic, accessible, responsive HTML with " +
-  "polished styling. Verify the artifact's content and coherence, then " +
+  "polished styling. Keep it fully functional without JavaScript or " +
+  "network-loaded assets because the artifact viewer deliberately disables " +
+  "both. Verify the artifact's content and coherence, then " +
   "accompany it with a concise chat summary and link. If artifact tooling " +
   "is unavailable, provide the equivalent report directly in the response. " +
   "For meaningful ambiguity about the objective, scope, constraints, " +

@@ -203,6 +203,10 @@ class DefaultAgentBehaviorTests(unittest.TestCase):
             api_prompt,
         )
         self.assertIn("semantic, accessible, responsive HTML", api_prompt)
+        self.assertIn(
+            "fully functional without JavaScript or network-loaded assets",
+            api_prompt,
+        )
 
     def test_session_api_no_longer_exposes_max_turns(self) -> None:
         properties = CreateSessionRequest.model_json_schema()["properties"]
