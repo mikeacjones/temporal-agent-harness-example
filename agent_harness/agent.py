@@ -55,6 +55,7 @@ CONTEXT_OVERFLOW_RECOVERY_ATTEMPTS = 1
 CONTEXT_OVERFLOW_RETRY_CHARS_PER_TOKEN = 2.5
 CONTEXT_OVERFLOW_RETRY_SAFETY_MARGIN_MULTIPLIER = 4
 CONTEXT_OVERFLOW_RETRY_MIN_SAFETY_MARGIN_TOKENS = 16_000
+UNLIMITED_AGENT_TURNS_PATCH = "agent-unlimited-turns-v1"
 
 
 class Agent:
@@ -153,6 +154,8 @@ class Agent:
         *,
         attachments: list[AttachmentRef] | None = None,
         state: AgentState | None = None,
+        # Retained only so histories created before agent-unlimited-turns-v1
+        # replay with their original stopping behavior. New executions ignore it.
         max_turns: int = 20,
     ) -> AgentResult:
         if self._terminated:
@@ -183,8 +186,9 @@ class Agent:
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
         turn = completed_turns
+        unlimited_turns = workflow.patched(UNLIMITED_AGENT_TURNS_PATCH)
 
-        while turn < max_turns:
+        while unlimited_turns or turn < max_turns:
             if self._interrupt_requested:
                 await self._flush_interrupt_context()
             await self._flush_immediate_context()

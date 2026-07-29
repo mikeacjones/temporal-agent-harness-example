@@ -9,7 +9,7 @@ from typing import Any, cast
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from agent_harness.agent import ContinueAsNewPolicy
+    from agent_harness.agent import AgentState, ContinueAsNewPolicy
     from agent_harness.mcp import HttpMcpProvider
     from agent_harness.mcp_types import HttpMcpServerConfig
     from agent_harness.providers.claude import ClaudeAgent
@@ -52,6 +52,8 @@ class SubagentRequest:
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     stream_id: str | None = None
+    agent_state: AgentState | None = None
+    approval_counter: int = 0
 
 
 @dataclass
@@ -87,7 +89,8 @@ class SubagentProvider:
             "subset of tool_names for the child to use. The child inherits this "
             "chat's streaming sideband. Mutating delegated tools request "
             "approval through this parent chat. Recursive subagents are not "
-            "delegated."
+            "delegated. The child continues until it finishes; no turn limit is "
+            "applied."
         ),
         tool_type=ToolType.READ,
     )
@@ -120,6 +123,8 @@ class SubagentProvider:
             available_tool_names,
         )
         max_tokens = max(1_024, min(max_tokens, _MAX_SUBAGENT_MAX_TOKENS))
+        # This value is carried into the child only so pre-unlimited histories
+        # reproduce their original command. New child runs ignore the turn cap.
         max_turns = max(1, min(max_turns, _MAX_SUBAGENT_MAX_TURNS))
         child_workflow_id = (
             f"{workflow.info().workflow_id}-subagent-{workflow.uuid4()}"
@@ -170,6 +175,7 @@ class SubagentWorkflow:
     async def run(self, request: SubagentRequest) -> SubagentResponse:
         parent_workflow_id = _parent_workflow_id(request)
         self._parent_workflow_id = parent_workflow_id
+        self._approval_counter = request.approval_counter
         tools = _build_subagent_tools(
             parent_workflow_id=parent_workflow_id or workflow.info().workflow_id,
             user_ref=request.user_ref,
@@ -194,9 +200,42 @@ class SubagentWorkflow:
             max_tokens=request.max_tokens,
             tool_names=tool_names,
             stream_id=request.stream_id,
-            continue_as_new_policy=ContinueAsNewPolicy(enabled=False),
+            continue_as_new_policy=ContinueAsNewPolicy(
+                enabled=workflow.patched("subagent-continue-as-new-v1")
+            ),
         )
-        result = await agent.run(request.task, max_turns=request.max_turns)
+        if request.agent_state is None:
+            result = await agent.run(request.task, max_turns=request.max_turns)
+        else:
+            result = await agent.run(
+                state=request.agent_state,
+                max_turns=request.max_turns,
+            )
+
+        if result.needs_continue_as_new:
+            workflow.continue_as_new(
+                SubagentRequest(
+                    system_prompt=request.system_prompt,
+                    task=request.task,
+                    model=request.model,
+                    max_tokens=request.max_tokens,
+                    max_turns=request.max_turns,
+                    tool_names=tool_names,
+                    denied_tool_names=denied_tool_names,
+                    parent_workflow_id=parent_workflow_id,
+                    user_ref=request.user_ref,
+                    conversation_id=request.conversation_id,
+                    github_connection_id=request.github_connection_id,
+                    mcp_servers=list(request.mcp_servers),
+                    stream_id=request.stream_id,
+                    agent_state=result.continuation_state,
+                    approval_counter=self._approval_counter,
+                ),
+                initial_versioning_behavior=(
+                    workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
+                ),
+            )
+
         return SubagentResponse(
             text=_assistant_text(result.message),
             stop_reason=result.stop_reason,

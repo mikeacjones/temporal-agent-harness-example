@@ -136,7 +136,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 model=model,
                 max_tokens=max_tokens,
                 max_context_tokens=max_context_tokens,
-                max_turns=session_request.max_turns,
                 thinking=thinking_config_from_request(
                     session_request.thinking,
                     model=model,

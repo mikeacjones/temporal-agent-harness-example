@@ -375,7 +375,7 @@ Important methods:
 
 | Method | Use |
 | --- | --- |
-| `run(user_prompt, attachments=None, state=None, max_turns=20)` | Execute the model/tool loop. Use `state` to resume after continue-as-new. |
+| `run(user_prompt, attachments=None, state=None)` | Execute the uncapped model/tool loop. Use `state` to resume after continue-as-new. |
 | `steer(message, mode="immediate")` | Add out-of-band steering during a run. |
 | `interrupt(message, partial_response_policy="discard")` | Interrupt an in-flight provider call or tool call. |
 | `restore_idle_state(state)` | Restore compacted context between turns. |
@@ -424,7 +424,7 @@ Required provider methods:
 | `response_from_guard_execution(...)` | Build a provider-shaped guard response. |
 | `response_with_visible_refusal(...)` | Normalize provider refusals. |
 | `response_message(...)` | Convert provider response into generic assistant message. |
-| `stop_reason_for_max_turns()` | Stop reason used when `max_turns` is reached. |
+| `stop_reason_for_max_turns()` | Legacy replay behavior for histories created before uncapped agent turns. |
 
 Provider convenience classes live under `agent_harness.providers`. They keep
 provider-specific options provider-specific while letting workflow code create

@@ -313,10 +313,13 @@ agent = ClaudeAgent(
     max_context_tokens=200_000,
 )
 
-result = await agent.run(user_message, max_turns=20)
+result = await agent.run(user_message)
 ```
 
 The default `SlidingWindowContextManager` keeps recent context, preserves the initial user message, removes stale tool-result blocks from older rounds, and fits the model input into a conservative token budget before each provider call. The latest tool result is preserved in full for the next model call.
+The agent loop has no turn cap; it continues until the model produces a final
+response, a guard halts it, the user interrupts it, or the workflow reaches a
+safe continue-as-new boundary.
 
 Applications can replace the context manager by passing `context_manager_factory=...`.
 

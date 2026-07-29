@@ -70,7 +70,9 @@ class CreateChatRequest:
     system_prompt: str
     model: str
     max_tokens: int
-    max_turns: int
+    # Kept for payload compatibility with create-chat updates recorded before
+    # agent-unlimited-turns-v1. New agent runs do not enforce this value.
+    max_turns: int = 20
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
     initial_message: str | None = None
