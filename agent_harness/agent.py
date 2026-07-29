@@ -39,6 +39,7 @@ from .providers.interface import (
     start_provider_activity,
 )
 from .sliding_window_context_manager import SlidingWindowContextManager
+from .streaming import emit_harness_event, stream_error_payload
 from .tools import ToolResult, ToolSet
 
 AgentStopReason = str
@@ -419,7 +420,32 @@ class Agent:
                     and _is_context_window_exceeded(err)
                 ):
                     context_overflow_retries += 1
+                    previous_attempt = stream_attempt
                     stream_attempt += 1
+                    agent_id = (
+                        self._stream_agent.get("id")
+                        if self._stream_agent is not None
+                        else "main"
+                    )
+                    await emit_harness_event(
+                        stream_id=self._stream_id,
+                        kind="harness_llm_retry",
+                        payload={
+                            "operation_id": (
+                                f"{agent_id or 'main'}:llm:"
+                                f"{self._provider_call_sequence}"
+                            ),
+                            "llm_sequence": self._provider_call_sequence,
+                            "provider": self._provider.name,
+                            "model": self._model,
+                            "failed_attempt": previous_attempt,
+                            "next_attempt": stream_attempt,
+                            "status": "retrying",
+                            "error": stream_error_payload(err),
+                        },
+                        agent=self._stream_agent,
+                        tool_name="agent",
+                    )
                     context_budget = self._context_token_budget(
                         tool_params,
                         context_overflow_retry=True,
@@ -561,11 +587,73 @@ class Agent:
         **kwargs: Any,
     ) -> ToolResult:
         if self._tool_names is not None and tool_name not in self._tool_names:
+            agent_id = (
+                self._stream_agent.get("id")
+                if self._stream_agent is not None
+                else "main"
+            )
+            await emit_harness_event(
+                stream_id=self._stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": tool_call_id
+                    or (
+                        f"{agent_id or 'main'}:tool:"
+                        f"{self._provider_call_sequence}:{tool_name}"
+                    ),
+                    "parent_operation_id": (
+                        f"{agent_id or 'main'}:llm:"
+                        f"{self._provider_call_sequence}"
+                    ),
+                    "tool_name": tool_name,
+                    "llm_sequence": self._provider_call_sequence,
+                    "status": "failed",
+                    "error": {
+                        "type": "ToolUnavailable",
+                        "message": (
+                            f"Tool is not available to this agent: {tool_name}"
+                        ),
+                    },
+                },
+                agent=self._stream_agent,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(
                 payload={"error": f"Tool is not available to this agent: {tool_name}"},
                 error=True,
             )
         if tool_name not in self._tools.tool_names():
+            agent_id = (
+                self._stream_agent.get("id")
+                if self._stream_agent is not None
+                else "main"
+            )
+            await emit_harness_event(
+                stream_id=self._stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": tool_call_id
+                    or (
+                        f"{agent_id or 'main'}:tool:"
+                        f"{self._provider_call_sequence}:{tool_name}"
+                    ),
+                    "parent_operation_id": (
+                        f"{agent_id or 'main'}:llm:"
+                        f"{self._provider_call_sequence}"
+                    ),
+                    "tool_name": tool_name,
+                    "llm_sequence": self._provider_call_sequence,
+                    "status": "failed",
+                    "error": {
+                        "type": "UnknownTool",
+                        "message": f"Unknown tool requested: {tool_name}",
+                    },
+                },
+                agent=self._stream_agent,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(
                 payload={"error": f"Unknown tool requested: {tool_name}"},
                 error=True,
@@ -576,6 +664,7 @@ class Agent:
             stream_id=self._stream_id,
             tool_call_id=tool_call_id,
             stream_agent=self._stream_agent,
+            llm_sequence=self._provider_call_sequence,
             activity_options=self._activity_options,
         )
 

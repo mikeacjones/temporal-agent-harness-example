@@ -35,7 +35,7 @@ from .guards import (
     guard_metadata,
 )
 from .invocation import bind_keyword_arguments, maybe_await
-from .streaming import StreamContext
+from .streaming import StreamContext, emit_harness_event, stream_error_payload
 from .tool_types import ToolCategory, normalize_tool_category
 from .workflow_activities import execute_routed_activity, record_routed_activity_call
 
@@ -343,16 +343,62 @@ class ToolSet:
         stream_id: str | None = None,
         tool_call_id: str | None = None,
         stream_agent: dict[str, str | None] | None = None,
+        llm_sequence: int | None = None,
         activity_options: ActivityOptions | None = None,
     ) -> ToolResult:
         tool = self.get_tool(name)
-        self._guards.validate_tool_guards(
-            tool_type=tool.tool_type,
-            pre_guards=tool.pre_guards,
-            post_guards=tool.post_guards,
-        )
         tool_args = args or {}
         resolved_activity_options = activity_options or DEFAULT_ACTIVITY_OPTIONS
+        agent_id = (
+            stream_agent.get("id")
+            if stream_agent is not None
+            else "main"
+        )
+        operation_id = tool_call_id or (
+            f"{agent_id or 'main'}:tool:{llm_sequence or 'unknown'}:{name}"
+        )
+        parent_operation_id = (
+            f"{agent_id or 'main'}:llm:{llm_sequence or 'unknown'}"
+        )
+        await emit_harness_event(
+            stream_id=stream_id,
+            kind="harness_tool_start",
+            payload={
+                "operation_id": operation_id,
+                "parent_operation_id": parent_operation_id,
+                "tool_name": name,
+                "tool_type": tool.tool_type,
+                "llm_sequence": llm_sequence,
+                "status": "running",
+            },
+            agent=stream_agent,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+        )
+        try:
+            self._guards.validate_tool_guards(
+                tool_type=tool.tool_type,
+                pre_guards=tool.pre_guards,
+                post_guards=tool.post_guards,
+            )
+        except Exception as err:
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "tool_name": name,
+                    "tool_type": tool.tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "failed",
+                    "error": stream_error_payload(err),
+                },
+                agent=stream_agent,
+                tool_name=name,
+                tool_call_id=tool_call_id,
+            )
+            raise
 
         pre_guard_failure = await self._guards.execute_guards(
             tool.pre_guards,
@@ -363,9 +409,27 @@ class ToolSet:
             tool_result=None,
             stream_id=stream_id,
             stream_agent=stream_agent,
+            tool_call_id=tool_call_id,
+            llm_sequence=llm_sequence,
+            parent_operation_id=operation_id,
             activity_options=resolved_activity_options,
         )
         if pre_guard_failure is not None:
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_complete",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "tool_name": name,
+                    "tool_type": tool.tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "blocked",
+                },
+                agent=stream_agent,
+                tool_name=name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(payload=pre_guard_failure.payload, error=True)
 
         ctx = ToolContext(
@@ -376,14 +440,37 @@ class ToolSet:
             stream_agent=stream_agent,
             activity_options=resolved_activity_options,
         )
-        if tool.args_mode == "raw":
-            tool_result = await _call_dynamic_tool(
-                cast(DynamicToolFn, tool.fn),
-                ctx,
-                tool_args,
+        try:
+            if tool.args_mode == "raw":
+                tool_result = await _call_dynamic_tool(
+                    cast(DynamicToolFn, tool.fn),
+                    ctx,
+                    tool_args,
+                )
+            else:
+                tool_result = await _call_tool(
+                    cast(ToolFn, tool.fn),
+                    ctx,
+                    tool_args,
+                )
+        except Exception as err:
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "tool_name": name,
+                    "tool_type": tool.tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "failed",
+                    "error": stream_error_payload(err),
+                },
+                agent=stream_agent,
+                tool_name=name,
+                tool_call_id=tool_call_id,
             )
-        else:
-            tool_result = await _call_tool(cast(ToolFn, tool.fn), ctx, tool_args)
+            raise
 
         post_guard_failure = await self._guards.execute_guards(
             tool.post_guards,
@@ -394,11 +481,44 @@ class ToolSet:
             tool_result=tool_result,
             stream_id=stream_id,
             stream_agent=stream_agent,
+            tool_call_id=tool_call_id,
+            llm_sequence=llm_sequence,
+            parent_operation_id=operation_id,
             activity_options=resolved_activity_options,
         )
         if post_guard_failure is not None:
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_complete",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "tool_name": name,
+                    "tool_type": tool.tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "blocked",
+                },
+                agent=stream_agent,
+                tool_name=name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(payload=post_guard_failure.payload, error=True)
 
+        await emit_harness_event(
+            stream_id=stream_id,
+            kind="harness_tool_complete",
+            payload={
+                "operation_id": operation_id,
+                "parent_operation_id": parent_operation_id,
+                "tool_name": name,
+                "tool_type": tool.tool_type,
+                "llm_sequence": llm_sequence,
+                "status": "failed" if tool_result.error else "complete",
+            },
+            agent=stream_agent,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+        )
         return tool_result
 
     def _register_tool(
@@ -571,12 +691,58 @@ async def run_tool_activity(request: ToolActivityRequest) -> Any:
         step=request.step,
         stream_id=request.stream_id,
     )
-    return await call_activity(
-        fn,
-        request.args,
-        stream,
-        activity_context=activity_context,
+    activity_attempt = temporal_activity.info().attempt
+    parent_operation_id = request.tool_call_id or (
+        f"tool:{request.tool_name or 'unknown'}"
     )
+    operation_id = (
+        f"{parent_operation_id}:activity:{request.step or request.function_ref}"
+    )
+    await stream.emit(
+        {
+            "operation_id": operation_id,
+            "parent_operation_id": parent_operation_id,
+            "activity_name": request.function_ref,
+            "tool_name": request.tool_name,
+            "activity_attempt": activity_attempt,
+            "status": "running" if activity_attempt == 1 else "retrying",
+        },
+        kind="harness_tool_activity_start",
+    )
+    try:
+        result = await call_activity(
+            fn,
+            request.args,
+            stream,
+            activity_context=activity_context,
+        )
+    except Exception as err:
+        await stream.emit(
+            {
+                "operation_id": operation_id,
+                "parent_operation_id": parent_operation_id,
+                "activity_name": request.function_ref,
+                "tool_name": request.tool_name,
+                "activity_attempt": activity_attempt,
+                "status": "failed",
+                "error": stream_error_payload(err),
+            },
+            kind="harness_tool_activity_failed",
+        )
+        raise
+
+    await stream.emit(
+        {
+            "operation_id": operation_id,
+            "parent_operation_id": parent_operation_id,
+            "activity_name": request.function_ref,
+            "tool_name": request.tool_name,
+            "activity_attempt": activity_attempt,
+            "status": "complete",
+        },
+        kind="harness_tool_activity_complete",
+    )
+    return result
 
 
 async def _call_tool(

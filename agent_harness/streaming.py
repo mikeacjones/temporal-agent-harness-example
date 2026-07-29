@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Awaitable, Protocol
 
@@ -22,6 +23,7 @@ class StreamEvent:
     sequence: int
     agent: dict[str, str | None] | None = None
     tool_call_id: str | None = None
+    emitted_at: str | None = None
 
 
 class StreamSink(Protocol):
@@ -39,6 +41,7 @@ class AgentStreamEventKind(StrEnum):
     AGENT_TOOL_INPUT_COMPLETE = "agent_tool_input_complete"
     AGENT_COMPLETE = "agent_complete"
     AGENT_CANCELLED = "agent_cancelled"
+    AGENT_FAILED = "agent_failed"
 
 
 @dataclass
@@ -65,6 +68,7 @@ class StreamContext:
             sequence=self._sequence,
             agent=dict(self.agent) if self.agent is not None else None,
             tool_call_id=self.tool_call_id,
+            emitted_at=datetime.now(timezone.utc).isoformat(),
         )
 
         try:
@@ -133,6 +137,7 @@ class StreamContext:
                         sequence=event.sequence,
                         agent=event.agent,
                         tool_call_id=event.tool_call_id,
+                        emitted_at=event.emitted_at,
                     )
 
             result = sink.emit(event)
@@ -170,16 +175,37 @@ class AgentStreamWriter:
             attempt=attempt,
         )
 
-    async def agent_started(self, *, sequence: int | None) -> None:
+    async def agent_started(
+        self,
+        *,
+        sequence: int | None,
+        model: str | None = None,
+    ) -> None:
         await self._emit(
             AgentStreamEventKind.AGENT_START,
-            {"sequence": sequence},
+            {"sequence": sequence, "model": model},
         )
 
     async def agent_cancelled(self, *, sequence: int | None) -> None:
         await self._emit(
             AgentStreamEventKind.AGENT_CANCELLED,
             {"sequence": sequence},
+        )
+
+    async def agent_failed(
+        self,
+        *,
+        sequence: int | None,
+        model: str | None,
+        error: BaseException,
+    ) -> None:
+        await self._emit(
+            AgentStreamEventKind.AGENT_FAILED,
+            {
+                "sequence": sequence,
+                "model": model,
+                "error": stream_error_payload(error),
+            },
         )
 
     async def agent_completed(
@@ -303,9 +329,16 @@ class AgentStreamWriter:
         kind: AgentStreamEventKind,
         payload: dict[str, Any],
     ) -> None:
+        sequence = payload.get("sequence")
+        agent_id = (
+            self.stream.agent.get("id")
+            if self.stream.agent is not None
+            else "main"
+        )
         await self.stream.emit(
             {
                 "provider": self.provider,
+                "operation_id": f"{agent_id or 'main'}:llm:{sequence or 'unknown'}",
                 **payload,
                 **_attempt_payload(self.attempt),
             },
@@ -384,3 +417,49 @@ if temporal_activity is not None:
     emit_stream_event_activity = temporal_activity.defn(
         name="agent_harness.emit_stream_event"
     )(emit_stream_event_activity)
+
+
+async def emit_harness_event(
+    *,
+    stream_id: str | None,
+    kind: str,
+    payload: object,
+    agent: dict[str, str | None] | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    step: str | None = None,
+) -> None:
+    if stream_id is None:
+        return
+
+    # This function is used from deterministic Workflow code. The actual
+    # sideband write stays in an Activity so replay never performs HTTP or file
+    # I/O. Visibility failures must not fail the user's agent run.
+    try:
+        from temporalio import workflow
+        from temporalio.common import RetryPolicy
+
+        await workflow.execute_activity(
+            "agent_harness.emit_stream_event",
+            EmitStreamEventRequest(
+                stream_id=stream_id,
+                tool_name=tool_name,
+                step=step,
+                kind=kind,
+                payload=payload,
+                agent=agent,
+                tool_call_id=tool_call_id,
+            ),
+            start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            summary=f"stream:{kind}",
+        )
+    except Exception:
+        return
+
+
+def stream_error_payload(error: BaseException) -> dict[str, str]:
+    return {
+        "type": type(error).__name__,
+        "message": str(error),
+    }

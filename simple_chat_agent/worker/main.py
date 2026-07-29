@@ -14,7 +14,7 @@ from agent_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
-from agent_harness.streaming import configure_stream_sink
+from agent_harness.streaming import configure_stream_sink, emit_stream_event_activity
 from agent_harness.tools import run_tool_activity
 from agent_harness.providers.claude import call_agent_api
 from simple_chat_agent import TASK_QUEUE
@@ -103,6 +103,7 @@ async def main() -> None:
             call_agent_api,
             run_tool_activity,
             run_guard_activity,
+            emit_stream_event_activity,
             emit_turn_settled,
             provision_demo_workspace,
             resolve_demo_workspace_images,

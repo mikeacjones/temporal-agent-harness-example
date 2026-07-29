@@ -455,11 +455,22 @@ def _chatgpt_response_from_guard_execution(
 async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise ApplicationError(
+        error = ApplicationError(
             "OPENAI_API_KEY must be set to call ChatGPT",
             type="MissingApiKey",
             non_retryable=True,
         )
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="chatgpt",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=error,
+        )
+        raise error
 
     create_params: dict[str, Any] = {
         "model": request.model,
@@ -489,6 +500,16 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 stream_agent=request.stream_agent,
             )
     except APIStatusError as err:
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="chatgpt",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=err,
+        )
         if _openai_error_is_context_window_exceeded(err):
             raise ApplicationError(
                 str(err),
@@ -501,6 +522,19 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 type=err.__class__.__name__,
                 non_retryable=True,
             ) from err
+        raise
+    except BaseException as err:
+        if not isinstance(err, asyncio.CancelledError):
+            await AgentStreamWriter.for_provider(
+                stream_id=request.stream_id,
+                provider="chatgpt",
+                attempt=request.stream_attempt,
+                agent=request.stream_agent,
+            ).agent_failed(
+                sequence=request.stream_sequence,
+                model=request.model,
+                error=err,
+            )
         raise
 
     return ChatGPTResponse(
@@ -534,7 +568,10 @@ async def _stream_chatgpt_response(
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_chatgpt_stream(heartbeat_state))
 
-    await stream.agent_started(sequence=stream_sequence)
+    await stream.agent_started(
+        sequence=stream_sequence,
+        model=cast(str | None, create_params.get("model")),
+    )
 
     try:
         response_stream = await client.responses.create(**create_params)

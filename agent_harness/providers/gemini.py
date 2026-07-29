@@ -432,11 +432,22 @@ def _gemini_response_from_guard_execution(
 async def call_gemini(request: GeminiRequest) -> GeminiResponse:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise ApplicationError(
+        error = ApplicationError(
             "GEMINI_API_KEY or GOOGLE_API_KEY must be set to call Gemini",
             type="MissingApiKey",
             non_retryable=True,
         )
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="gemini",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=error,
+        )
+        raise error
 
     config = _gemini_generate_content_config(request)
     contents = [
@@ -467,6 +478,16 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
                 stream_agent=request.stream_agent,
             )
     except genai_errors.APIError as err:
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="gemini",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=err,
+        )
         if _google_error_is_context_window_exceeded(err):
             raise ApplicationError(
                 str(err),
@@ -481,6 +502,19 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
                 type=err.__class__.__name__,
                 non_retryable=True,
             ) from err
+        raise
+    except BaseException as err:
+        if not isinstance(err, asyncio.CancelledError):
+            await AgentStreamWriter.for_provider(
+                stream_id=request.stream_id,
+                provider="gemini",
+                attempt=request.stream_attempt,
+                agent=request.stream_agent,
+            ).agent_failed(
+                sequence=request.stream_sequence,
+                model=request.model,
+                error=err,
+            )
         raise
 
     return GeminiResponse(
@@ -596,7 +630,7 @@ async def _stream_gemini_message(
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_gemini_stream(heartbeat_state))
 
-    await stream.agent_started(sequence=stream_sequence)
+    await stream.agent_started(sequence=stream_sequence, model=model)
 
     try:
         response_stream = await client.models.generate_content_stream(

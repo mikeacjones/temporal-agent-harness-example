@@ -418,6 +418,16 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
                 stream_agent=request.stream_agent,
             )
     except APIStatusError as err:
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="claude",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=err,
+        )
         if _anthropic_error_is_context_window_exceeded(err):
             raise ApplicationError(
                 str(err),
@@ -430,6 +440,19 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
                 type=err.__class__.__name__,
                 non_retryable=True,
             ) from err
+        raise
+    except BaseException as err:
+        if not isinstance(err, asyncio.CancelledError):
+            await AgentStreamWriter.for_provider(
+                stream_id=request.stream_id,
+                provider="claude",
+                attempt=request.stream_attempt,
+                agent=request.stream_agent,
+            ).agent_failed(
+                sequence=request.stream_sequence,
+                model=request.model,
+                error=err,
+            )
         raise
 
     return ClaudeResponse(
@@ -514,7 +537,10 @@ async def _stream_claude_message(
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))
-    await stream.agent_started(sequence=stream_sequence)
+    await stream.agent_started(
+        sequence=stream_sequence,
+        model=cast(str | None, create_params.get("model")),
+    )
 
     try:
         async with client.messages.stream(

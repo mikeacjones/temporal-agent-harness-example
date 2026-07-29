@@ -159,6 +159,109 @@ test("only main-agent completions trigger workflow reconciliation boundaries", (
   assert.equal(streamEventNeedsSettledTranscriptDelta(childDone), false);
 });
 
+test("failed model attempts remain visible when Temporal retries the call", () => {
+  const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
+  let state = initialState();
+
+  state = handleStreamEventInState(
+    state,
+    event(AgentStart, main, {
+      sequence: 1,
+      provider: "claude",
+      model: "claude-sonnet",
+      stream_attempt: 1,
+      activity_attempt: 1,
+      attempt: 1001,
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentFailed, main, {
+      sequence: 1,
+      provider: "claude",
+      model: "claude-sonnet",
+      stream_attempt: 1,
+      activity_attempt: 1,
+      attempt: 1001,
+      error: { type: "APIConnectionError", message: "connection reset" },
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentStart, main, {
+      sequence: 1,
+      provider: "claude",
+      model: "claude-sonnet",
+      stream_attempt: 1,
+      activity_attempt: 2,
+      attempt: 1002,
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentComplete, main, {
+      sequence: 1,
+      provider: "claude",
+      model: "claude-sonnet",
+      stream_attempt: 1,
+      activity_attempt: 2,
+      attempt: 1002,
+      stop_reason: "end_turn",
+      text: "Recovered response",
+    }),
+  );
+
+  const attempts = state.streamTurn.segments.filter(
+    (segment) => segment.type === "agent" && segment.sequence === 1,
+  );
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].status, "failed");
+  assert.equal(attempts[0].error.message, "connection reset");
+  assert.equal(attempts[1].status, "complete");
+  assert.equal(attempts[1].activityAttempt, 2);
+  assert.equal(attempts[1].text, "Recovered response");
+});
+
+test("post-LLM guard lifecycle stays attached after provider completion", () => {
+  const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
+  let state = initialState();
+  state = handleStreamEventInState(
+    state,
+    event(AgentStart, main, { sequence: 1, attempt: 1001 }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentComplete, main, {
+      sequence: 1,
+      attempt: 1001,
+      stop_reason: "end_turn",
+      text: "Done",
+    }),
+  );
+  const completedTurn = state.streamTurn;
+  state = handleStreamEventInState(
+    state,
+    event("harness_llm_guard_complete", main, {
+      operation_id: "chat-1:llm:1:guard:post:0:good_place",
+      parent_operation_id: "chat-1:llm:1",
+      guard_name: "good_place",
+      timing: "post",
+      llm_sequence: 1,
+      status: "passed",
+    }),
+  );
+
+  assert.equal(state.streamTurn.startedAt, completedTurn.startedAt);
+  assert.equal(
+    state.streamTurn.segments
+      .filter((segment) => segment.type === "tools")
+      .flatMap((segment) => segment.events)
+      .some((streamEvent) => streamEvent.kind === "harness_llm_guard_complete"),
+    true,
+  );
+});
+
 const AgentStart = "agent_start";
 const AgentTextDelta = "agent_text_delta";
 const AgentComplete = "agent_complete";
+const AgentFailed = "agent_failed";

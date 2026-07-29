@@ -27,7 +27,10 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             workflow_id="simple-chat-parent",
             typed_search_attributes=parent_search_attributes,
         )
-        ctx = Mock(stream_id="simple-chat-parent")
+        ctx = Mock(
+            stream_id="simple-chat-parent",
+            tool_call_id="create-subagent-call-1",
+        )
         ctx.tool_names.return_value = ["research"]
         provider = SubagentProvider(
             default_model=lambda: "claude-sonnet-4-5",
@@ -72,6 +75,10 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         child_request = execute_child.await_args.args[1]
         self.assertEqual(child_request.tool_names, ["research"])
         self.assertEqual(child_request.reference_time, "2026-07-29T18:42:00Z")
+        self.assertEqual(
+            child_request.parent_tool_call_id,
+            "create-subagent-call-1",
+        )
         self.assertIn("focused research subagent", child_request.system_prompt)
         self.assertFalse(result.error)
 

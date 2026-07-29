@@ -6,10 +6,12 @@ import {
   AGENT_TOOL_INPUT_EVENT_PREFIX,
   AgentStreamEventKind,
 } from "../state/streamEvents.js";
+import { HarnessFlow } from "./HarnessFlow.jsx";
 
 export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
-  const [view, setView] = useState("overview");
+  const [view, setView] = useState("flow");
   const [selectedAgentId, setSelectedAgentId] = useState(null);
+  const [flowAgentId, setFlowAgentId] = useState(null);
   const [expandedAgentIds, setExpandedAgentIds] = useState(() => new Set());
   const [following, setFollowing] = useState(true);
   const [now, setNow] = useState(() => Date.now());
@@ -20,6 +22,8 @@ export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
   const subagents = agents.filter((agent) => agent.kind === "subagent");
   const selectedAgent =
     agents.find((agent) => agent.id === selectedAgentId) || subagents[0] || null;
+  const activeFlowAgentId =
+    agents.find((agent) => agent.id === flowAgentId)?.id || mainAgent?.id || null;
   const activityVersion = timeline.segments.reduce(
     (total, segment) =>
       total +
@@ -99,6 +103,7 @@ export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
             />
             <div className="stream-view-tabs" role="tablist" aria-label="Stream views">
               {[
+                ["flow", "Harness flow"],
                 ["overview", "Overview"],
                 ["main", "Main agent"],
                 ["subagents", `Subagents (${subagents.length})`],
@@ -147,6 +152,14 @@ export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
                     setSelectedAgentId(agentId);
                     setView("subagents");
                   }}
+                />
+              ) : null}
+              {view === "flow" ? (
+                <HarnessFlow
+                  timeline={timeline}
+                  agents={agents}
+                  activeAgentId={activeFlowAgentId}
+                  onSelectAgent={(agentId) => setFlowAgentId(agentId)}
                 />
               ) : null}
               {view === "main" ? (
@@ -423,11 +436,17 @@ function RawEventTimeline({ timeline }) {
 
 function AgentStreamSegment({ segment, showAgent = true }) {
   const complete = segment.status === "complete";
+  const failed = segment.status === "failed";
+  const retrying = segment.status === "retrying";
   const text = String(segment.text || "").trim();
   const thinking = String(segment.thinking || "").trim();
   const refusalDetails = refusalDetailsText(segment.stopDetails);
   return (
-    <div className={`stream-agent-segment ${complete ? "complete" : "streaming"}`}>
+    <div
+      className={`stream-agent-segment ${
+        failed ? "failed" : retrying ? "retrying" : complete ? "complete" : "streaming"
+      }`}
+    >
       <div className="stream-finished-title">
         {showAgent ? (
           <span className={`stream-agent-origin ${segment.agentKind || "main"}`}>
@@ -440,11 +459,20 @@ function AgentStreamSegment({ segment, showAgent = true }) {
               : "Main agent"}
           </span>
         ) : null}
-        Agent turn {segment.sequence ?? "—"} {complete ? "complete" : "streaming"}
+        Agent turn {segment.sequence ?? "—"}{" "}
+        {failed ? "failed" : retrying ? "retrying" : complete ? "complete" : "streaming"}
+        {segment.activityAttempt > 1 || segment.streamAttempt > 1
+          ? ` · attempt ${segment.activityAttempt || segment.streamAttempt}`
+          : ""}
         {complete && segment.stopReason ? ` · ${segment.stopReason}` : ""}
       </div>
       {thinking ? <div className="stream-thinking">{thinking}</div> : null}
       {refusalDetails ? <div className="stream-refusal-details">{refusalDetails}</div> : null}
+      {failed && segment.error ? (
+        <div className="stream-refusal-details">
+          {segment.error.type || "Error"}: {segment.error.message || "The model call failed."}
+        </div>
+      ) : null}
       {text ? (
         complete ? (
           <MarkdownContent content={text} />
@@ -453,7 +481,11 @@ function AgentStreamSegment({ segment, showAgent = true }) {
         )
       ) : (
         <div className="stream-preview">
-          {complete
+          {failed
+            ? "This attempt failed. Temporal may retry it."
+            : retrying
+              ? "Retrying the model call…"
+              : complete
             ? `Completed without text (${segment.stopReason || "unknown"}).`
             : "Waiting for streamed tokens…"}
         </div>
@@ -573,6 +605,7 @@ function streamAgents(timeline) {
       agents.set(id, {
         id,
         parentId: segment.parentAgentId || null,
+        parentToolCallId: segment.parentToolCallId || null,
         kind,
         label: String(segment.agentLabel || (kind === "main" ? "Main agent" : "Subagent")),
         segments: [],
@@ -604,6 +637,7 @@ function streamAgents(timeline) {
       agents.set(id, {
         id,
         parentId: segment.agentId || null,
+        parentToolCallId: event.payload?.tool_use_id || event.tool_call_id || null,
         kind: "subagent",
         label: task,
         segments: [],
@@ -619,17 +653,20 @@ function streamAgents(timeline) {
   return [...agents.values()].map((agent) => {
     const agentSegments = agent.segments.filter((segment) => segment.type === "agent");
     const latestAgentSegment = agentSegments[agentSegments.length - 1] || null;
-    const hasLiveSegment = agent.segments.some((segment) => segment.status === "streaming");
+    const hasLiveSegment = agent.segments.some((segment) =>
+      ["streaming", "retrying"].includes(segment.status),
+    );
     let status = "waiting";
     if (agent.queued) status = "queued";
     else if (
-      latestAgentSegment?.status === "interrupted" ||
+      ["interrupted", "failed"].includes(latestAgentSegment?.status) ||
       ["error", "failed", "cancelled", "refusal"].includes(
         String(latestAgentSegment?.stopReason || "").toLowerCase(),
       )
     ) {
       status = "error";
     } else if (latestAgentSegment?.terminal) status = "complete";
+    else if (latestAgentSegment?.status === "retrying") status = "retrying";
     else if (hasLiveSegment) status = "running";
 
     const toolCalls = new Set();
@@ -650,10 +687,15 @@ function streamAgents(timeline) {
       latestAction = finalText
         ? `Finished · ${finalText.slice(0, 150)}${finalText.length > 150 ? "…" : ""}`
         : "Finished and returned findings";
-    } else if (latestSegment?.type === "agent" && latestSegment.status === "streaming") {
+    } else if (
+      latestSegment?.type === "agent" &&
+      ["streaming", "retrying"].includes(latestSegment.status)
+    ) {
       const text = String(latestSegment.text || "").replace(/\s+/g, " ").trim();
       const thinking = String(latestSegment.thinking || "").replace(/\s+/g, " ").trim();
-      latestAction = text
+      latestAction = latestSegment.status === "retrying"
+        ? `Retrying model call · attempt ${latestSegment.activityAttempt || latestSegment.streamAttempt || "—"}`
+        : text
         ? `Drafting · ${text.slice(-150)}`
         : thinking
           ? `Reasoning · ${thinking.slice(-150)}`

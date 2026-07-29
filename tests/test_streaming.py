@@ -5,6 +5,7 @@ import unittest
 from agent_harness.llm_guards import LlmGuardContext, LlmGuardResult
 from agent_harness.streaming import (
     AgentStreamEventKind,
+    AgentStreamWriter,
     StreamContext,
     StreamEvent,
     configure_stream_sink,
@@ -59,6 +60,33 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sink.events[0].agent, agent)
         self.assertEqual(sink.events[0].tool_call_id, "tool-use-1")
+        self.assertIsNotNone(sink.events[0].emitted_at)
+
+    async def test_agent_failure_keeps_model_attempt_and_error_details(self) -> None:
+        sink = RecordingStreamSink()
+        configure_stream_sink(sink)
+        stream = AgentStreamWriter.for_provider(
+            stream_id="chat-1",
+            provider="claude",
+            attempt=2,
+            agent={"id": "chat-1", "kind": "main", "label": "Main agent"},
+        )
+
+        await stream.agent_failed(
+            sequence=4,
+            model="claude-sonnet",
+            error=ConnectionError("connection reset"),
+        )
+
+        event = sink.events[0]
+        self.assertEqual(event.kind, AgentStreamEventKind.AGENT_FAILED)
+        self.assertEqual(event.payload["operation_id"], "chat-1:llm:4")
+        self.assertEqual(event.payload["model"], "claude-sonnet")
+        self.assertEqual(event.payload["stream_attempt"], 2)
+        self.assertEqual(
+            event.payload["error"],
+            {"type": "ConnectionError", "message": "connection reset"},
+        )
 
     async def test_stream_sink_runs_text_delta_through_llm_guard(self) -> None:
         sink = RecordingStreamSink()

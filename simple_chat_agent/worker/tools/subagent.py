@@ -44,6 +44,7 @@ class SubagentRequest:
     tool_names: list[str] = field(default_factory=list)
     denied_tool_names: list[str] = field(default_factory=list)
     parent_workflow_id: str | None = None
+    parent_tool_call_id: str | None = None
     user_ref: str | None = None
     conversation_id: str | None = None
     github_connection_id: str | None = None
@@ -152,6 +153,7 @@ class SubagentProvider:
                 tool_names=granted_tool_names,
                 denied_tool_names=denied_tool_names,
                 parent_workflow_id=workflow.info().workflow_id,
+                parent_tool_call_id=ctx.tool_call_id,
                 user_ref=self._user_ref(),
                 conversation_id=self._conversation_id(),
                 github_connection_id=self._github_connection_id(),
@@ -218,6 +220,7 @@ class SubagentWorkflow:
                 "parent_id": parent_workflow_id,
                 "kind": "subagent",
                 "label": request.task,
+                "parent_tool_call_id": request.parent_tool_call_id,
             },
         )
         if request.agent_state is None:
@@ -238,6 +241,7 @@ class SubagentWorkflow:
                     tool_names=tool_names,
                     denied_tool_names=denied_tool_names,
                     parent_workflow_id=parent_workflow_id,
+                    parent_tool_call_id=request.parent_tool_call_id,
                     user_ref=request.user_ref,
                     conversation_id=request.conversation_id,
                     github_connection_id=request.github_connection_id,
