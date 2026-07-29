@@ -235,9 +235,6 @@ class ClaudeProvider(AgentProvider):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         return _claude_message_to_agent_message(cast(ClaudeResponse, response).message)
 
-    def stop_reason_for_max_turns(self) -> ClaudeStopReason:
-        return "max_tokens"
-
 
 class ClaudeAgent(Agent):
     def __init__(
@@ -976,4 +973,3 @@ def _text_from_block_dict(block: Any) -> str:
         refusal = block.get("refusal")
         return refusal if isinstance(refusal, str) else ""
     return ""
-

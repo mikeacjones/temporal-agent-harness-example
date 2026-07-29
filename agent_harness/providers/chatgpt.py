@@ -219,9 +219,6 @@ class ChatGPTProvider(AgentProvider):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         return _chatgpt_message_to_agent_message(cast(ChatGPTResponse, response).message)
 
-    def stop_reason_for_max_turns(self) -> ChatGPTStopReason:
-        return "max_output_tokens"
-
 
 class ChatGPTAgent(Agent):
     def __init__(
@@ -1175,4 +1172,3 @@ def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
         if isinstance(reason, str) and reason:
             return f"Incomplete reason: {reason}."
     return ""
-

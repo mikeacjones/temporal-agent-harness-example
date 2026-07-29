@@ -44,7 +44,7 @@ def _final_response() -> ProviderResponse:
     )
 
 
-class AgentTurnLimitTests(unittest.IsolatedAsyncioTestCase):
+class AgentBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_reference_time_is_added_to_system_context(self) -> None:
         tools = Mock()
         tools.tool_schemas.return_value = []
@@ -61,11 +61,10 @@ class AgentTurnLimitTests(unittest.IsolatedAsyncioTestCase):
             return_value=_final_response()
         )
 
-        with patch("agent_harness.agent.workflow.patched", return_value=True):
-            await agent.run(
-                "What happened today?",
-                reference_time="2026-07-29T18:42:00Z",
-            )
+        await agent.run(
+            "What happened today?",
+            reference_time="2026-07-29T18:42:00Z",
+        )
 
         self.assertIn(
             "Current reference time: 2026-07-29T18:42:00Z (UTC).",
@@ -99,11 +98,10 @@ class AgentTurnLimitTests(unittest.IsolatedAsyncioTestCase):
             return_value=True
         )
 
-        with patch("agent_harness.agent.workflow.patched", return_value=True):
-            result = await agent.run(
-                "What happened today?",
-                reference_time="2026-07-29T18:42:00Z",
-            )
+        result = await agent.run(
+            "What happened today?",
+            reference_time="2026-07-29T18:42:00Z",
+        )
 
         self.assertIsNotNone(result.continuation_state)
         self.assertEqual(
@@ -111,7 +109,7 @@ class AgentTurnLimitTests(unittest.IsolatedAsyncioTestCase):
             "2026-07-29T18:42:00Z",
         )
 
-    async def test_new_workflow_histories_continue_past_legacy_turn_limit(self) -> None:
+    async def test_agent_has_no_turn_limit(self) -> None:
         tools = Mock()
         tools.tool_schemas.return_value = []
         provider = Mock()
@@ -136,46 +134,11 @@ class AgentTurnLimitTests(unittest.IsolatedAsyncioTestCase):
             return_value=False
         )
 
-        with patch("agent_harness.agent.workflow.patched", return_value=True):
-            result = await agent.run("Investigate this.", max_turns=20)
+        result = await agent.run("Investigate this.")
 
         self.assertEqual(result.message, text_message("assistant", "Research complete."))
         self.assertEqual(result.turns, 26)
         self.assertEqual(agent._call_provider.await_count, 26)
-
-    async def test_old_workflow_histories_replay_original_turn_limit(self) -> None:
-        tools = Mock()
-        tools.tool_schemas.return_value = []
-        provider = Mock()
-        provider.response_with_visible_refusal.side_effect = lambda response: response
-        provider.response_message.side_effect = lambda response: response.message
-        provider.stop_reason_for_max_turns.return_value = "max_tokens"
-        agent = Agent(
-            "Research thoroughly.",
-            tools,
-            provider=provider,
-            model="test-model",
-        )
-        agent._call_provider = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[_tool_response(1), _tool_response(2)]
-        )
-        agent._execute_requested_tools = AsyncMock(  # type: ignore[method-assign]
-            return_value=ToolExecutionResult(tool_results=[])
-        )
-        agent._should_return_continue_as_new = Mock(  # type: ignore[method-assign]
-            return_value=False
-        )
-
-        with patch("agent_harness.agent.workflow.patched", return_value=False):
-            result = await agent.run("Investigate this.", max_turns=2)
-
-        self.assertEqual(
-            result.message,
-            text_message("assistant", "Stopped after reaching max_turns=2."),
-        )
-        self.assertEqual(result.stop_reason, "max_tokens")
-        self.assertEqual(result.turns, 2)
-
 
 class DefaultAgentBehaviorTests(unittest.TestCase):
     def test_api_and_workflow_use_same_deep_research_prompt(self) -> None:

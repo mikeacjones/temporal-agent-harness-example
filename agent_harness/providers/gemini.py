@@ -231,9 +231,6 @@ class GeminiProvider(AgentProvider):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         return _gemini_content_to_agent_message(cast(GeminiResponse, response).message)
 
-    def stop_reason_for_max_turns(self) -> GeminiStopReason:
-        return "MAX_TOKENS"
-
 
 class GeminiAgent(Agent):
     def __init__(

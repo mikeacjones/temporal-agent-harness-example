@@ -70,9 +70,6 @@ class CreateChatRequest:
     system_prompt: str
     model: str
     max_tokens: int
-    # Kept for payload compatibility with create-chat updates recorded before
-    # agent-unlimited-turns-v1. New agent runs do not enforce this value.
-    max_turns: int = 20
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
     initial_message: str | None = None
@@ -234,7 +231,6 @@ class UserChatsWorkflow:
                 max_tokens=request.max_tokens,
                 max_context_tokens=request.max_context_tokens,
                 thinking=request.thinking,
-                max_turns=request.max_turns,
                 stream_id=workflow_id,
                 available_tool_names=list(request.available_tool_names),
                 github_connection_id=request.github_connection_id,

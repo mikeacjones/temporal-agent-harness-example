@@ -424,7 +424,6 @@ Required provider methods:
 | `response_from_guard_execution(...)` | Build a provider-shaped guard response. |
 | `response_with_visible_refusal(...)` | Normalize provider refusals. |
 | `response_message(...)` | Convert provider response into generic assistant message. |
-| `stop_reason_for_max_turns()` | Legacy replay behavior for histories created before uncapped agent turns. |
 
 Provider convenience classes live under `agent_harness.providers`. They keep
 provider-specific options provider-specific while letting workflow code create

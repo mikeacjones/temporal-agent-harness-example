@@ -9,7 +9,7 @@ from typing import Any, cast
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from agent_harness.agent import AgentState, ContinueAsNewPolicy
+    from agent_harness.agent import AgentState
     from agent_harness.mcp import HttpMcpProvider
     from agent_harness.mcp_types import HttpMcpServerConfig
     from agent_harness.providers.claude import ClaudeAgent
@@ -31,8 +31,6 @@ with workflow.unsafe.imports_passed_through():
 
 CREATE_SUBAGENT_TOOL = "create_subagent"
 _DISALLOWED_SUBAGENT_TOOLS = frozenset({CREATE_SUBAGENT_TOOL})
-_DEFAULT_SUBAGENT_MAX_TURNS = 8
-_MAX_SUBAGENT_MAX_TURNS = 12
 _DEFAULT_SUBAGENT_MAX_TOKENS = 16_000
 _MAX_SUBAGENT_MAX_TOKENS = 32_000
 
@@ -43,7 +41,6 @@ class SubagentRequest:
     task: str
     model: str
     max_tokens: int = _DEFAULT_SUBAGENT_MAX_TOKENS
-    max_turns: int = _DEFAULT_SUBAGENT_MAX_TURNS
     tool_names: list[str] = field(default_factory=list)
     denied_tool_names: list[str] = field(default_factory=list)
     parent_workflow_id: str | None = None
@@ -117,7 +114,6 @@ class SubagentProvider:
         tool_names: list[str] | None = None,
         model: str | None = None,
         max_tokens: int = _DEFAULT_SUBAGENT_MAX_TOKENS,
-        max_turns: int = _DEFAULT_SUBAGENT_MAX_TURNS,
     ) -> ToolResult:
         if not system_prompt.strip():
             return ToolResult(
@@ -135,20 +131,16 @@ class SubagentProvider:
         child_workflow_id = (
             f"{workflow.info().workflow_id}-subagent-{workflow.uuid4()}"
         )
-        if tool_names is None and workflow.patched(
-            f"subagent-default-tools-v1-{child_workflow_id}"
-        ):
-            requested_tool_names = available_tool_names
-        else:
-            requested_tool_names = _dedupe(tool_names or [])
+        requested_tool_names = (
+            available_tool_names
+            if tool_names is None
+            else _dedupe(tool_names)
+        )
         granted_tool_names, denied_tool_names = _split_requested_tools(
             requested_tool_names,
             available_tool_names,
         )
         max_tokens = max(1_024, min(max_tokens, _MAX_SUBAGENT_MAX_TOKENS))
-        # This value is carried into the child only so pre-unlimited histories
-        # reproduce their original command. New child runs ignore the turn cap.
-        max_turns = max(1, min(max_turns, _MAX_SUBAGENT_MAX_TURNS))
 
         result = await workflow.execute_child_workflow(
             SubagentWorkflow.run,
@@ -157,7 +149,6 @@ class SubagentProvider:
                 task=task,
                 model=model or self._default_model(),
                 max_tokens=max_tokens,
-                max_turns=max_turns,
                 tool_names=granted_tool_names,
                 denied_tool_names=denied_tool_names,
                 parent_workflow_id=workflow.info().workflow_id,
@@ -171,11 +162,7 @@ class SubagentProvider:
             id=child_workflow_id,
             task_queue=TASK_QUEUE,
             static_summary=f"{CREATE_SUBAGENT_TOOL}:run",
-            search_attributes=(
-                workflow.info().typed_search_attributes
-                if workflow.patched("subagent-inherit-search-attributes-v1")
-                else None
-            ),
+            search_attributes=workflow.info().typed_search_attributes,
         )
 
         return ToolResult(payload=asdict(result), error=False)
@@ -226,21 +213,14 @@ class SubagentWorkflow:
             max_tokens=request.max_tokens,
             tool_names=tool_names,
             stream_id=request.stream_id,
-            continue_as_new_policy=ContinueAsNewPolicy(
-                enabled=workflow.patched("subagent-continue-as-new-v1")
-            ),
         )
         if request.agent_state is None:
             result = await agent.run(
                 request.task,
                 reference_time=request.reference_time,
-                max_turns=request.max_turns,
             )
         else:
-            result = await agent.run(
-                state=request.agent_state,
-                max_turns=request.max_turns,
-            )
+            result = await agent.run(state=request.agent_state)
 
         if result.needs_continue_as_new:
             workflow.continue_as_new(
@@ -249,7 +229,6 @@ class SubagentWorkflow:
                     task=request.task,
                     model=request.model,
                     max_tokens=request.max_tokens,
-                    max_turns=request.max_turns,
                     tool_names=tool_names,
                     denied_tool_names=denied_tool_names,
                     parent_workflow_id=parent_workflow_id,

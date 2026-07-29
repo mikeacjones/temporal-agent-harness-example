@@ -185,9 +185,6 @@ class SimpleChatInput:
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
-    # Replay compatibility for histories created before unlimited agent turns.
-    # Agent.run ignores this value in new workflow histories.
-    max_turns: int = 20
     stream_id: str | None = None
     available_tool_names: list[str] = field(default_factory=list)
     github_connection_id: str | None = None
@@ -812,7 +809,6 @@ class SimpleChatWorkflow:
                 attachments=turn.attachments,
                 state=resume_agent_state,
                 reference_time=turn.reference_time,
-                max_turns=chat_input.max_turns,
             )
             await self._record_effective_user_prompt_if_needed(
                 chat_input.good_place_censor
@@ -999,17 +995,15 @@ class SimpleChatWorkflow:
         attachments: list[AttachmentRef] | None,
         state: AgentState | None,
         reference_time: str,
-        max_turns: int,
     ) -> AgentResult:
         if self._agent is None:
             raise RuntimeError("Agent has not been initialized")
         if state is not None:
-            return await self._agent.run(state=state, max_turns=max_turns)
+            return await self._agent.run(state=state)
         return await self._agent.run(
             message,
             attachments=list(attachments or []),
             reference_time=reference_time,
-            max_turns=max_turns,
         )
 
     async def _request_tool_approval(
@@ -1131,7 +1125,6 @@ class SimpleChatWorkflow:
             max_tokens=chat_input.max_tokens,
             max_context_tokens=chat_input.max_context_tokens,
             thinking=chat_input.thinking,
-            max_turns=chat_input.max_turns,
             stream_id=chat_input.stream_id,
             available_tool_names=sorted(self._available_tool_names),
             github_connection_id=self._github_connection_id,

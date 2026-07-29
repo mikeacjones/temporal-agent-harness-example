@@ -55,10 +55,6 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
                 return_value="child-id",
             ),
             patch(
-                "simple_chat_agent.worker.tools.subagent.workflow.patched",
-                return_value=True,
-            ) as patched,
-            patch(
                 "simple_chat_agent.worker.tools.subagent.workflow."
                 "execute_child_workflow",
                 new=AsyncMock(return_value=child_result),
@@ -69,10 +65,6 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
                 task="Investigate the question.",
             )
 
-        patched.assert_any_call(
-            "subagent-default-tools-v1-simple-chat-parent-subagent-child-id"
-        )
-        patched.assert_any_call("subagent-inherit-search-attributes-v1")
         self.assertIs(
             execute_child.await_args.kwargs["search_attributes"],
             parent_search_attributes,

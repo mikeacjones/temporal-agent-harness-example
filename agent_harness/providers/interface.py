@@ -124,9 +124,6 @@ class AgentProvider(Protocol):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         pass
 
-    def stop_reason_for_max_turns(self) -> ProviderStopReason:
-        pass
-
 
 def start_provider_activity(
     provider: AgentProvider,
