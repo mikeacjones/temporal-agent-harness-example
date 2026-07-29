@@ -117,6 +117,17 @@ class DefaultAgentBehaviorTests(unittest.TestCase):
         self.assertIn("rigorous deep-research agent", api_prompt)
         self.assertIn("multiple independent primary sources", api_prompt)
         self.assertIn("do not stop at the first plausible result", api_prompt)
+        self.assertIn("dispatch those lines concurrently", api_prompt)
+        self.assertIn(
+            "ten independent report topics may warrant ten subagents",
+            api_prompt,
+        )
+        self.assertIn("ask focused clarifying questions", api_prompt)
+        self.assertIn(
+            "high-quality, self-contained HTML artifact as the primary deliverable",
+            api_prompt,
+        )
+        self.assertIn("semantic, accessible, responsive HTML", api_prompt)
 
     def test_session_api_no_longer_exposes_max_turns(self) -> None:
         properties = CreateSessionRequest.model_json_schema()["properties"]
