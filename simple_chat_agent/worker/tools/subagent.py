@@ -150,6 +150,11 @@ class SubagentProvider:
             id=child_workflow_id,
             task_queue=TASK_QUEUE,
             static_summary=f"{CREATE_SUBAGENT_TOOL}:run",
+            search_attributes=(
+                workflow.info().typed_search_attributes
+                if workflow.patched("subagent-inherit-search-attributes-v1")
+                else None
+            ),
         )
 
         return ToolResult(payload=asdict(result), error=False)
