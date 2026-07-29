@@ -9,7 +9,9 @@ from temporalio.common import (
     TypedSearchAttributes,
 )
 
+from agent_harness.tools import ToolSet
 from simple_chat_agent.worker.tools.subagent import (
+    CREATE_SUBAGENT_TOOL,
     SubagentProvider,
     SubagentResponse,
 )
@@ -32,6 +34,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             user_ref=lambda: "user-123",
             conversation_id=lambda: "simple-chat-parent",
             github_connection_id=lambda: None,
+            reference_time=lambda: "2026-07-29T18:42:00Z",
         )
         child_result = SubagentResponse(
             text="Research complete.",
@@ -63,17 +66,43 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await provider.create_subagent(
                 ctx,
-                system_prompt="Research rigorously.",
                 task="Investigate the question.",
-                tool_names=["research"],
             )
 
-        patched.assert_called_once_with("subagent-inherit-search-attributes-v1")
+        patched.assert_any_call(
+            "subagent-default-tools-v1-simple-chat-parent-subagent-child-id"
+        )
+        patched.assert_any_call("subagent-inherit-search-attributes-v1")
         self.assertIs(
             execute_child.await_args.kwargs["search_attributes"],
             parent_search_attributes,
         )
+        child_request = execute_child.await_args.args[1]
+        self.assertEqual(child_request.tool_names, ["research"])
+        self.assertEqual(child_request.reference_time, "2026-07-29T18:42:00Z")
+        self.assertIn("focused research subagent", child_request.system_prompt)
         self.assertFalse(result.error)
+
+    def test_tool_schema_invites_parallel_delegation_with_one_required_input(
+        self,
+    ) -> None:
+        provider = SubagentProvider(
+            default_model=lambda: "claude-sonnet-4-5",
+            user_ref=lambda: "user-123",
+            conversation_id=lambda: "simple-chat-parent",
+            github_connection_id=lambda: None,
+        )
+        tools = ToolSet(providers=[provider])
+        schema = next(
+            tool
+            for tool in tools.tool_schemas()
+            if tool["name"] == CREATE_SUBAGENT_TOOL
+        )
+
+        self.assertEqual(schema["input_schema"]["required"], ["task"])
+        self.assertIn("Proactively delegate", schema["description"])
+        self.assertIn("same assistant turn", schema["description"])
+        self.assertIn("those calls run concurrently", schema["description"])
 
 
 if __name__ == "__main__":

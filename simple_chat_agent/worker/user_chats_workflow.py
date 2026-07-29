@@ -81,6 +81,7 @@ class CreateChatRequest:
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     good_place_censor: bool = False
     task_queue: str = TASK_QUEUE
+    reference_time: str = ""
 
 
 @dataclass
@@ -213,7 +214,13 @@ class UserChatsWorkflow:
             else ""
         )
         pending_messages = (
-            [QueuedChatMessage(content=initial_message, transcript_index=0)]
+            [
+                QueuedChatMessage(
+                    content=initial_message,
+                    transcript_index=0,
+                    reference_time=request.reference_time,
+                )
+            ]
             if initial_message
             else []
         )

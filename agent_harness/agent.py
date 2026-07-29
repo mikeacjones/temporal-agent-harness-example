@@ -79,6 +79,7 @@ class Agent:
         context_chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
         continue_as_new_policy: ContinueAsNewPolicy | None = None,
     ):
+        self._base_system_prompt = system_prompt
         self._system_prompt = system_prompt
         self._tools = tools
         self._provider = provider
@@ -114,6 +115,7 @@ class Agent:
         self._terminated = False
         self._termination_reason: str | None = None
         self._llm_guard_state: dict[str, Any] = {}
+        self._reference_time: str | None = None
 
     def steer(
         self,
@@ -154,6 +156,7 @@ class Agent:
         *,
         attachments: list[AttachmentRef] | None = None,
         state: AgentState | None = None,
+        reference_time: str | None = None,
         # Retained only so histories created before agent-unlimited-turns-v1
         # replay with their original stopping behavior. New executions ignore it.
         max_turns: int = 20,
@@ -177,12 +180,26 @@ class Agent:
                 self._context_initialized = True
             self._turn_user_prompt_index = self._context.message_count() - 1
             completed_turns = 0
+            self._reference_time = reference_time.strip() if reference_time else None
         else:
             self._context.restore(state.context_snapshot)
             self._context_initialized = True
             self._llm_guard_state = dict(state.llm_guard_state)
             self._turn_user_prompt_index = None
             completed_turns = state.turns
+            self._reference_time = state.reference_time
+
+        self._system_prompt = self._base_system_prompt
+        if self._reference_time:
+            self._system_prompt = (
+                f"{self._base_system_prompt}\n\n"
+                "<current_datetime>\n"
+                f"Current reference time: {self._reference_time} (UTC).\n"
+                "Use this to interpret relative dates. This timestamp is "
+                "temporal context only, not evidence of current facts; verify "
+                "time-sensitive claims with research tools.\n"
+                "</current_datetime>"
+            )
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
         turn = completed_turns
@@ -255,6 +272,7 @@ class Agent:
                         ),
                         turns=turn,
                         llm_guard_state=dict(self._llm_guard_state),
+                        reference_time=self._reference_time,
                     ),
                     guard_action=response.guard_action,
                     guard_reason=response.guard_reason,
@@ -743,6 +761,7 @@ class AgentState:
     context_snapshot: ContextSnapshot
     turns: int
     llm_guard_state: dict = field(default_factory=dict)
+    reference_time: str | None = None
 
 
 @dataclass

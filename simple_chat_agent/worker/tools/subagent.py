@@ -52,6 +52,7 @@ class SubagentRequest:
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     stream_id: str | None = None
+    reference_time: str = ""
     agent_state: AgentState | None = None
     approval_counter: int = 0
 
@@ -74,31 +75,45 @@ class SubagentProvider:
         user_ref: Callable[[], str | None],
         conversation_id: Callable[[], str | None],
         github_connection_id: Callable[[], str | None],
+        reference_time: Callable[[], str | None] | None = None,
         mcp_servers: Callable[[], list[HttpMcpServerConfig]] | None = None,
     ) -> None:
         self._default_model = default_model
         self._user_ref = user_ref
         self._conversation_id = conversation_id
         self._github_connection_id = github_connection_id
+        self._reference_time = reference_time or (lambda: None)
         self._mcp_servers = mcp_servers or (lambda: [])
 
     @tool(
         name=CREATE_SUBAGENT_TOOL,
         description=(
-            "Create a child Claude agent for a delegated task. Pass an explicit "
-            "subset of tool_names for the child to use. The child inherits this "
-            "chat's streaming sideband. Mutating delegated tools request "
-            "approval through this parent chat. Recursive subagents are not "
-            "delegated. The child continues until it finishes; no turn limit is "
-            "applied."
+            "Proactively delegate one independent, substantive workstream to a "
+            "child research agent. Use this whenever a request has separable "
+            "research topics, comparisons, sources, regions, time periods, or "
+            "report sections. For parallel work, call create_subagent multiple "
+            "times in the same assistant turn—one focused call per independent "
+            "workstream; those calls run concurrently. Do not research clearly "
+            "separable workstreams serially yourself. Each child returns findings "
+            "for you to cross-check and synthesize. Omit tool_names to grant all "
+            "currently available non-recursive tools, or pass a focused subset. "
+            "Mutating tools still request approval through the parent chat. Avoid "
+            "delegation only for trivial, single-step work. Children cannot create "
+            "more subagents and have no turn limit."
         ),
         tool_type=ToolType.READ,
     )
     async def create_subagent(
         self,
         ctx: ToolContext,
-        system_prompt: str,
         task: str,
+        system_prompt: str = (
+            "You are a focused research subagent. Investigate the delegated "
+            "workstream thoroughly, use the available tools, cross-check "
+            "important claims, distinguish evidence from inference, cite sources "
+            "when available, and return concise findings for the parent agent to "
+            "synthesize."
+        ),
         tool_names: list[str] | None = None,
         model: str | None = None,
         max_tokens: int = _DEFAULT_SUBAGENT_MAX_TOKENS,
@@ -117,7 +132,15 @@ class SubagentProvider:
             for name in ctx.tool_names()
             if name not in _DISALLOWED_SUBAGENT_TOOLS
         ]
-        requested_tool_names = _dedupe(tool_names or [])
+        child_workflow_id = (
+            f"{workflow.info().workflow_id}-subagent-{workflow.uuid4()}"
+        )
+        if tool_names is None and workflow.patched(
+            f"subagent-default-tools-v1-{child_workflow_id}"
+        ):
+            requested_tool_names = available_tool_names
+        else:
+            requested_tool_names = _dedupe(tool_names or [])
         granted_tool_names, denied_tool_names = _split_requested_tools(
             requested_tool_names,
             available_tool_names,
@@ -126,9 +149,6 @@ class SubagentProvider:
         # This value is carried into the child only so pre-unlimited histories
         # reproduce their original command. New child runs ignore the turn cap.
         max_turns = max(1, min(max_turns, _MAX_SUBAGENT_MAX_TURNS))
-        child_workflow_id = (
-            f"{workflow.info().workflow_id}-subagent-{workflow.uuid4()}"
-        )
 
         result = await workflow.execute_child_workflow(
             SubagentWorkflow.run,
@@ -146,6 +166,7 @@ class SubagentProvider:
                 github_connection_id=self._github_connection_id(),
                 mcp_servers=list(self._mcp_servers()),
                 stream_id=ctx.stream_id,
+                reference_time=self._reference_time() or "",
             ),
             id=child_workflow_id,
             task_queue=TASK_QUEUE,
@@ -210,7 +231,11 @@ class SubagentWorkflow:
             ),
         )
         if request.agent_state is None:
-            result = await agent.run(request.task, max_turns=request.max_turns)
+            result = await agent.run(
+                request.task,
+                reference_time=request.reference_time,
+                max_turns=request.max_turns,
+            )
         else:
             result = await agent.run(
                 state=request.agent_state,
@@ -233,6 +258,7 @@ class SubagentWorkflow:
                     github_connection_id=request.github_connection_id,
                     mcp_servers=list(request.mcp_servers),
                     stream_id=request.stream_id,
+                    reference_time=request.reference_time,
                     agent_state=result.continuation_state,
                     approval_counter=self._approval_counter,
                 ),

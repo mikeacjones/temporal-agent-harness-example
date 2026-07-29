@@ -94,6 +94,7 @@ class QueuedChatMessage:
     available_tool_names: list[str] | None = None
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] | None = None
+    reference_time: str = ""
 
 
 @dataclass
@@ -101,6 +102,7 @@ class ActiveTurn:
     message: str | None
     attachments: list[AttachmentRef]
     settle_after_revision: int
+    reference_time: str = ""
 
 
 @dataclass
@@ -111,6 +113,7 @@ class ChatSignalRequest:
     available_tool_names: list[str] = field(default_factory=list)
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
+    reference_time: str = ""
 
 
 @dataclass
@@ -146,12 +149,16 @@ class SimpleChatInput:
         "investigate before answering: decompose the problem, use available "
         "research, retrieval, browsing, code-execution, and delegation tools, "
         "and consult multiple independent primary sources when possible. "
-        "Decompose broad work into independent lines of inquiry and, when "
-        "subagents or delegation tools are available, dispatch those lines "
-        "concurrently instead of researching them serially. Use as many "
-        "parallel subagents as the work genuinely supports—for example, ten "
-        "independent report topics may warrant ten subagents—then reconcile, "
-        "cross-check, and synthesize their findings yourself. "
+        "Before starting substantive research, decompose broad work into "
+        "independent lines of inquiry. If two or more workstreams can proceed "
+        "independently and create_subagent is available, actually call it once "
+        "per workstream in the same assistant turn so those calls run "
+        "concurrently; do not merely describe a delegation plan or research "
+        "those branches serially yourself. Use as many parallel subagents as the "
+        "work genuinely supports—for example, ten independent report topics may "
+        "warrant ten subagents. Skip delegation only for trivial, genuinely "
+        "sequential, or tightly coupled work, then reconcile, cross-check, and "
+        "synthesize the delegated findings yourself. "
         "Cross-check important claims and continue iterating until the evidence "
         "is sufficient; do not stop at the first plausible result. Clearly "
         "distinguish verified facts, reasoned inference, and uncertainty, and "
@@ -264,6 +271,7 @@ class SimpleChatWorkflow:
         self._last_touched_at: datetime | None = None
         self._touched_this_run = False
         self._active_settle_after_revision = 0
+        self._active_reference_time = ""
 
     @workflow.signal
     async def chat(self, request: ChatSignalRequest) -> None:
@@ -275,6 +283,7 @@ class SimpleChatWorkflow:
             available_tool_names=request.available_tool_names,
             github_connection_id=request.github_connection_id,
             mcp_servers=request.mcp_servers,
+            reference_time=request.reference_time,
         )
         self._record_transcript_change(
             transcript_index,
@@ -293,10 +302,15 @@ class SimpleChatWorkflow:
         message: str,
         mode: str = "immediate",
         attachments: list[AttachmentRef] | None = None,
+        reference_time: str = "",
     ) -> None:
         self._touch()
         if attachments:
-            transcript_index = self._enqueue_chat(message, attachments=attachments)
+            transcript_index = self._enqueue_chat(
+                message,
+                attachments=attachments,
+                reference_time=reference_time,
+            )
             self._record_transcript_change(
                 transcript_index,
                 _chat_message_for_queue(self._pending_messages[-1]),
@@ -322,10 +336,13 @@ class SimpleChatWorkflow:
         self._record_system_message(f"Steering queued {label}: {message}")
 
     @workflow.signal
-    async def interrupt(self, message: str) -> None:
+    async def interrupt(self, message: str, reference_time: str = "") -> None:
         self._touch()
         if self._agent is None or self._status != "responding":
-            transcript_index = self._enqueue_chat(message)
+            transcript_index = self._enqueue_chat(
+                message,
+                reference_time=reference_time,
+            )
             self._record_transcript_change(
                 transcript_index,
                 _chat_message_for_queue(self._pending_messages[-1]),
@@ -635,6 +652,7 @@ class SimpleChatWorkflow:
                     message=None,
                     attachments=[],
                     settle_after_revision=self._active_settle_after_revision,
+                    reference_time=self._active_reference_time,
                 )
 
             continue_as_new_state = await self._run_active_turn(
@@ -662,6 +680,12 @@ class SimpleChatWorkflow:
 
         self._active_message_index = chat_input.active_message_index
         self._active_settle_after_revision = chat_input.active_settle_after_revision
+        self._active_reference_time = (
+            chat_input.agent_state.reference_time
+            if chat_input.agent_state is not None
+            and chat_input.agent_state.reference_time is not None
+            else ""
+        )
         self._active_message = None
         self._agent_context_state = (
             chat_input.agent_context_state or chat_input.agent_state
@@ -693,6 +717,7 @@ class SimpleChatWorkflow:
             user_ref=lambda: self._user_ref,
             conversation_id=lambda: self._conversation_id,
             workflow_id=lambda: workflow.info().workflow_id,
+            reference_time=lambda: self._active_reference_time,
             github_connection_id=lambda: self._github_connection_id,
             mcp_servers=lambda: self._mcp_servers,
             default_model=lambda: chat_input.model,
@@ -759,11 +784,13 @@ class SimpleChatWorkflow:
         self._active_message_index = queued_message.transcript_index
         self._active_message = queued_message
         self._active_settle_after_revision = queued_message.settle_after_revision
+        self._active_reference_time = queued_message.reference_time
         self._apply_queued_tool_config(queued_message)
         return ActiveTurn(
             message=queued_message.content,
             attachments=list(queued_message.attachments),
             settle_after_revision=queued_message.settle_after_revision,
+            reference_time=queued_message.reference_time,
         )
 
     async def _run_active_turn(
@@ -782,6 +809,7 @@ class SimpleChatWorkflow:
                 message=turn.message,
                 attachments=turn.attachments,
                 state=resume_agent_state,
+                reference_time=turn.reference_time,
                 max_turns=chat_input.max_turns,
             )
             await self._record_effective_user_prompt_if_needed(
@@ -829,6 +857,7 @@ class SimpleChatWorkflow:
         self._active_message_index = None
         self._active_message = None
         self._active_settle_after_revision = 0
+        self._active_reference_time = ""
         self._status = "idle"
         self._record_state_change()
 
@@ -902,6 +931,7 @@ class SimpleChatWorkflow:
         available_tool_names: list[str] | None = None,
         github_connection_id: str | None = None,
         mcp_servers: list[HttpMcpServerConfig] | None = None,
+        reference_time: str = "",
     ) -> int:
         attachment_refs = list(attachments or [])
         transcript_index = self._next_transcript_index()
@@ -918,6 +948,7 @@ class SimpleChatWorkflow:
                 ),
                 github_connection_id=github_connection_id,
                 mcp_servers=list(mcp_servers) if mcp_servers is not None else None,
+                reference_time=reference_time,
             )
         )
         return transcript_index
@@ -965,6 +996,7 @@ class SimpleChatWorkflow:
         message: str | None,
         attachments: list[AttachmentRef] | None,
         state: AgentState | None,
+        reference_time: str,
         max_turns: int,
     ) -> AgentResult:
         if self._agent is None:
@@ -974,6 +1006,7 @@ class SimpleChatWorkflow:
         return await self._agent.run(
             message,
             attachments=list(attachments or []),
+            reference_time=reference_time,
             max_turns=max_turns,
         )
 

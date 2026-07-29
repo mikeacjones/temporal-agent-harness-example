@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Callable
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -150,6 +151,12 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 github_connection_id=github_connection_id,
                 mcp_servers=mcp_servers,
                 good_place_censor=good_place_enabled(),
+                reference_time=(
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
             ),
         )
         deps.stream_broker().clear(conversation.workflow_id)
@@ -451,7 +458,17 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.steer,
-            args=[request.message, request.mode, attachments],
+            args=[
+                request.message,
+                request.mode,
+                attachments,
+                (
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -472,7 +489,15 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.interrupt,
-            request.message,
+            args=[
+                request.message,
+                (
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
@@ -747,6 +772,12 @@ async def _chat_signal_request(
         ),
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
+        reference_time=(
+            datetime.now(UTC)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
     )
 
 

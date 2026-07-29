@@ -117,6 +117,7 @@ def build_tools(
     user_ref: Callable[[], str | None],
     conversation_id: Callable[[], str | None],
     workflow_id: Callable[[], str],
+    reference_time: Callable[[], str | None],
     github_connection_id: Callable[[], str | None],
     mcp_servers: Callable[[], Iterable[HttpMcpServerConfig]] | None = None,
     default_model: Callable[[], str],
@@ -148,6 +149,7 @@ def build_tools(
             default_model=default_model,
             user_ref=user_ref,
             conversation_id=conversation_id,
+            reference_time=reference_time,
             github_connection_id=github_connection_id,
             mcp_servers=lambda: list(
                 mcp_servers() if mcp_servers is not None else ()

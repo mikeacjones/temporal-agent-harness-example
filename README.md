@@ -320,6 +320,10 @@ The default `SlidingWindowContextManager` keeps recent context, preserves the in
 The agent loop has no turn cap; it continues until the model produces a final
 response, a guard halts it, the user interrupts it, or the workflow reaches a
 safe continue-as-new boundary.
+Applications can pass a durable ISO-8601 UTC `reference_time` to `run(...)`.
+The harness adds it to the system context for that turn, carries it through
+continue-as-new, and reminds the model to verify time-sensitive facts rather
+than treating the timestamp itself as evidence.
 
 Applications can replace the context manager by passing `context_manager_factory=...`.
 
