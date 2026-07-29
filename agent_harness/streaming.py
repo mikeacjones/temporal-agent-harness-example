@@ -1,7 +1,10 @@
 import inspect
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Awaitable, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Protocol
+
+if TYPE_CHECKING:
+    from .llm_guards import LlmGuardFn
 
 try:
     from temporalio import activity as temporal_activity
@@ -59,6 +62,70 @@ class StreamContext:
         )
 
         try:
+            llm_guard = _stream_llm_guard
+            content_key: str | None = None
+            if (
+                llm_guard is not None
+                and isinstance(event.payload, dict)
+                and event.kind
+                in (
+                    AgentStreamEventKind.AGENT_TEXT_DELTA,
+                    AgentStreamEventKind.AGENT_THINKING_DELTA,
+                    AgentStreamEventKind.AGENT_COMPLETE,
+                )
+            ):
+                if event.kind == AgentStreamEventKind.AGENT_THINKING_DELTA:
+                    content_key = "thinking"
+                else:
+                    content_key = "text"
+
+                stream_payload = dict(event.payload)
+                stream_content = stream_payload.get(content_key)
+                if isinstance(stream_content, str):
+                    from .activity_options import DEFAULT_ACTIVITY_OPTIONS
+                    from .llm_guards import LlmGuardPipeline
+
+                    model = str(stream_payload.get("provider") or "stream")
+                    guarded = await LlmGuardPipeline(
+                        post_guards=[llm_guard]
+                    ).execute_post(
+                        request={"model": model},
+                        response={
+                            "id": f"stream:{event.kind}",
+                            "model": model,
+                            "message": {
+                                "role": "assistant",
+                                "content": stream_content,
+                            },
+                            "stop_reason": stream_payload.get("stop_reason"),
+                            "stop_sequence": None,
+                            "usage": stream_payload.get("usage") or {},
+                        },
+                        state={},
+                        stream_id=event.stream_id,
+                        activity_options=DEFAULT_ACTIVITY_OPTIONS,
+                    )
+                    guarded_message = (guarded.response or {}).get("message")
+                    guarded_content = (
+                        guarded_message.get("content")
+                        if isinstance(guarded_message, dict)
+                        else None
+                    )
+                    if not isinstance(guarded_content, str):
+                        raise TypeError(
+                            "Stream LLM guards must leave response.message.content "
+                            "as a string"
+                        )
+                    stream_payload[content_key] = guarded_content
+                    event = StreamEvent(
+                        stream_id=event.stream_id,
+                        tool_name=event.tool_name,
+                        step=event.step,
+                        kind=event.kind,
+                        payload=stream_payload,
+                        sequence=event.sequence,
+                    )
+
             result = sink.emit(event)
             if inspect.isawaitable(result):
                 await result
@@ -236,6 +303,7 @@ class AgentStreamWriter:
 
 
 _stream_sink: StreamSink | None = None
+_stream_llm_guard: "LlmGuardFn | None" = None
 _raise_stream_errors = False
 
 
@@ -268,10 +336,14 @@ def _attempt_payload(stream_attempt: int | None) -> dict[str, int]:
 
 
 def configure_stream_sink(
-    sink: StreamSink | None, *, raise_stream_errors: bool = False
+    sink: StreamSink | None,
+    *,
+    llm_guard: "LlmGuardFn | None" = None,
+    raise_stream_errors: bool = False,
 ) -> None:
-    global _stream_sink, _raise_stream_errors
+    global _stream_sink, _stream_llm_guard, _raise_stream_errors
     _stream_sink = sink
+    _stream_llm_guard = llm_guard
     _raise_stream_errors = raise_stream_errors
 
 

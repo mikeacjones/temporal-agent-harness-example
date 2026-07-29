@@ -41,6 +41,7 @@ from simple_chat_agent.common.env import load_dotenv
 from simple_chat_agent.common.external_storage import simple_chat_data_converter
 from simple_chat_agent.common.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
 from simple_chat_agent.common.streaming import configured_stream_sink
+from simple_chat_agent.worker.good_place_guards import good_place_post_guard
 from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
 from simple_chat_agent.worker.streaming_activities import emit_turn_settled
 from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
@@ -55,7 +56,15 @@ DEFAULT_WORKER_VERSION = "1.0.0"
 
 async def main() -> None:
     load_dotenv()
-    configure_stream_sink(configured_stream_sink())
+    configure_stream_sink(
+        configured_stream_sink(),
+        llm_guard=(
+            good_place_post_guard
+            if os.environ.get("SIMPLE_CHAT_GOOD_PLACE", "1").lower()
+            in ("1", "true", "yes")
+            else None
+        ),
+    )
     configure_mcp_auth_resolver(resolve_mcp_auth_headers)
     configure_mcp_http_auth_resolver(resolve_mcp_http_auth)
     data_converter = simple_chat_data_converter()

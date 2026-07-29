@@ -98,7 +98,12 @@ The generic loop in `Agent.run(...)` does the same sequence for every provider:
 
 The loop treats partial streaming as sideband UX. Durable conversation state is
 only committed when the provider activity returns and the workflow records the
-assistant message or tool results.
+assistant message or tool results. `configure_stream_sink(...)` also accepts one
+optional post-LLM guard. When assigned, text deltas, thinking deltas, and
+completed agent text pass through that guard before the sink emits them. With no
+guard assigned, streaming is unchanged. Stream guards run in the provider
+activity, so they must be pure in-process transforms and cannot schedule their
+own Temporal activities.
 
 ## Context
 
