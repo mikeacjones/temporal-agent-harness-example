@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import unittest
 
+from temporalio.converter import DataConverter
+
 from agent_harness.llm_guards import LlmGuardContext, LlmGuardResult
 from agent_harness.streaming import (
     AgentStreamEventKind,
     AgentStreamWriter,
+    EmitStreamEventRequest,
     StreamContext,
     StreamEvent,
     configure_stream_sink,
@@ -36,6 +39,29 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(sink.events), 1)
         self.assertEqual(sink.events[0].payload, {"text": "What the fuck?"})
+
+    async def test_emit_stream_event_request_decodes_nested_payload(self) -> None:
+        request = EmitStreamEventRequest(
+            stream_id="stream-1",
+            tool_name="search_web",
+            step="searxng",
+            kind="harness_tool_activity_failed",
+            payload={
+                "activity_attempt": 2,
+                "error": {
+                    "type": "ApplicationError",
+                    "message": "rate limited",
+                },
+            },
+        )
+
+        payloads = await DataConverter.default.encode([request])
+        decoded = await DataConverter.default.decode(
+            payloads,
+            [EmitStreamEventRequest],
+        )
+
+        self.assertEqual(decoded, [request])
 
     async def test_stream_event_preserves_agent_and_tool_call_identity(self) -> None:
         sink = RecordingStreamSink()

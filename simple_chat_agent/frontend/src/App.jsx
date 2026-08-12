@@ -1767,6 +1767,9 @@ export default function App() {
 
   async function resolveApproval(approvalId, decision) {
     if (stateRef.current.resolvingApprovals.has(approvalId)) return;
+    const selectedApproval = (
+      stateRef.current.workflowState?.pending_approvals || []
+    ).find((approval) => approval.approval_id === approvalId);
     setState((previous) => ({
       ...previous,
       resolvingApprovals: new Set([...previous.resolvingApprovals, approvalId]),
@@ -1787,7 +1790,13 @@ export default function App() {
           workflowState: {
             ...previous.workflowState,
             pending_approvals: (previous.workflowState.pending_approvals || []).filter(
-              (approval) => approval.approval_id !== approvalId,
+              (approval) =>
+                approval.approval_id !== approvalId &&
+                (
+                  decision !== "always_allow" ||
+                  !selectedApproval?.memory_key ||
+                  approval.memory_key !== selectedApproval.memory_key
+                ),
             ),
           },
         };

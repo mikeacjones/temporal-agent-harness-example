@@ -371,13 +371,32 @@ class SimpleChatWorkflow:
             )
             return
 
+        if decision == "always_allow":
+            self._approval_memory.add(approval.memory_key)
+            child_approvals = [
+                pending
+                for pending in self._pending_approvals.values()
+                if pending.memory_key == approval.memory_key
+                and pending.requesting_workflow_id is not None
+                and pending.requesting_approval_id is not None
+            ]
+            for pending in child_approvals:
+                self._pending_approvals.pop(pending.approval_id, None)
+            self._record_state_change()
+            for pending in child_approvals:
+                await self._signal_child_approval(
+                    workflow_id=cast(str, pending.requesting_workflow_id),
+                    approval_id=cast(str, pending.requesting_approval_id),
+                    decision="allow",
+                )
+            if approval.requesting_workflow_id is not None:
+                return
+
         if (
             approval.requesting_workflow_id is not None
             and approval.requesting_approval_id is not None
         ):
             self._pending_approvals.pop(approval_id, None)
-            if decision == "always_allow":
-                self._approval_memory.add(approval.memory_key)
             self._record_state_change()
             await self._signal_child_approval(
                 workflow_id=approval.requesting_workflow_id,
@@ -1036,6 +1055,7 @@ class SimpleChatWorkflow:
         try:
             await workflow.wait_condition(
                 lambda: approval_id in self._approval_decisions
+                or memory_key in self._approval_memory
                 or self._approval_wait_cancelled(),
                 timeout=TOOL_APPROVAL_TIMEOUT,
                 timeout_summary=f"approval:{approval_id}",
@@ -1045,6 +1065,8 @@ class SimpleChatWorkflow:
         else:
             if approval_id in self._approval_decisions:
                 decision = self._approval_decisions.pop(approval_id)
+            elif memory_key in self._approval_memory:
+                decision = "allow"
             else:
                 decision = "cancelled"
         self._pending_approvals.pop(approval_id, None)

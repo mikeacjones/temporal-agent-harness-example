@@ -626,6 +626,16 @@ export function streamEventNeedsSettledTranscriptDelta(event) {
 }
 
 export function streamEventNeedsWorkflowStateRefresh(event) {
+  if (
+    event.payload?.guard_name === "mutating_tool_approval" &&
+    (
+      event.kind === "harness_tool_guard_start" ||
+      event.kind === "harness_tool_guard_complete" ||
+      event.kind === "harness_tool_guard_failed"
+    )
+  ) {
+    return true;
+  }
   return (
     event.kind === AgentStreamEventKind.AGENT_COMPLETE &&
     streamAgentForEvent(event).kind === "main" &&

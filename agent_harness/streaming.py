@@ -397,7 +397,7 @@ class EmitStreamEventRequest:
     tool_name: str | None
     step: str | None
     kind: str
-    payload: object
+    payload: Any
     agent: dict[str, str | None] | None = None
     tool_call_id: str | None = None
 

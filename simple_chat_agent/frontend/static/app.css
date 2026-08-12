@@ -2010,140 +2010,54 @@ main {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-.harness-flow-workspace {
+.harness-agent-picker {
     min-width: 0;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 280px;
-    height: min(60vh, 610px);
-}
-.harness-flow-canvas {
-    min-width: 0;
-    min-height: 430px;
-}
-.harness-flow-canvas .react-flow {
-    background:
-        radial-gradient(circle at 25% 10%, rgba(68, 76, 231, 0.1), transparent 36%),
-        #090d14;
-}
-.harness-flow-canvas .react-flow__controls {
-    overflow: hidden;
-    border: 1px solid rgba(110, 118, 129, 0.3);
-    border-radius: 6px;
-    box-shadow: none;
-}
-.harness-flow-canvas .react-flow__controls-button {
-    border-color: rgba(110, 118, 129, 0.22);
-    background: #151e2c;
-    fill: #b9c7d8;
-}
-.harness-flow-canvas .react-flow__edge-path {
-    stroke: #64748b;
-    stroke-width: 1.6;
-}
-.harness-flow-canvas .react-flow__edge.animated .react-flow__edge-path {
-    stroke: #fb923c;
-}
-.harness-flow-canvas .react-flow__edge.retry .react-flow__edge-path {
-    stroke: #f97316;
-    stroke-dasharray: 6 4;
-}
-.harness-flow-canvas .react-flow__edge-text {
-    fill: #fdba74;
-    font-size: 11px;
-    font-weight: 800;
-}
-.harness-flow-canvas .react-flow__edge-textbg {
-    fill: #111827;
-}
-.harness-node {
-    width: 218px;
-    min-height: 106px;
-    display: grid;
-    gap: 6px;
-    padding: 10px 12px;
-    border: 1px solid rgba(148, 163, 184, 0.38);
-    border-left-width: 4px;
-    border-radius: 9px;
-    background: linear-gradient(145deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.98));
-    color: #d9e2ef;
-    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28);
-    font-size: 11px;
-}
-.harness-node.clickable {
-    cursor: pointer;
-}
-.harness-node-heading {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    color: #94a3b8;
-    font-size: 9px;
-    font-weight: 900;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    gap: 6px;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(110, 118, 129, 0.22);
+    background: rgba(10, 15, 24, 0.96);
+    overflow-x: auto;
 }
-.harness-node > strong {
+.harness-agent-picker button {
+    min-width: 148px;
+    max-width: 260px;
+    height: 34px;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    padding: 0 9px;
+    border: 1px solid rgba(110, 118, 129, 0.28);
+    border-radius: 7px;
+    background: rgba(21, 30, 44, 0.78);
+    color: #b9c7d8;
+    font-size: 0.68rem;
+}
+.harness-agent-picker button.active {
+    border-color: rgba(103, 232, 249, 0.55);
+    background: rgba(8, 47, 73, 0.72);
+    color: #ecfeff;
+    box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.1);
+}
+.harness-agent-picker button > span:nth-child(2) {
     overflow: hidden;
-    color: #f8fafc;
-    font-size: 12px;
-    line-height: 1.3;
+    text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-.harness-node > small {
-    min-height: 2.5em;
-    overflow: hidden;
-    color: #aebccd;
-    font-size: 10px;
-    line-height: 1.25;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
+.harness-agent-picker button small {
+    color: #7890a8;
+    font-size: 0.58rem;
+    font-weight: 800;
+    text-transform: uppercase;
 }
-.harness-node.input {
-    border-left-color: #f472b6;
-}
-.harness-node.llm {
-    border-left-color: #a78bfa;
-}
-.harness-node.llmGuard {
-    border-left-color: #c084fc;
-}
-.harness-node.toolGuard {
-    border-left-color: #2dd4bf;
-}
-.harness-node.approval {
-    border-left-color: #f472b6;
-}
-.harness-node.tool {
-    border-left-color: #facc15;
-}
-.harness-node.activity {
-    border-left-color: #94a3b8;
-    background: linear-gradient(145deg, rgba(30, 41, 59, 0.92), rgba(17, 24, 39, 0.96));
-}
-.harness-node.subagent {
-    border-left-color: #22d3ee;
-    background: linear-gradient(145deg, rgba(8, 47, 73, 0.94), rgba(15, 23, 42, 0.98));
-}
-.harness-node.artifact,
-.harness-node.output {
-    border-left-color: #4ade80;
-}
-.harness-node.failed {
-    border-color: rgba(248, 81, 73, 0.62);
-    border-left-color: #f85149;
-    box-shadow: 0 0 0 1px rgba(248, 81, 73, 0.1), 0 8px 26px rgba(0, 0, 0, 0.3);
-}
-.harness-node.retrying {
-    border-color: rgba(251, 146, 60, 0.68);
-    border-left-color: #fb923c;
-    box-shadow: 0 0 18px rgba(251, 146, 60, 0.12);
-}
-.harness-node.blocked {
-    border-color: rgba(244, 114, 182, 0.55);
-    border-left-color: #f472b6;
+.harness-flow-workspace {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    min-height: 460px;
+    height: min(52vh, 540px);
 }
 .harness-status {
     display: inline-flex;
@@ -2177,34 +2091,253 @@ main {
     border-color: rgba(244, 114, 182, 0.48);
     color: #f9a8d4;
 }
-.harness-node-metrics {
+.harness-loop-scroll {
+    min-width: 0;
+    overflow: auto;
+    background:
+        radial-gradient(circle at 42% 20%, rgba(68, 76, 231, 0.11), transparent 38%),
+        #090d14;
+}
+.harness-loop-diagram {
+    min-width: 1096px;
+    min-height: 430px;
+    display: grid;
+    grid-template-columns: 152px 30px 152px 30px 152px 30px 152px 30px 152px 30px 152px;
+    grid-template-rows: 148px 62px 148px;
+    align-content: center;
+    justify-content: center;
+    padding: 30px 22px;
+}
+.harness-stage {
+    width: 100%;
+    min-width: 0;
+    height: 138px;
+    display: grid;
+    align-content: start;
+    gap: 7px;
+    padding: 11px 12px;
+    border: 1px solid rgba(148, 163, 184, 0.32);
+    border-left: 4px solid #64748b;
+    border-radius: 9px;
+    background: linear-gradient(145deg, rgba(30, 41, 59, 0.97), rgba(15, 23, 42, 0.98));
+    color: #d9e2ef;
+    text-align: left;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+}
+.harness-stage:hover,
+.harness-stage.selected {
+    border-color: rgba(159, 178, 255, 0.66);
+    border-left-color: #9fb2ff;
+    background: linear-gradient(145deg, rgba(36, 50, 74, 0.99), rgba(18, 27, 45, 0.99));
+}
+.harness-stage.waiting {
+    opacity: 0.58;
+}
+.harness-stage.current {
+    opacity: 1;
+    border-color: rgba(250, 204, 21, 0.78);
+    border-left-color: #facc15;
+    box-shadow:
+        0 0 0 2px rgba(250, 204, 21, 0.12),
+        0 0 26px rgba(250, 204, 21, 0.12);
+    animation: harness-current-pulse 1.8s ease-in-out infinite;
+}
+.harness-stage.failed {
+    opacity: 1;
+    border-color: rgba(248, 81, 73, 0.68);
+    border-left-color: #f85149;
+}
+.harness-stage.retrying {
+    opacity: 1;
+    border-color: rgba(251, 146, 60, 0.72);
+    border-left-color: #fb923c;
+}
+.harness-stage.blocked {
+    opacity: 1;
+    border-color: rgba(244, 114, 182, 0.62);
+    border-left-color: #f472b6;
+}
+@keyframes harness-current-pulse {
+    0%,
+    100% {
+        box-shadow:
+            0 0 0 2px rgba(250, 204, 21, 0.1),
+            0 0 20px rgba(250, 204, 21, 0.08);
+    }
+    50% {
+        box-shadow:
+            0 0 0 3px rgba(250, 204, 21, 0.18),
+            0 0 30px rgba(250, 204, 21, 0.16);
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .harness-stage.current {
+        animation: none;
+    }
+}
+.harness-stage-heading {
     display: flex;
-    gap: 14px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
     color: #94a3b8;
-    font-size: 10px;
+    font-size: 0.56rem;
+    font-weight: 900;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
 }
-.harness-node-error-brief {
-    padding: 4px 6px;
-    border-radius: 5px;
-    background: rgba(248, 81, 73, 0.1);
-    color: #fca5a5;
-    font-size: 9px;
-    line-height: 1.3;
+.harness-stage > strong {
+    overflow: hidden;
+    color: #f8fafc;
+    font-size: 0.76rem;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
-.harness-node-attempt,
-.harness-node-open {
+.harness-stage > small {
+    min-height: 2.7em;
+    overflow: hidden;
+    color: #9eafc2;
+    font-size: 0.62rem;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+}
+.harness-stage-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    margin-top: auto;
+    color: #71859b;
+    font-size: 0.56rem;
+    font-weight: 700;
+}
+.harness-stage-footer .retry {
     color: #fdba74;
-    font-size: 9px;
+}
+.harness-stage-footer .failed {
+    color: #fca5a5;
+}
+.stage-request {
+    grid-column: 1;
+    grid-row: 1;
+    border-left-color: #f472b6;
+}
+.stage-inputGuard {
+    grid-column: 3;
+    grid-row: 1;
+    border-left-color: #c084fc;
+}
+.stage-llm {
+    grid-column: 5;
+    grid-row: 1;
+    border-left-color: #a78bfa;
+}
+.stage-outputGuard {
+    grid-column: 7;
+    grid-row: 1;
+    border-left-color: #c084fc;
+}
+.stage-decision {
+    grid-column: 9;
+    grid-row: 1;
+    border-left-color: #22d3ee;
+}
+.stage-response {
+    grid-column: 11;
+    grid-row: 1;
+    border-left-color: #4ade80;
+}
+.stage-preToolGuard {
+    grid-column: 9;
+    grid-row: 3;
+    border-left-color: #2dd4bf;
+}
+.stage-tool {
+    grid-column: 7;
+    grid-row: 3;
+    border-left-color: #facc15;
+}
+.stage-postToolGuard {
+    grid-column: 5;
+    grid-row: 3;
+    border-left-color: #2dd4bf;
+}
+.harness-connector {
+    align-self: center;
+    justify-self: center;
+    color: #64748b;
+    font-size: 1.2rem;
+    font-weight: 900;
+}
+.connector-request {
+    grid-column: 2;
+    grid-row: 1;
+}
+.connector-input-guard {
+    grid-column: 4;
+    grid-row: 1;
+}
+.connector-llm {
+    grid-column: 6;
+    grid-row: 1;
+}
+.connector-output-guard {
+    grid-column: 8;
+    grid-row: 1;
+}
+.connector-response {
+    grid-column: 10;
+    grid-row: 1;
+}
+.connector-pre-tool {
+    grid-column: 8;
+    grid-row: 3;
+}
+.connector-tool {
+    grid-column: 6;
+    grid-row: 3;
+}
+.harness-branch-label {
+    align-self: center;
+    color: #7890a8;
+    font-size: 0.58rem;
     font-weight: 800;
+    letter-spacing: 0.03em;
+    text-align: center;
+    text-transform: uppercase;
 }
-.harness-node-open {
-    color: #67e8f9;
+.branch-tool {
+    grid-column: 9;
+    grid-row: 2;
 }
-.harness-node .react-flow__handle {
-    width: 7px;
-    height: 7px;
-    border: 1px solid #0f172a;
-    background: #94a3b8;
+.branch-final {
+    grid-column: 10 / 12;
+    grid-row: 2;
+    align-self: start;
+    padding-top: 5px;
+}
+.harness-loop-return {
+    grid-column: 5;
+    grid-row: 2;
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    gap: 2px;
+    color: #9fb2ff;
+    text-align: center;
+}
+.harness-loop-return span {
+    font-size: 1.3rem;
+    line-height: 1;
+}
+.harness-loop-return strong {
+    width: 130px;
+    font-size: 0.56rem;
+    line-height: 1.25;
+    text-transform: uppercase;
 }
 .harness-node-inspector {
     min-width: 0;
@@ -2265,6 +2398,99 @@ main {
     color: #fca5a5;
     overflow-wrap: anywhere;
 }
+.harness-stage-description {
+    margin: 0;
+    color: #8fa1b5;
+    font-size: 0.68rem;
+    line-height: 1.45;
+}
+.harness-operation-list {
+    min-height: 0;
+    max-height: 190px;
+    display: grid;
+    gap: 4px;
+    overflow-y: auto;
+}
+.harness-operation-list button {
+    min-width: 0;
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 7px;
+    border: 1px solid rgba(110, 118, 129, 0.22);
+    border-radius: 6px;
+    background: rgba(10, 15, 24, 0.68);
+    color: #b9c7d8;
+    text-align: left;
+}
+.harness-operation-list button.active {
+    border-color: rgba(159, 178, 255, 0.54);
+    background: rgba(40, 52, 85, 0.54);
+}
+.harness-operation-list button > span:first-child {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+}
+.harness-operation-list strong {
+    overflow: hidden;
+    color: #dbe7f5;
+    font-size: 0.66rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.harness-operation-list small {
+    color: #71859b;
+    font-size: 0.58rem;
+}
+.harness-operation-detail {
+    min-width: 0;
+    display: grid;
+    gap: 8px;
+    padding-top: 2px;
+}
+.harness-operation-detail-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+.harness-operation-detail-heading > div {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+}
+.harness-operation-detail-heading span,
+.harness-operation-detail-heading small {
+    color: #71859b;
+    font-size: 0.58rem;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+.harness-operation-detail-heading strong {
+    overflow-wrap: anywhere;
+    color: #e5edf7;
+    font-size: 0.72rem;
+}
+.harness-open-child {
+    width: 100%;
+    min-height: 32px;
+    border-color: rgba(34, 211, 238, 0.4);
+    background: rgba(8, 47, 73, 0.5);
+    color: #a5f3fc;
+    font-size: 0.66rem;
+    font-weight: 800;
+}
+.harness-stage-empty {
+    padding: 10px;
+    border: 1px dashed rgba(110, 118, 129, 0.3);
+    border-radius: 6px;
+    color: #71859b;
+    font-size: 0.68rem;
+    line-height: 1.45;
+}
 @media (max-width: 720px) {
     .stream-panel {
         width: 96%;
@@ -2296,11 +2522,11 @@ main {
         grid-template-columns: 1fr;
         height: auto;
     }
-    .harness-flow-canvas {
-        height: 480px;
+    .harness-loop-scroll {
+        max-height: 490px;
     }
     .harness-node-inspector {
-        max-height: 280px;
+        max-height: 420px;
         border-top: 1px solid rgba(110, 118, 129, 0.22);
         border-left: 0;
     }

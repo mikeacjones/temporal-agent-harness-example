@@ -6,7 +6,7 @@ import {
   AGENT_TOOL_INPUT_EVENT_PREFIX,
   AgentStreamEventKind,
 } from "../state/streamEvents.js";
-import { HarnessFlow } from "./HarnessFlow.jsx";
+import { AgentLoop } from "./AgentLoop.jsx";
 
 export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
   const [view, setView] = useState("flow");
@@ -103,7 +103,7 @@ export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
             />
             <div className="stream-view-tabs" role="tablist" aria-label="Stream views">
               {[
-                ["flow", "Harness flow"],
+                ["flow", "Agent loop"],
                 ["overview", "Overview"],
                 ["main", "Main agent"],
                 ["subagents", `Subagents (${subagents.length})`],
@@ -155,7 +155,7 @@ export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
                 />
               ) : null}
               {view === "flow" ? (
-                <HarnessFlow
+                <AgentLoop
                   timeline={timeline}
                   agents={agents}
                   activeAgentId={activeFlowAgentId}

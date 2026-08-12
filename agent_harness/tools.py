@@ -14,7 +14,7 @@ from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from .activity_options import (
-    DEFAULT_ACTIVITY_OPTIONS,
+    DEFAULT_TOOL_ACTIVITY_OPTIONS,
     ActivityOptions,
 )
 from .activity_router import (
@@ -89,7 +89,7 @@ class ToolContext:
     stream_id: str | None = None
     tool_call_id: str | None = None
     stream_agent: dict[str, str | None] | None = None
-    activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
+    activity_options: ActivityOptions = DEFAULT_TOOL_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
 
@@ -348,7 +348,7 @@ class ToolSet:
     ) -> ToolResult:
         tool = self.get_tool(name)
         tool_args = args or {}
-        resolved_activity_options = activity_options or DEFAULT_ACTIVITY_OPTIONS
+        resolved_activity_options = activity_options or DEFAULT_TOOL_ACTIVITY_OPTIONS
         agent_id = (
             stream_agent.get("id")
             if stream_agent is not None

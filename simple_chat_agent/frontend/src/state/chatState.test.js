@@ -159,6 +159,37 @@ test("only main-agent completions trigger workflow reconciliation boundaries", (
   assert.equal(streamEventNeedsSettledTranscriptDelta(childDone), false);
 });
 
+test("approval guard lifecycle triggers workflow state reconciliation", () => {
+  const child = {
+    id: "chat-1-subagent",
+    parent_id: "chat-1",
+    kind: "subagent",
+    label: "Research one topic",
+  };
+  const approvalGuardStart = event("harness_tool_guard_start", child, {
+    guard_name: "mutating_tool_approval",
+    tool_name: "python_sandbox",
+    tool_type: "mutating",
+    status: "running",
+  });
+  const approvalGuardComplete = event("harness_tool_guard_complete", child, {
+    guard_name: "mutating_tool_approval",
+    tool_name: "python_sandbox",
+    tool_type: "mutating",
+    status: "passed",
+  });
+  const unrelatedGuard = event("harness_tool_guard_start", child, {
+    guard_name: "some_other_guard",
+    tool_name: "python_sandbox",
+    tool_type: "mutating",
+    status: "running",
+  });
+
+  assert.equal(streamEventNeedsWorkflowStateRefresh(approvalGuardStart), true);
+  assert.equal(streamEventNeedsWorkflowStateRefresh(approvalGuardComplete), true);
+  assert.equal(streamEventNeedsWorkflowStateRefresh(unrelatedGuard), false);
+});
+
 test("failed model attempts remain visible when Temporal retries the call", () => {
   const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
   let state = initialState();
