@@ -129,32 +129,25 @@ test("the runtime projects requested, running, failed, recovered, and completed 
 
   assert.equal(atEvent("agent_tool_input_complete").tools[0].status, "requested");
   assert.equal(atEvent("harness_tool_start").tools[0].status, "running");
+  const guardedTool = atEvent("harness_tool_guard_start").tools[0];
+  assert.equal(guardedTool.id, "tool-1");
+  assert.equal(guardedTool.status, "running");
   assert.deepEqual(
-    atEvent("harness_tool_guard_start").tools.find((tool) => tool.kind === "guard"),
-    {
+    guardedTool.guards.map((guard) => ({
+      id: guard.id,
+      name: guard.name,
+      timing: guard.timing,
+      status: guard.status,
+    })),
+    [{
       id: "tool-1:guard:pre:0:policy",
-      name: "guard · policy",
-      kind: "guard",
+      name: "policy",
+      timing: "pre",
       status: "running",
-      preview: "pre guard · file_search",
-      events: [agent.segments[1].events[2]],
-      detail: {
-        tool_call_id: "tool-1:guard:pre:0:policy",
-        tool_name: "guard · policy",
-        parent_tool_call_id: "tool-1",
-        guard_name: "policy",
-        guard_timing: "pre",
-        input: undefined,
-        latest_event: "harness_tool_guard_start",
-        latest_payload: agent.segments[1].events[2].payload,
-        event_count: 1,
-      },
-    },
+    }],
   );
   assert.equal(
-    atEvent("harness_tool_guard_complete").tools.find(
-      (tool) => tool.kind === "guard",
-    )?.status,
+    atEvent("harness_tool_guard_complete").tools[0].guards[0].status,
     "done",
   );
   assert.equal(atEvent("harness_tool_activity_failed").tools[0].status, "failed");
@@ -169,7 +162,6 @@ test("the runtime projects requested, running, failed, recovered, and completed 
     current.tools.map((tool) => ({ id: tool.id, name: tool.name, status: tool.status })),
     [
       { id: "tool-1", name: "file_search", status: "done" },
-      { id: "tool-1:guard:pre:0:policy", name: "guard · policy", status: "done" },
     ],
   );
 
@@ -199,12 +191,6 @@ test("the runtime projects requested, running, failed, recovered, and completed 
         preview: '{"query":"Temporal agents"}',
       },
       {
-        id: "tool-1:guard:pre:0:policy",
-        name: "guard · policy",
-        status: "done",
-        preview: "pre guard · file_search",
-      },
-      {
         id: "subagent-tool-1",
         name: "create_subagent",
         status: "running",
@@ -217,7 +203,7 @@ test("the runtime projects requested, running, failed, recovered, and completed 
     projectSubagentTools(current, [agent, completedChild], agent).tools.map(
       (tool) => tool.id,
     ),
-    ["tool-1", "tool-1:guard:pre:0:policy"],
+    ["tool-1"],
   );
   assert.equal(projectSubagentTools(current, [agent, child], agent, false), current);
 });
@@ -310,14 +296,24 @@ test("the final response retains create_artifact without reviving old subagents"
   );
 });
 
-test("the thinking stream pins its viewport to the newest content", async (t) => {
+test("model streams transition from thinking to response and pin to newest content", async (t) => {
   const server = await createServer({
     server: { middlewareMode: true },
     appType: "custom",
   });
   t.after(() => server.close());
-  const { scrollStreamToBottom } = await server.ssrLoadModule(
+  const { modelStreamForProjection, scrollStreamToBottom } = await server.ssrLoadModule(
     "/src/components/AgentRuntime.jsx",
+  );
+  assert.deepEqual(
+    modelStreamForProjection({ currentSegment: { thinking: "Considering tools", text: "" } }),
+    { kind: "thinking", label: "Thinking stream", text: "Considering tools" },
+  );
+  assert.deepEqual(
+    modelStreamForProjection({
+      currentSegment: { thinking: "Considering tools", text: "Here is the answer" },
+    }),
+    { kind: "response", label: "Response stream", text: "Here is the answer" },
   );
   const viewport = {
     clientHeight: 132,
@@ -328,6 +324,140 @@ test("the thinking stream pins its viewport to the newest content", async (t) =>
   scrollStreamToBottom(viewport);
 
   assert.equal(viewport.scrollTop, 280);
+});
+
+test("LLM guards are bundled with the model and replay precedes its tools", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { buildRuntimeFrames, projectRuntimeFrame } = await server.ssrLoadModule(
+    "/src/components/AgentRuntime.jsx",
+  );
+  const preStart = {
+    kind: "harness_llm_guard_start",
+    payload: {
+      operation_id: "chat:llm:1:guard:pre:policy",
+      parent_operation_id: "chat:llm:1",
+      guard_name: "prompt_policy",
+      timing: "pre",
+      status: "running",
+      llm_sequence: 1,
+    },
+  };
+  const preComplete = {
+    ...preStart,
+    kind: "harness_llm_guard_complete",
+    payload: { ...preStart.payload, status: "passed" },
+  };
+  const postStart = {
+    kind: "harness_llm_guard_start",
+    payload: {
+      operation_id: "chat:llm:1:guard:post:policy",
+      parent_operation_id: "chat:llm:1",
+      guard_name: "response_policy",
+      timing: "post",
+      status: "running",
+      llm_sequence: 1,
+    },
+  };
+  const postComplete = {
+    ...postStart,
+    kind: "harness_llm_guard_complete",
+    payload: { ...postStart.payload, status: "passed" },
+  };
+  const agent = {
+    id: "main",
+    kind: "main",
+    status: "running",
+    segments: [
+      {
+        id: "tools:main:1",
+        type: "tools",
+        afterSequence: 1,
+        status: "complete",
+        events: [
+          preStart,
+          preComplete,
+          {
+            kind: "agent_tool_input_complete",
+            payload: { tool_use_id: "tool-1", tool_name: "search_web", input: { query: "Temporal" } },
+          },
+          postStart,
+          postComplete,
+          {
+            kind: "harness_tool_start",
+            payload: { operation_id: "tool-1", tool_name: "search_web", status: "running" },
+          },
+          {
+            kind: "search_start",
+            tool_name: "search_web",
+            tool_call_id: "tool-1",
+            payload: { tool_name: "search_web" },
+          },
+          {
+            kind: "harness_tool_complete",
+            payload: { operation_id: "tool-1", tool_name: "search_web", status: "complete" },
+          },
+        ],
+      },
+      {
+        id: "agent:main:1",
+        type: "agent",
+        sequence: 1,
+        status: "complete",
+        terminal: false,
+        stopReason: "tool_use",
+        thinking: "I should search.",
+        text: "I’ll check that.",
+      },
+    ],
+  };
+  const timeline = { status: "tooling", activeSequence: 1 };
+  const frames = buildRuntimeFrames(timeline, agent);
+
+  assert.deepEqual(
+    frames.map((frame) => frame.kind),
+    [
+      "ingress",
+      "model-guard",
+      "model-guard",
+      "model",
+      "model",
+      "model-guard",
+      "model-guard",
+      "tool-event",
+      "tool-event",
+      "tool-event",
+    ],
+  );
+  assert.equal(
+    frames.some((frame) => frame.event?.kind === "search_start"),
+    false,
+  );
+  const preGuardModel = projectRuntimeFrame(timeline, agent, frames, 1);
+  assert.equal(preGuardModel.modelStatus, "guarding");
+  assert.deepEqual(
+    preGuardModel.modelGuards.map((guard) => ({ name: guard.name, status: guard.status })),
+    [{ name: "prompt_policy", status: "running" }],
+  );
+  const responseFrame = frames.findIndex(
+    (frame) => frame.kind === "model" && frame.modelStatus === "active",
+  );
+  assert.equal(projectRuntimeFrame(timeline, agent, frames, responseFrame).currentSegment.text, "I’ll check that.");
+  const postGuardFrame = frames.findIndex(
+    (frame) => frame.kind === "model-guard" && frame.event === postComplete,
+  );
+  assert.deepEqual(
+    projectRuntimeFrame(timeline, agent, frames, postGuardFrame).modelGuards.map(
+      (guard) => ({ name: guard.name, status: guard.status }),
+    ),
+    [
+      { name: "prompt_policy", status: "done" },
+      { name: "response_policy", status: "done" },
+    ],
+  );
 });
 
 test("a historical terminal turn projects a completed model", async (t) => {

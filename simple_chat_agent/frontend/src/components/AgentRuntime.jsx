@@ -25,8 +25,8 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
   const [playing, setPlaying] = useState(false);
   const [selectedCard, setSelectedCard] = useState(null);
   const toolGridRef = useRef(null);
-  const thoughtStreamRef = useRef(null);
-  const thoughtContentRef = useRef(null);
+  const modelStreamRef = useRef(null);
+  const modelStreamContentRef = useRef(null);
   const lastAgentIdRef = useRef(activeAgent?.id || null);
   const finalFrame = Math.max(0, frames.length - 1);
   const visibleCursor = following ? finalFrame : Math.min(cursor, finalFrame);
@@ -38,11 +38,10 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
     () => projectSubagentTools(projectedModel, agents, activeAgent, following),
     [activeAgent, agents, following, projectedModel],
   );
-  const thoughtText = String(model.currentSegment?.thinking || "").trim();
-  const showThoughtStream =
-    Boolean(thoughtText) && ["active", "thinking"].includes(model.modelStatus);
+  const modelStream = modelStreamForProjection(model);
+  const showModelStream = Boolean(modelStream.text);
   const layoutVersion = model.tools
-    .map((tool) => `${tool.id}:${tool.status}`)
+    .map((tool) => `${tool.id}:${tool.status}:${guardVersion(tool.guards)}`)
     .join("|");
 
   useFluidToolLayout(toolGridRef, layoutVersion);
@@ -61,11 +60,12 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
     setCursor(finalFrame);
   }, [finalFrame, following]);
 
-  useLiveThoughtAutoscroll(
-    thoughtStreamRef,
-    thoughtContentRef,
-    following && showThoughtStream,
-    activeAgent?.id,
+  useLiveStreamAutoscroll(
+    modelStreamRef,
+    modelStreamContentRef,
+    following && showModelStream,
+    `${activeAgent?.id || "agent"}:${modelStream.kind}`,
+    modelStream.text,
   );
 
   useEffect(() => {
@@ -169,17 +169,18 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
               <span className="runtime-model-icon"><i /></span>
               <strong>Model</strong>
               <small>{modelStatusLabel(model.modelStatus)}</small>
+              <RuntimeGuardBundle guards={model.modelGuards} owner="model" />
             </button>
 
             <div ref={toolGridRef} className="runtime-tool-bay">
-              {showThoughtStream ? (
-                <div className="runtime-thought-stream">
-                  <div className="runtime-thought-heading">
-                    <span><i /> Thinking stream</span>
-                    <small>Following live</small>
+              {showModelStream ? (
+                <div className={`runtime-model-stream ${modelStream.kind}`}>
+                  <div className="runtime-model-stream-heading">
+                    <span><i /> {modelStream.label}</span>
+                    <small>{following ? "Following live" : "Replay"}</small>
                   </div>
-                  <p ref={thoughtStreamRef} aria-live="polite">
-                    <span ref={thoughtContentRef}>{thoughtText}</span>
+                  <p ref={modelStreamRef} aria-live="polite" aria-atomic="false">
+                    <span ref={modelStreamContentRef}>{modelStream.text}</span>
                   </p>
                 </div>
               ) : null}
@@ -202,9 +203,10 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
                     </div>
                     <span className="runtime-tool-status"><i /> {toolStatusLabel(tool.status)}</span>
                     {tool.preview ? <p>{compactText(tool.preview, 88)}</p> : null}
+                    <RuntimeGuardBundle guards={tool.guards} owner="tool" />
                   </button>
                 ))
-              ) : !showThoughtStream ? (
+              ) : !showModelStream ? (
                 <div className="runtime-tool-empty">
                   {model.modelStatus === "complete"
                     ? "Run complete"
@@ -272,7 +274,7 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
   );
 }
 
-function useLiveThoughtAutoscroll(viewportRef, contentRef, enabled, streamId) {
+function useLiveStreamAutoscroll(viewportRef, contentRef, enabled, streamId, content) {
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     const content = contentRef.current;
@@ -309,7 +311,23 @@ function useLiveThoughtAutoscroll(viewportRef, contentRef, enabled, streamId) {
       resizeObserver?.disconnect();
       mutationObserver?.disconnect();
     };
-  }, [contentRef, enabled, streamId, viewportRef]);
+  }, [content, contentRef, enabled, streamId, viewportRef]);
+}
+
+function RuntimeGuardBundle({ guards, owner }) {
+  if (!guards?.length) return null;
+  return (
+    <span className={`runtime-guard-bundle ${owner}`} aria-label={`${owner} guards`}>
+      {guards.map((guard) => (
+        <span key={guard.id} className={`runtime-guard-row ${guard.status}`}>
+          <i />
+          <b title={guard.name}>{compactText(guard.name, owner === "model" ? 18 : 24)}</b>
+          <em>{guard.timing || "guard"}</em>
+          <small>{guardStatusLabel(guard.status)}</small>
+        </span>
+      ))}
+    </span>
+  );
 }
 
 export function scrollStreamToBottom(viewport) {
@@ -340,15 +358,29 @@ export function buildRuntimeFrames(_timeline, agent) {
     { id: `${agent.id}:ingress`, kind: "ingress", tone: "ingress", turn: 0 },
   ];
   let ordinal = 0;
-  for (const segment of agent.segments || []) {
-    const turn = Number(segment.sequence ?? segment.afterSequence ?? 0);
-    if (segment.type === "agent") {
+  for (const group of runtimeTurnGroups(agent.segments || [])) {
+    const llmGuardEvents = group.toolSegments.flatMap((segment) =>
+      (segment.events || []).filter(isLlmGuardEvent),
+    );
+    const preGuards = llmGuardEvents.filter(
+      (event) => String(event.payload?.timing || "pre") !== "post",
+    );
+    const postGuards = llmGuardEvents.filter(
+      (event) => String(event.payload?.timing || "") === "post",
+    );
+
+    for (const event of preGuards) {
+      frames.push(modelGuardFrame(agent.id, group.turn, event, ordinal));
+      ordinal += 1;
+    }
+
+    for (const segment of group.agentSegments) {
       if (String(segment.thinking || "").trim()) {
         frames.push({
           id: `${segment.id}:thinking`,
           kind: "model",
           tone: "model",
-          turn,
+          turn: group.turn,
           modelStatus: "thinking",
           segment,
         });
@@ -357,50 +389,144 @@ export function buildRuntimeFrames(_timeline, agent) {
         id: `${segment.id}:model`,
         kind: "model",
         tone: segment.status === "failed" ? "failed" : "model",
-        turn,
+        turn: group.turn,
         modelStatus: modelStatusForSegment(segment),
         segment,
       });
-      continue;
     }
-    for (const event of segment.events || []) {
-      frames.push({
-        id: `${segment.id}:event:${ordinal}`,
-        kind: "tool-event",
-        tone: eventTone(event),
-        turn,
-        event,
-        ordinal,
-      });
+
+    for (const event of postGuards) {
+      frames.push(modelGuardFrame(agent.id, group.turn, event, ordinal));
       ordinal += 1;
     }
-    if (segment.status === "complete") {
-      frames.push({
-        id: `${segment.id}:settled`,
-        kind: "tools-settled",
-        tone: "done",
-        turn,
-        segment,
-      });
+
+    for (const segment of group.toolSegments) {
+      const toolFrames = [];
+      let pendingEvents = [];
+      let currentFrame = null;
+      for (const event of (segment.events || []).filter((candidate) => !isLlmGuardEvent(candidate))) {
+        if (!isSemanticToolEvent(event)) {
+          pendingEvents.push(event);
+          continue;
+        }
+        currentFrame = {
+          id: `${segment.id}:event:${ordinal}`,
+          kind: "tool-event",
+          tone: eventTone(event),
+          turn: group.turn,
+          event,
+          events: [...pendingEvents, event],
+          ordinal,
+        };
+        pendingEvents = [];
+        toolFrames.push(currentFrame);
+        ordinal += 1;
+      }
+      if (pendingEvents.length) {
+        if (currentFrame) currentFrame.events.push(...pendingEvents);
+      }
+      frames.push(...toolFrames);
+      if (segment.status === "complete" && toolFrames.length &&
+          toolSegmentNeedsSettledFrame(segment.events || [])) {
+        frames.push({
+          id: `${segment.id}:settled`,
+          kind: "tools-settled",
+          tone: "done",
+          turn: group.turn,
+          segment,
+        });
+      }
     }
   }
   return frames;
 }
 
+function runtimeTurnGroups(segments) {
+  const groups = new Map();
+  for (const segment of segments) {
+    const turn = Number(segment.sequence ?? segment.afterSequence ?? 0);
+    const key = String(turn);
+    if (!groups.has(key)) {
+      groups.set(key, { turn, agentSegments: [], toolSegments: [] });
+    }
+    const group = groups.get(key);
+    if (segment.type === "agent") group.agentSegments.push(segment);
+    else group.toolSegments.push(segment);
+  }
+  return [...groups.values()];
+}
+
+function modelGuardFrame(agentId, turn, event, ordinal) {
+  return {
+    id: `${agentId}:model-guard:${event.payload?.operation_id || ordinal}:${event.kind}`,
+    kind: "model-guard",
+    tone: eventTone(event),
+    turn,
+    event,
+    ordinal,
+  };
+}
+
+function isLlmGuardEvent(event) {
+  return String(event?.kind || "").startsWith("harness_llm_guard_");
+}
+
+function isSemanticToolEvent(event) {
+  const kind = String(event?.kind || "");
+  if (kind.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX)) return true;
+  if (/^harness_tool_(start|complete|failed)$/.test(kind)) return true;
+  if (kind.startsWith("harness_tool_guard_")) return true;
+  if (kind.endsWith("_activity_failed") || kind.endsWith("_activity_rejected")) return true;
+  if (kind.endsWith("_activity_start") && Number(event.payload?.activity_attempt || 1) > 1) {
+    return true;
+  }
+  if (kind.startsWith("artifact_create") || kind.startsWith("python_sandbox_")) return true;
+  return false;
+}
+
+function toolSegmentNeedsSettledFrame(events) {
+  const tools = new Map();
+  for (const [ordinal, event] of events.entries()) {
+    const update = runtimeToolUpdate(event, ordinal, tools);
+    if (update) tools.set(update.id, update);
+  }
+  return [...tools.values()].some((tool) =>
+    ["requested", "running", "waiting"].includes(tool.status),
+  );
+}
+
 export function projectRuntimeFrame(timeline, agent, frames, cursor) {
   const tools = new Map();
+  const modelGuards = new Map();
   let toolTurn = null;
+  let modelTurn = null;
   let turn = Number(agent?.segments?.[0]?.sequence || timeline?.activeSequence || 0);
   let modelStatus = "dormant";
+  let modelBaseStatus = "dormant";
   let currentSegment = null;
   const visibleFrames = frames.slice(0, Math.max(0, cursor) + 1);
 
   for (const frame of visibleFrames) {
     if (frame.kind === "model") {
       const nextTurn = frame.turn || turn;
+      if (modelTurn !== nextTurn) modelGuards.clear();
+      modelTurn = nextTurn;
       turn = nextTurn;
       modelStatus = frame.modelStatus;
+      modelBaseStatus = frame.modelStatus;
       currentSegment = frame.segment;
+      continue;
+    }
+    if (frame.kind === "model-guard") {
+      const nextTurn = frame.turn || turn;
+      if (modelTurn !== nextTurn) modelGuards.clear();
+      modelTurn = nextTurn;
+      turn = nextTurn;
+      const guard = runtimeGuardUpdate(frame.event, modelGuards.get(runtimeGuardId(frame.event)));
+      modelGuards.set(guard.id, guard);
+      if (guard.status === "failed") modelStatus = "failed";
+      else if (guard.status === "running" || guard.status === "waiting") modelStatus = "guarding";
+      else modelStatus = modelBaseStatus;
       continue;
     }
     if (frame.kind === "tool-event") {
@@ -408,9 +534,12 @@ export function projectRuntimeFrame(timeline, agent, frames, cursor) {
       if (toolTurn !== null && nextToolTurn !== toolTurn) tools.clear();
       toolTurn = nextToolTurn;
       turn = nextToolTurn;
-      const update = runtimeToolUpdate(frame.event, frame.ordinal, tools);
-      if (update) tools.set(update.id, update);
+      for (const event of frame.events || [frame.event]) {
+        const update = runtimeToolUpdate(event, frame.ordinal, tools);
+        if (update) tools.set(update.id, update);
+      }
       modelStatus = "dormant";
+      modelBaseStatus = "dormant";
       continue;
     }
     if (frame.kind === "tools-settled") {
@@ -420,16 +549,18 @@ export function projectRuntimeFrame(timeline, agent, frames, cursor) {
       turn = nextToolTurn;
       for (const [id, tool] of tools) {
         if (["requested", "running", "waiting"].includes(tool.status)) {
-          tools.set(id, { ...tool, status: "done" });
+          tools.set(id, { ...tool, status: "done", executionStatus: "done" });
         }
       }
       modelStatus = "dormant";
+      modelBaseStatus = "dormant";
     }
   }
 
   return {
     turn,
     modelStatus,
+    modelGuards: [...modelGuards.values()],
     currentSegment,
     tools: [...tools.values()],
     agentStatus:
@@ -460,7 +591,9 @@ export function projectSubagentTools(model, agents, activeAgent, enabled = true)
       id,
       name: "create_subagent",
       status,
+      executionStatus: status,
       preview: subagent.label,
+      guards: existing?.guards || [],
       detail: {
         ...(existing?.detail || {}),
         tool_call_id: id,
@@ -480,18 +613,18 @@ export function projectSubagentTools(model, agents, activeAgent, enabled = true)
 
 function runtimeToolUpdate(event, ordinal, tools) {
   const kind = String(event?.kind || "");
-  if (!kind || kind.startsWith("harness_llm_")) return null;
+  if (!kind || isLlmGuardEvent(event)) return null;
   const payload = event.payload || {};
   const isInput = kind.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX);
   const isToolLifecycle = /^harness_tool_(start|complete|failed)$/.test(kind);
   const isToolGuard = kind.startsWith("harness_tool_guard_");
   const isToolActivity = kind.startsWith("harness_tool_activity_");
-  const isToolDetail = isToolGuard || isToolActivity;
+  const isToolDetail = isToolActivity;
   const isArtifact = kind.startsWith("artifact_create");
   const isPython = kind.startsWith("python_sandbox_");
+  if (isToolGuard) return runtimeToolGuardUpdate(event, ordinal, tools);
   const rawId =
     payload.tool_use_id ||
-    (isToolGuard ? payload.operation_id : null) ||
     event.tool_call_id ||
     (isToolActivity ? payload.parent_operation_id : payload.operation_id) ||
     payload.run_id ||
@@ -503,38 +636,32 @@ function runtimeToolUpdate(event, ordinal, tools) {
     return null;
   }
   const name = String(
-    (isToolGuard && payload.guard_name
-      ? `guard · ${payload.guard_name}`
-      : payload.tool_name) ||
+    payload.tool_name ||
       event.tool_name ||
       existing?.name ||
       (isArtifact ? "create_artifact" : isPython ? "python_sandbox" : "tool"),
   );
   const nextStatus = toolStatusForEvent(kind, payload, existing?.status);
   const input = payload.input ?? payload.input_partial ?? payload.input_preview;
-  const guardPreview = isToolGuard
-    ? [payload.timing ? `${payload.timing} guard` : "tool guard", payload.tool_name]
-      .filter(Boolean)
-      .join(" · ")
-    : "";
   const preview = input === undefined
-    ? existing?.preview || guardPreview
+    ? existing?.preview || ""
     : compactValue(input);
   const events = [...(existing?.events || []), event];
+  const guards = existing?.guards || [];
   return {
     id,
     name,
-    kind: isToolGuard ? "guard" : existing?.kind || "tool",
+    kind: existing?.kind || "tool",
     status: nextStatus,
+    executionStatus: nextStatus,
     preview,
     events,
+    guards,
     detail: {
       tool_call_id: id,
       tool_name: name,
-      parent_tool_call_id: isToolGuard ? payload.parent_operation_id || null : null,
-      guard_name: isToolGuard ? payload.guard_name || null : null,
-      guard_timing: isToolGuard ? payload.timing || null : null,
       input: input ?? existing?.detail?.input,
+      guards: guards.map((guard) => guard.detail),
       latest_event: kind,
       latest_payload: payload,
       event_count: events.length,
@@ -542,25 +669,109 @@ function runtimeToolUpdate(event, ordinal, tools) {
   };
 }
 
+function runtimeToolGuardUpdate(event, ordinal, tools) {
+  const payload = event.payload || {};
+  const parentId = String(
+    payload.parent_operation_id ||
+    payload.tool_use_id ||
+    event.tool_call_id ||
+    `${payload.tool_name || "tool"}:${payload.llm_sequence ?? ordinal}`,
+  );
+  const existing = tools.get(parentId);
+  const guardId = runtimeGuardId(event);
+  const previousGuard = existing?.guards?.find((guard) => guard.id === guardId);
+  const guard = runtimeGuardUpdate(event, previousGuard);
+  const guards = [...(existing?.guards || []).filter((candidate) => candidate.id !== guard.id), guard];
+  const executionStatus = existing?.executionStatus || existing?.status || "requested";
+  const status = guard.status === "failed"
+    ? "failed"
+    : guard.status === "waiting"
+      ? "waiting"
+      : executionStatus;
+  const events = [...(existing?.events || []), event];
+  const name = String(payload.tool_name || existing?.name || event.tool_name || "tool");
+  const preview = existing?.preview || compactValue(payload.input || "");
+  return {
+    id: parentId,
+    name,
+    kind: existing?.kind || "tool",
+    status,
+    executionStatus,
+    preview,
+    events,
+    guards,
+    detail: {
+      ...(existing?.detail || {}),
+      tool_call_id: parentId,
+      tool_name: name,
+      input: existing?.detail?.input,
+      guards: guards.map((candidate) => candidate.detail),
+      latest_event: event.kind,
+      latest_payload: payload,
+      event_count: events.length,
+    },
+  };
+}
+
+function runtimeGuardId(event) {
+  const payload = event?.payload || {};
+  return String(
+    payload.operation_id ||
+    `${payload.parent_operation_id || "guard"}:${payload.timing || "guard"}:${payload.guard_name || event?.kind}`,
+  );
+}
+
+function runtimeGuardUpdate(event, existing = null) {
+  const payload = event?.payload || {};
+  const status = guardStatusForEvent(event?.kind, payload, existing?.status);
+  const events = [...(existing?.events || []), event];
+  const name = String(payload.guard_name || event?.tool_name || "guard");
+  return {
+    id: runtimeGuardId(event),
+    name,
+    timing: String(payload.timing || "guard"),
+    status,
+    reason: payload.reason || existing?.reason || null,
+    events,
+    detail: {
+      guard_name: name,
+      guard_timing: payload.timing || null,
+      operation_id: runtimeGuardId(event),
+      parent_operation_id: payload.parent_operation_id || null,
+      status,
+      reason: payload.reason || existing?.reason || null,
+      latest_event: event?.kind || null,
+      latest_payload: payload,
+      event_count: events.length,
+    },
+  };
+}
+
+function guardStatusForEvent(kind, payload, fallback = "running") {
+  const normalized = String(payload.status || "").toLowerCase();
+  if (String(kind || "").endsWith("_failed") ||
+      String(kind || "").endsWith("_rejected") ||
+      ["failed", "error", "rejected", "blocked", "cancelled"].includes(normalized)) {
+    return "failed";
+  }
+  if (String(kind || "").endsWith("_complete")) return "done";
+  if (String(kind || "").endsWith("_start") &&
+      String(payload.guard_name || "").includes("approval")) return "waiting";
+  if (String(kind || "").endsWith("_start")) return "running";
+  return fallback || "running";
+}
+
 function toolStatusForEvent(kind, payload, previous = "requested") {
   if (kind === AgentStreamEventKind.AGENT_TOOL_INPUT_START ||
       kind === AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA ||
       kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) return "requested";
-  if (kind.startsWith("harness_tool_guard_")) {
-    if (kind.endsWith("_failed") || kind.endsWith("_rejected")) return "failed";
-    if (kind.endsWith("_complete")) return "done";
-    if (kind.endsWith("_start") && String(payload.guard_name || "").includes("approval")) {
-      return "waiting";
-    }
-    if (kind.endsWith("_start")) return "running";
-    return normalizeToolStatus(payload.status, previous);
-  }
   if (kind === "harness_tool_start" || kind.endsWith("_activity_start")) return "running";
-  if (kind === "harness_tool_complete" || kind === "artifact_create_complete") return "done";
+  if (kind === "harness_tool_complete") return normalizeToolStatus(payload.status, "done");
+  if (kind === "artifact_create_complete") return "done";
   if (kind.endsWith("_failed") || kind.endsWith("_rejected")) return "failed";
   if (kind.endsWith("_activity_complete")) return "running";
   if (kind.startsWith("python_sandbox_")) return "running";
-  return normalizeToolStatus(payload.status, previous);
+  return previous || "requested";
 }
 
 function normalizeToolStatus(value, fallback) {
@@ -590,8 +801,22 @@ function modelStatusForSegment(segment) {
       : "active";
   }
   if (segment.terminal) return "complete";
-  if (segment.stopReason === "tool_use") return "dormant";
+  if (segment.stopReason === "tool_use") {
+    return String(segment.text || "").trim() ? "active" : "dormant";
+  }
   return segment.status === "complete" ? "complete" : "active";
+}
+
+export function modelStreamForProjection(model) {
+  const response = String(model?.currentSegment?.text || "").trim();
+  if (response) {
+    return { kind: "response", label: "Response stream", text: response };
+  }
+  const thinking = String(model?.currentSegment?.thinking || "").trim();
+  if (thinking) {
+    return { kind: "thinking", label: "Thinking stream", text: thinking };
+  }
+  return { kind: "idle", label: "Model stream", text: "" };
 }
 
 function inspectedRuntimeCard(selected, model) {
@@ -605,14 +830,17 @@ function inspectedRuntimeCard(selected, model) {
       kind: "Model",
       label: segment?.model || segment?.provider || "Agent model",
       status: model.modelStatus,
-      summary: segment?.thinking ? compactText(segment.thinking, 220) : compactText(segment?.text, 220),
-      detail: segment || {},
+      summary: segment?.text ? compactText(segment.text, 220) : compactText(segment?.thinking, 220),
+      detail: {
+        ...(segment || {}),
+        guards: model.modelGuards?.map((guard) => guard.detail) || [],
+      },
     };
   }
   const tool = model.tools.find((candidate) => candidate.id === selected.id);
   if (!tool) return null;
   return {
-    kind: tool.kind === "guard" ? "Tool guard" : "Tool",
+    kind: "Tool",
     label: tool.name,
     status: tool.status,
     summary: tool.preview,
@@ -670,11 +898,19 @@ function runtimeStatusLabel(status) {
 }
 
 function modelStatusLabel(status) {
-  return ({ dormant: "Dormant", active: "Active", thinking: "Thinking", complete: "Complete", failed: "Stopped" })[status] || "Dormant";
+  return ({ dormant: "Dormant", active: "Responding", thinking: "Thinking", guarding: "Guarding", complete: "Complete", failed: "Stopped" })[status] || "Dormant";
 }
 
 function toolStatusLabel(status) {
   return ({ requested: "Requested", running: "Running", waiting: "Waiting", done: "Done", failed: "Failed" })[status] || "Requested";
+}
+
+function guardStatusLabel(status) {
+  return ({ running: "Checking", waiting: "Waiting", done: "Passed", failed: "Blocked" })[status] || "Checking";
+}
+
+function guardVersion(guards) {
+  return (guards || []).map((guard) => `${guard.id}:${guard.status}`).join(",");
 }
 
 function shortId(value) {

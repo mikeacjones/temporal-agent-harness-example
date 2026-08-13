@@ -1730,9 +1730,14 @@ main {
     filter: saturate(0.36);
 }
 .runtime-model-card.thinking,
-.runtime-model-card.active {
+.runtime-model-card.active,
+.runtime-model-card.guarding {
     box-shadow: 0 0 36px rgba(78, 139, 231, 0.24);
     animation: runtime-model-breathe 2s ease-in-out infinite;
+}
+.runtime-model-card.guarding {
+    border-color: rgba(93, 207, 199, 0.76);
+    color: #7bd9d2;
 }
 .runtime-model-card.complete {
     border-color: rgba(104, 211, 145, 0.68);
@@ -1784,7 +1789,7 @@ main {
     border-radius: 16px;
     background: rgba(7, 9, 13, 0.34);
 }
-.runtime-thought-stream {
+.runtime-model-stream {
     min-width: 0;
     grid-column: 1 / -1;
     display: grid;
@@ -1799,7 +1804,13 @@ main {
     box-shadow: inset 0 0 24px rgba(102, 126, 206, 0.06);
     animation: runtime-card-enter 280ms cubic-bezier(.16,.8,.24,1) both;
 }
-.runtime-thought-heading {
+.runtime-model-stream.response {
+    border-color: rgba(91, 189, 201, 0.34);
+    background:
+        linear-gradient(110deg, rgba(32, 67, 75, 0.52), rgba(20, 31, 45, 0.84)),
+        rgba(10, 13, 19, 0.88);
+}
+.runtime-model-stream-heading {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1810,12 +1821,15 @@ main {
     letter-spacing: 0.15em;
     text-transform: uppercase;
 }
-.runtime-thought-heading span {
+.runtime-model-stream.response .runtime-model-stream-heading {
+    color: #9ed8df;
+}
+.runtime-model-stream-heading span {
     display: flex;
     align-items: center;
     gap: 7px;
 }
-.runtime-thought-heading i {
+.runtime-model-stream-heading i {
     width: 7px;
     height: 7px;
     border-radius: 50%;
@@ -1823,12 +1837,16 @@ main {
     box-shadow: 0 0 10px rgba(165, 126, 238, 0.8);
     animation: runtime-dot-pulse 1.25s ease-in-out infinite;
 }
-.runtime-thought-heading small {
+.runtime-model-stream.response .runtime-model-stream-heading i {
+    background: #66cbd5;
+    box-shadow: 0 0 10px rgba(102, 203, 213, 0.72);
+}
+.runtime-model-stream-heading small {
     color: #8068a6;
     font-size: 0.52rem;
     letter-spacing: 0.08em;
 }
-.runtime-thought-stream > p {
+.runtime-model-stream > p {
     max-height: 132px;
     margin: 0;
     overflow: auto;
@@ -1841,7 +1859,7 @@ main {
     scrollbar-gutter: stable;
     mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), black 18%);
 }
-.runtime-thought-stream > p > span {
+.runtime-model-stream > p > span {
     display: block;
 }
 .runtime-tool-empty {
@@ -1952,6 +1970,68 @@ main {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
+}
+.runtime-guard-bundle {
+    width: 100%;
+    min-width: 0;
+    display: grid;
+    gap: 5px;
+    margin-top: 2px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(114, 184, 184, 0.18);
+    text-align: left;
+}
+.runtime-model-card .runtime-guard-bundle {
+    width: min(100%, 210px);
+    margin-top: 5px;
+}
+.runtime-guard-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 7px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 5px;
+    color: #71ccc7;
+    font-size: 0.48rem;
+    letter-spacing: 0.04em;
+    text-transform: none;
+}
+.runtime-guard-row > i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
+}
+.runtime-guard-row > b {
+    min-width: 0;
+    overflow: hidden;
+    color: #b7d7d6;
+    font-size: 0.5rem;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.runtime-guard-row > em {
+    color: #607f82;
+    font-size: 0.44rem;
+    font-style: normal;
+    text-transform: uppercase;
+}
+.runtime-guard-row > small {
+    color: currentColor;
+    font-size: 0.44rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+.runtime-guard-row.waiting {
+    color: #c39af9;
+}
+.runtime-guard-row.done {
+    color: #78d8a0;
+}
+.runtime-guard-row.failed {
+    color: #ff8f88;
 }
 .runtime-transport {
     min-width: 0;
@@ -2271,8 +2351,8 @@ main {
 @media (prefers-reduced-motion: reduce) {
     .runtime-dot.running,
     .runtime-run-pill.running i,
-    .runtime-thought-stream,
-    .runtime-thought-heading i,
+    .runtime-model-stream,
+    .runtime-model-stream-heading i,
     .runtime-ingress-card,
     .runtime-model-card,
     .runtime-tool-card,
