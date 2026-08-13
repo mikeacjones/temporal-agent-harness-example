@@ -32,7 +32,7 @@ lifespan hook:
 
 - a Temporal client configured with the shared data converter;
 - `AppStore` for OAuth, artifact, attachment, and local metadata storage;
-- an in-memory `StreamBroker`;
+- a Redis-backed `StreamBroker` (or local JSONL fallback);
 - MCP auth resolvers used by dynamic HTTP MCP tools.
 
 Local development can serve the built frontend from the API process. In
@@ -49,7 +49,7 @@ deployment serves only API and OAuth routes.
 | `routes/demo_workspace.py` | Main-to-temp workspace controls, temp workspace login handoff, crash/delete/create actions, and parent workspace state queries. |
 | `schemas.py` | Request shapes accepted from the browser. |
 | `serialization.py` | UI-shaped response dictionaries for workflow state, transcripts, artifacts, and attachments. |
-| `streaming.py` | API-owned in-memory stream broker and SSE helpers. |
+| `streaming.py` | Redis/JSONL stream broker and SSE helpers. |
 | `auth.py`, `local_auth.py`, `google_oauth.py`, `github_oauth.py` | Login/session/OAuth helpers. |
 | `features.py`, `thinking.py`, `anthropic_models.py` | Runtime feature gates and model/thinking configuration. |
 | `artifacts.py` | Artifact/attachment response helpers for view and download routes. |
@@ -91,16 +91,17 @@ Durable reads are deliberately bounded:
 - `/api/sessions/{workflow_id}/state/patch` returns a small non-transcript state
   patch when only status/tool/approval data changed.
 
-Stream events arrive from workers over `/internal/stream` and
-`/internal/stream/event`, are stored in `StreamBroker`, and are served to the
-browser through SSE. The important durable transition is `turn_settled`: the
-workflow emits that as an activity after committing the final turn state, so the
-browser can reconcile in-order with the transcript revision carried by the
-event.
+Workers append stream events directly to Redis Streams, and `StreamBroker` reads
+that ordered log for browser SSE and replay APIs. The important durable
+transition is `turn_settled`: the workflow emits that as an activity after
+committing the final turn state, so the browser can reconcile in-order with the
+transcript revision carried by the event. Its idempotency key is enforced
+atomically with the Redis append.
 
-The in-memory broker means the API deployment is intentionally single-replica
-for this demo. Scaling the API would require a shared stream backplane such as
-Redis or another ordered event store.
+`/internal/stream` and `/internal/stream/event` remain as authenticated ingress
+for the sandbox Lambda and rolling compatibility with older workers. Those
+routes now append to Redis rather than process memory. Local development keeps
+the JSONL fallback when `SIMPLE_CHAT_REDIS_URL` is unset.
 
 ## Sessions And Chats
 

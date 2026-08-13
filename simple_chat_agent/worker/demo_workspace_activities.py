@@ -29,6 +29,8 @@ WORKSPACE_SERVICE_ACCOUNT = "agent-harness-workspace"
 WORKSPACE_HTTPS_REDIRECT_MIDDLEWARE = "agent-harness-https-redirect"
 WEB_SERVICE = "agent-harness-web"
 API_SERVICE = "agent-harness-api"
+REDIS_SERVICE = "agent-harness-redis"
+REDIS_IMAGE = "redis:7.4-alpine"
 
 SECRET_DENY_PREFIXES = (
     "AWS_",
@@ -55,6 +57,7 @@ async def provision_demo_workspace(request: ProvisionDemoWorkspaceRequest) -> di
     await configure_demo_workspace(request)
     await deploy_demo_workspace_workloads(request, source_images)
     for deployment_name in [
+        "agent-harness-redis",
         "agent-harness-web",
         "agent-harness-api",
         "agent-harness-worker",
@@ -121,8 +124,13 @@ async def deploy_demo_workspace_workloads(
     client = KubernetesClient.in_cluster()
     client.upsert_service(request.namespace, _service(WEB_SERVICE, "web", 80, 8080))
     client.upsert_service(request.namespace, _service(API_SERVICE, "api", 80, 8000))
+    client.upsert_service(
+        request.namespace,
+        _service(REDIS_SERVICE, "redis", 6379, 6379, port_name="redis"),
+    )
 
     common_env = _common_env(request)
+    client.upsert_deployment(request.namespace, _redis_deployment(request.namespace))
     client.upsert_deployment(
         request.namespace,
         _web_deployment(source_images["web"], request.namespace),
@@ -438,7 +446,7 @@ def _service_account(role_arn: str = "") -> dict[str, Any]:
     }
 
 
-def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
+def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, Any]]:
     values = {
         "SIMPLE_CHAT_DEMO_WORKSPACE": "1",
         "SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED": "0",
@@ -447,7 +455,6 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED": "0",
         "SIMPLE_CHAT_WORKFLOW_PREFIX": request.workflow_prefix,
         "SIMPLE_CHAT_PUBLIC_URL": request.url,
-        "SIMPLE_CHAT_STREAM_SINK_URL": f"http://{API_SERVICE}",
         "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID": request.control_workflow_id,
         "SIMPLE_CHAT_DEMO_PARENT_PUBLIC_URL": request.parent_public_url,
     }
@@ -474,7 +481,24 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, str]]:
         values["SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR"] = request.search_attr_name
     if os.environ.get("SIMPLE_CHAT_GOOD_PLACE") is not None:
         values["SIMPLE_CHAT_GOOD_PLACE"] = os.environ["SIMPLE_CHAT_GOOD_PLACE"]
-    return [{"name": key, "value": value} for key, value in values.items()]
+    return [
+        {
+            "name": "SIMPLE_CHAT_STREAM_TOKEN",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": WORKSPACE_SECRET,
+                    "key": "SIMPLE_CHAT_STREAM_TOKEN",
+                }
+            },
+        },
+        {
+            "name": "SIMPLE_CHAT_REDIS_URL",
+            "value": (
+                f"redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@{REDIS_SERVICE}:6379/0"
+            ),
+        },
+        *[{"name": key, "value": value} for key, value in values.items()],
+    ]
 
 
 def _web_deployment(image: str, namespace: str) -> dict[str, Any]:
@@ -508,7 +532,7 @@ def _web_deployment(image: str, namespace: str) -> dict[str, Any]:
 def _api_deployment(
     image: str,
     namespace: str,
-    common_env: list[dict[str, str]],
+    common_env: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return _deployment(
         name="agent-harness-api",
@@ -543,7 +567,7 @@ def _api_deployment(
 def _worker_deployment(
     image: str,
     namespace: str,
-    common_env: list[dict[str, str]],
+    common_env: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return _deployment(
         name="agent-harness-worker",
@@ -565,6 +589,89 @@ def _worker_deployment(
     )
 
 
+def _redis_deployment(namespace: str) -> dict[str, Any]:
+    labels = {
+        "app": WORKSPACE_LABEL,
+        "workspace": namespace,
+        "component": "redis",
+    }
+    secret_ref = {
+        "secretKeyRef": {
+            "name": WORKSPACE_SECRET,
+            "key": "SIMPLE_CHAT_STREAM_TOKEN",
+        }
+    }
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": REDIS_SERVICE, "labels": labels},
+        "spec": {
+            "replicas": 1,
+            "strategy": {"type": "Recreate"},
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": {"fsGroup": 999},
+                    "containers": [
+                        {
+                            "name": "redis",
+                            "image": REDIS_IMAGE,
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": ["/bin/sh", "-ec"],
+                            "args": [
+                                "umask 077\n"
+                                "printf 'requirepass %s\\n' "
+                                '"$SIMPLE_CHAT_STREAM_TOKEN" '
+                                "> /run/redis/redis.conf\n"
+                                "exec redis-server /run/redis/redis.conf "
+                                "--appendonly yes --appendfsync everysec --dir /data"
+                            ],
+                            "env": [
+                                {
+                                    "name": "SIMPLE_CHAT_STREAM_TOKEN",
+                                    "valueFrom": secret_ref,
+                                },
+                                {"name": "REDISCLI_AUTH", "valueFrom": secret_ref},
+                            ],
+                            "ports": [{"name": "redis", "containerPort": 6379}],
+                            "volumeMounts": [
+                                {"name": "data", "mountPath": "/data"},
+                                {"name": "config", "mountPath": "/run/redis"},
+                            ],
+                            "readinessProbe": {
+                                "exec": {"command": ["redis-cli", "ping"]},
+                                "initialDelaySeconds": 3,
+                                "periodSeconds": 5,
+                            },
+                            "livenessProbe": {
+                                "exec": {"command": ["redis-cli", "ping"]},
+                                "initialDelaySeconds": 15,
+                                "periodSeconds": 10,
+                            },
+                            "resources": {
+                                "requests": {"cpu": "50m", "memory": "64Mi"},
+                                "limits": {"cpu": "500m", "memory": "256Mi"},
+                            },
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"]},
+                                "runAsNonRoot": True,
+                                "runAsUser": 999,
+                            },
+                        }
+                    ],
+                    "volumes": [
+                        {"name": "data", "emptyDir": {}},
+                        {"name": "config", "emptyDir": {"medium": "Memory"}},
+                    ],
+                },
+            },
+        },
+    }
+
+
 def _deployment(
     *,
     name: str,
@@ -573,7 +680,7 @@ def _deployment(
     image: str,
     command: list[str],
     ports: list[dict[str, Any]],
-    env: list[dict[str, str]],
+    env: list[dict[str, Any]],
     env_from: list[dict[str, Any]],
     resources: dict[str, Any],
     readiness_port: int,
@@ -628,6 +735,8 @@ def _service(
     component: str,
     port: int,
     target_port: int,
+    *,
+    port_name: str = "http",
 ) -> dict[str, Any]:
     return {
         "apiVersion": "v1",
@@ -636,7 +745,9 @@ def _service(
         "spec": {
             "type": "ClusterIP",
             "selector": {"app": WORKSPACE_LABEL, "component": component},
-            "ports": [{"name": "http", "port": port, "targetPort": target_port}],
+            "ports": [
+                {"name": port_name, "port": port, "targetPort": target_port}
+            ],
         },
     }
 

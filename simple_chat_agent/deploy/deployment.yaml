@@ -1,15 +1,14 @@
 # Independent frontend, API, and worker Deployments for the simple_chat_agent.
 #
 # All shared state is now external (S3 claim-checks + artifacts, DynamoDB
-# OAuth/artifact metadata, API-owned HTTP streaming), so the runtime boundaries
-# no longer share a pod or any local volume. The API and worker keep a small
-# emptyDir for SQLite scratch (transient OAuth handshake state, etc.).
+# OAuth/artifact metadata, Redis Streams), so the runtime boundaries no longer
+# share a pod or any local volume. The API and worker keep a small emptyDir for
+# SQLite scratch (transient OAuth handshake state, etc.).
 #
 # - web: static frontend only; no secrets or service-account token. The
 #        `component: web` label is retained for Deployment selector stability.
-# - api: FastAPI, OAuth, SSE, artifacts, and internal stream API. Single replica
-#        while it owns the in-memory stream buffer; scaling needs a shared
-#        backplane, e.g. Redis.
+# - api: FastAPI, OAuth, SSE, artifacts, and the authenticated SSE gateway over
+#        the shared Redis Streams backplane.
 # - worker: Temporal worker + in-process codec; horizontally scalable (the codec
 #           reads claim-checks from S3, so any worker pod can decode).
 ---
@@ -123,6 +122,13 @@ spec:
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            - name: SIMPLE_CHAT_STREAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-harness-secrets
+                  key: SIMPLE_CHAT_STREAM_TOKEN
+            - name: SIMPLE_CHAT_REDIS_URL
+              value: redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@agent-harness-redis:6379/0
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.tmprl-demo.cloud
             - name: SIMPLE_CHAT_WORKER_VERSION
@@ -214,10 +220,18 @@ spec:
               value: UserEmail
             - name: SIMPLE_CHAT_DYNAMODB_TABLE
               value: temporal-michaelj-agent-harness-demo-oauth
-            - name: SIMPLE_CHAT_STREAM_SINK_URL
-              value: http://agent-harness-api
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            - name: SIMPLE_CHAT_STREAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-harness-secrets
+                  key: SIMPLE_CHAT_STREAM_TOKEN
+            - name: SIMPLE_CHAT_REDIS_URL
+              value: redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@agent-harness-redis:6379/0
+            # Old images use this during a rolling migration; new images prefer Redis.
+            - name: SIMPLE_CHAT_STREAM_SINK_URL
+              value: http://agent-harness-api
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.tmprl-demo.cloud
             - name: SIMPLE_CHAT_WORKER_VERSION

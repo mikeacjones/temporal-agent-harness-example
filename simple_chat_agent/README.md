@@ -114,6 +114,10 @@ uv run python -m simple_chat_agent.api.main
 Open `http://127.0.0.1:8000` and log in. The default credentials are
 `demo` / `demo` unless you override them in `.env`.
 
+Local development uses per-chat JSONL stream files by default. To exercise the
+deployed Redis Streams path locally, start Redis and set
+`SIMPLE_CHAT_REDIS_URL=redis://127.0.0.1:6379/0` for both the API and worker.
+
 For the full local setup, including required CLI tools and optional Google
 OAuth, see [`docs/local-development.md`](../docs/local-development.md).
 

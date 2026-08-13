@@ -143,10 +143,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.store = AppStore()
     app.state.mcp_oauth_flows = {}
-    # In-memory per-stream event buffers, used when streaming arrives over the
-    # API-owned HTTP endpoint (deployment) instead of local files (local dev).
-    app.state.stream_broker = StreamBroker()
-    yield
+    stream_broker = StreamBroker()
+    await stream_broker.start()
+    app.state.stream_broker = stream_broker
+    try:
+        yield
+    finally:
+        await stream_broker.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -392,15 +395,15 @@ async def logout() -> Response:
 
 @app.post("/internal/stream")
 async def internal_stream(request: Request) -> dict[str, str]:
-    # Worker -> web: append a stream event to the in-memory per-stream buffer.
-    # Authenticated with a shared token (cluster-internal); not user-facing.
+    # External executor/old worker -> API -> Redis. Authenticated with a shared
+    # token and retained for sandbox callbacks plus rolling compatibility.
     token = os.environ.get("SIMPLE_CHAT_STREAM_TOKEN", "").strip()
     if not token or request.headers.get("x-stream-token") != token:
         raise HTTPException(status_code=401, detail="Invalid stream token.")
     event = await request.json()
     stream_id = event.get("stream_id")
     if stream_id:
-        _stream_broker().append(stream_id, event)
+        await _stream_broker().append(stream_id, event)
     return {"status": "ok"}
 
 
@@ -420,7 +423,7 @@ async def internal_stream_event(request: Request) -> dict[str, str]:
     idempotency_key = str(payload.get("idempotency_key") or "")
     if not stream_id or not event or not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="Invalid stream event payload.")
-    cursor = _stream_broker().append_event(
+    cursor = await _stream_broker().append_event(
         stream_id,
         event,
         data,
@@ -525,7 +528,7 @@ async def _forget_conversation(
         user_id=user_id,
         workflow_id=workflow_id,
     )
-    _stream_broker().clear(workflow_id)
+    await _stream_broker().clear(workflow_id)
     # Purge the chat's offloaded payloads from external storage. Best-effort:
     # a purge failure must not block forgetting the conversation. No-op when
     # S3 storage is not configured (local dev).

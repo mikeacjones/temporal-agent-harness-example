@@ -159,7 +159,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 ),
             ),
         )
-        deps.stream_broker().clear(conversation.workflow_id)
+        await deps.stream_broker().clear(conversation.workflow_id)
         await deps.register_demo_workspace_chat(conversation)
         return {
             "workflow_id": conversation.workflow_id,
@@ -221,7 +221,9 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         record_timing(timings, "owner", started)
 
         response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Stream-Cursor"] = deps.stream_broker().cursor(workflow_id)
+        response.headers["X-Stream-Cursor"] = await deps.stream_broker().cursor(
+            workflow_id
+        )
         query_started = time.perf_counter()
         try:
             snapshot = await deps.query_snapshot(
@@ -355,7 +357,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
             attachment_ids=request.attachment_ids,
         )
-        cursor = deps.stream_broker().cursor(workflow_id)
+        cursor = await deps.stream_broker().cursor(workflow_id)
         await deps.signal_workflow(
             http_request,
             workflow_id,
@@ -395,7 +397,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
             attachment_ids=request.attachment_ids,
         )
-        cursor = deps.stream_broker().cursor(workflow_id)
+        cursor = await deps.stream_broker().cursor(workflow_id)
         await deps.signal_workflow(
             http_request,
             workflow_id,
@@ -702,7 +704,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         stream_cursor = (
             request.headers.get("last-event-id")
             or cursor
-            or deps.stream_broker().cursor(workflow_id)
+            or await deps.stream_broker().cursor(workflow_id)
         )
 
         return EventSourceResponse(
@@ -725,7 +727,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         limit: int = Query(1000, ge=1, le=5000),
     ) -> dict[str, Any]:
         await deps.require_conversation_owner(request, workflow_id)
-        return deps.stream_broker().replay(
+        return await deps.stream_broker().replay(
             workflow_id,
             cursor=cursor,
             limit=limit,
@@ -744,7 +746,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             user_id=user.user_id,
             workflow_id=workflow_id,
         )
-        deps.stream_broker().clear(workflow_id)
+        await deps.stream_broker().clear(workflow_id)
         await deps.unregister_demo_workspace_chat(workflow_id)
         return {"status": "ok"}
 

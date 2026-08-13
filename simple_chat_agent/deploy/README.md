@@ -1,7 +1,7 @@
 # Deploying simple_chat_agent
 
-Deploys the frontend, API, and Temporal worker (with its in-process codec
-server) as **three independent Deployments** into the
+Deploys the frontend, API, Redis stream backplane, and Temporal worker (with its
+in-process codec server) as independent workloads into the
 `temporal-michaelj-agent-harness-demo` namespace on the `sa-demo` EKS cluster
 (`us-west-1`, account `429214323166`), fronted by Traefik on
 `*.tmprl-demo.cloud`.
@@ -13,14 +13,15 @@ server) as **three independent Deployments** into the
 | Codec     | https://codec.agent-harness-demo.tmprl-demo.cloud |
 
 All shared state is external (S3 claim-checks + artifacts, DynamoDB OAuth and
-artifact metadata, and an API-owned HTTP streaming endpoint), so the runtimes no
-longer share a pod or any local volume:
+artifact metadata, and Redis Streams), so the runtimes no longer share a pod or
+any local volume:
 
 - `agent-harness-web` — static frontend only. It receives no app secrets and no
   service-account token.
-- `agent-harness-api` — FastAPI, OAuth, SSE, artifacts, and internal stream API.
-  Single replica while it owns the in-memory stream buffer; scaling needs a
-  shared backplane such as Redis.
+- `agent-harness-api` — FastAPI, OAuth, SSE, artifacts, and the authenticated
+  browser gateway over Redis Streams.
+- `agent-harness-redis` — ordered/replayable stream events, protected with the
+  existing stream token and using AOF on a pod-local `emptyDir`.
 - `agent-harness-worker` — Temporal worker + codec. Horizontally scalable (bump
   `replicas`); the codec reads claim-checks from S3, so any worker pod decodes.
 
@@ -30,22 +31,26 @@ The deployment keeps runtime responsibilities separated even though all three
 processes are built from one Docker image.
 
 - The web pod is static and should not receive application secrets.
-- The API pod owns login, OAuth, browser routes, artifact metadata, and the
-  in-memory stream broker.
+- The API pod owns login, OAuth, browser routes, artifact metadata, and the SSE
+  projection of Redis Streams.
 - The worker pod owns Temporal workflow/activity execution and the codec server.
+- Redis owns short-lived, ordered stream events and resumable cursors.
 - S3 and DynamoDB are the durable cross-pod stores.
 - Temporal Cloud is the durable workflow store.
 
 This keeps pod restarts and worker crashes demo-friendly. Crashing a worker
 should interrupt execution, not erase state. Crashing the web pod should only
-affect static asset serving. Crashing the API pod can lose in-memory sideband
-stream buffers, but durable workflow state remains queryable.
+affect static asset serving. API restarts no longer erase sideband stream events;
+Redis AOF preserves them across Redis container restarts in the same pod. A pod
+replacement loses the short-lived stream log and the UI reconciles from durable
+Temporal workflow state.
 
 ## Manifest And Script Map
 
 | Path | Purpose |
 | --- | --- |
 | `deployment.yaml` | Production web/API/worker Deployments and environment wiring. |
+| `redis.yaml` | Password-protected Redis Deployment and Service. |
 | `service.yaml` | ClusterIP Services for web, API, and codec. |
 | `ingressroute.yaml` | Traefik routes, TLS, HTTPS redirect middleware, and codec host. |
 | `certificate.yaml` | Production wildcard and app certificates. |
@@ -138,6 +143,10 @@ The testing script:
 5. rolls out the testing Deployments;
 6. refreshes the S3 lifecycle policy.
 
+Both rollout scripts use the explicit `sa-demo` kubectl context; they do not
+depend on whichever context happens to be current. Each rollout also sets a
+unique timestamp-based Temporal Worker Deployment build ID.
+
 The testing URL is:
 
 ```text
@@ -178,6 +187,7 @@ to a local on-disk store (used for local dev).
 |-------|---------|-------|
 | Claim-check payloads and artifact bytes | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; chat delete purges known prefixes |
 | GitHub/MCP OAuth tokens | DynamoDB (`SIMPLE_CHAT_DYNAMODB_TABLE`, table `…-oauth`) | survives redeploys; SSE-encrypted; accessed via IRSA |
+| Ordered deployed stream events and cursors | Redis Streams + AOF on `emptyDir` | 30-minute idle TTL; survives API and Redis-container restarts, not Redis-pod replacement |
 | Transient OAuth handshake state and local-dev stream/artifact files | local `emptyDir` | ephemeral; lost on restart |
 
 When the S3 / DynamoDB env vars are unset (local dev), the app falls back to
@@ -188,10 +198,11 @@ leave `SIMPLE_CHAT_LOCAL_AUTH_ENABLED=0` and use Google OAuth. Even if local
 auth is accidentally enabled, the local login route is not registered while
 Google OAuth credentials are configured.
 
-The deployed API receives sideband stream events over `/internal/stream` and
-serves browser SSE from its in-memory stream buffer. That keeps the frontend pod
-static, but the API should stay at one replica until the stream buffer moves to a
-shared backplane.
+Deployed workers append sideband events directly to Redis Streams. The API reads
+the same ordered log and serves authenticated browser SSE without changing the
+frontend contract. `/internal/stream` remains for the sandbox Lambda callback
+and for rolling compatibility with older workers; the API forwards those events
+to Redis. Stream keys expire 30 minutes after their last event by default.
 
 ## Temporary Demo Workspaces
 
@@ -232,7 +243,7 @@ disable versioning because each workspace has a short-lived unique task queue.
 After any rollout, check:
 
 ```bash
-kubectl get deploy agent-harness-web agent-harness-api agent-harness-worker \
+kubectl get deploy agent-harness-web agent-harness-api agent-harness-worker agent-harness-redis \
   -n temporal-michaelj-agent-harness-demo -o wide
 
 kubectl get pods -n temporal-michaelj-agent-harness-demo -o wide

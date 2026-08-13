@@ -19,6 +19,7 @@ REGION="us-west-1"
 ACCOUNT="429214323166"
 REPO="temporal-michaelj-agent-harness-demo"
 NAMESPACE="temporal-michaelj-agent-harness-demo"
+KUBE_CONTEXT="sa-demo"
 FRONTEND_DEPLOYMENT="agent-harness-web"
 API_DEPLOYMENT="agent-harness-api"
 WORKER_DEPLOYMENT="agent-harness-worker"
@@ -43,16 +44,20 @@ docker buildx build --platform linux/amd64 \
   -t "${IMAGE}:latest" \
   --push .
 
-echo ">> Applying manifests"
-kubectl apply -f simple_chat_agent/deploy/
+echo ">> Applying Redis first"
+kubectl --context "${KUBE_CONTEXT}" apply -f simple_chat_agent/deploy/redis.yaml
 
-echo ">> Rolling out frontend + API + worker in ${NAMESPACE} to ${TAG}"
-kubectl set image "deployment/${FRONTEND_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"
-kubectl set image "deployment/${API_DEPLOYMENT}" "api=${IMAGE}:${TAG}" -n "${NAMESPACE}"
-kubectl set image "deployment/${WORKER_DEPLOYMENT}" "worker=${IMAGE}:${TAG}" -n "${NAMESPACE}"
-kubectl rollout status "deployment/${FRONTEND_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
-kubectl rollout status "deployment/${API_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
-kubectl rollout status "deployment/${WORKER_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+echo ">> Waiting for Redis before changing the application stack"
+kubectl --context "${KUBE_CONTEXT}" rollout status deployment/agent-harness-redis -n "${NAMESPACE}" --timeout=300s
+
+echo ">> Applying manifests and rolling out frontend + API + worker in ${NAMESPACE} to ${TAG}"
+kubectl --context "${KUBE_CONTEXT}" apply -f simple_chat_agent/deploy/
+kubectl --context "${KUBE_CONTEXT}" set image "deployment/${FRONTEND_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl --context "${KUBE_CONTEXT}" set image "deployment/${API_DEPLOYMENT}" "api=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl --context "${KUBE_CONTEXT}" set image "deployment/${WORKER_DEPLOYMENT}" "worker=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl --context "${KUBE_CONTEXT}" rollout status "deployment/${FRONTEND_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+kubectl --context "${KUBE_CONTEXT}" rollout status "deployment/${API_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+kubectl --context "${KUBE_CONTEXT}" rollout status "deployment/${WORKER_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 
 "${ROOT}/simple_chat_agent/deploy/configure-s3-lifecycle.sh"
 

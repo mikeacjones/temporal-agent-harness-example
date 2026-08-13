@@ -56,8 +56,12 @@ DEFAULT_WORKER_VERSION = "1.0.0"
 
 async def main() -> None:
     load_dotenv()
+    stream_sink = configured_stream_sink()
+    start_stream_sink = getattr(stream_sink, "start", None)
+    if start_stream_sink is not None:
+        await start_stream_sink()
     configure_stream_sink(
-        configured_stream_sink(),
+        stream_sink,
         llm_guard=(
             good_place_post_guard
             if os.environ.get("SIMPLE_CHAT_GOOD_PLACE", "1").lower()
@@ -117,20 +121,25 @@ async def main() -> None:
         ],
         deployment_config=deployment_config,
     )
-    if not codec_server_enabled():
-        await worker.run()
-        return
+    try:
+        if not codec_server_enabled():
+            await worker.run()
+            return
 
-    codec_server = uvicorn.Server(
-        uvicorn.Config(
-            create_codec_app(data_converter),
-            host=codec_server_host(),
-            port=codec_server_port(),
-            log_level="info",
+        codec_server = uvicorn.Server(
+            uvicorn.Config(
+                create_codec_app(data_converter),
+                host=codec_server_host(),
+                port=codec_server_port(),
+                log_level="info",
+            )
         )
-    )
-    print(f"Temporal Web codec server listening on {codec_server_url()}")
-    await _run_worker_and_codec_server(worker, codec_server)
+        print(f"Temporal Web codec server listening on {codec_server_url()}")
+        await _run_worker_and_codec_server(worker, codec_server)
+    finally:
+        close = getattr(stream_sink, "close", None)
+        if close is not None:
+            await close()
 
 
 async def _run_worker_and_codec_server(

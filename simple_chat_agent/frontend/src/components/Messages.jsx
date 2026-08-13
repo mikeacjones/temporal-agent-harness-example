@@ -26,6 +26,14 @@ export function Messages({
   const transcript = workflowState?.transcript || [];
   const transcriptOffset = workflowState?.transcript_offset || 0;
   const transcriptTotal = workflowState?.transcript_total ?? transcriptOffset + transcript.length;
+  const activeMessageValue = workflowState?.active_message_index;
+  const activeMessageIndex =
+    activeMessageValue === null || activeMessageValue === undefined
+      ? null
+      : Number(activeMessageValue);
+  const activeMessage = Number.isFinite(activeMessageIndex)
+    ? transcript[activeMessageIndex - transcriptOffset]
+    : null;
   const messageItems = visibleMessageItems(
     transcript,
     localPending,
@@ -80,6 +88,7 @@ export function Messages({
         turn={streamTurn}
         collapsed={streamPanelCollapsed}
         onToggle={onToggleStreamPanel}
+        inputText={activeMessage?.role === "user" ? activeMessage.content : ""}
       />
       <ApprovalsPanel
         workflowState={workflowState}

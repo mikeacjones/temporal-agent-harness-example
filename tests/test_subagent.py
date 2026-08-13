@@ -3,21 +3,30 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from temporalio import workflow
 from temporalio.common import (
     SearchAttributeKey,
     SearchAttributePair,
     TypedSearchAttributes,
 )
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
+from agent_harness.providers.claude import ClaudeThinkingConfig
 from agent_harness.tools import ToolSet
 from simple_chat_agent.worker.tools.subagent import (
     CREATE_SUBAGENT_TOOL,
     SubagentProvider,
     SubagentResponse,
+    SubagentWorkflow,
 )
 
 
 class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subagent_workflow_is_valid_in_the_temporal_sandbox(self) -> None:
+        SandboxedWorkflowRunner().prepare_workflow(
+            workflow._Definition.must_from_class(SubagentWorkflow)
+        )
+
     async def test_child_workflow_inherits_parent_search_attributes(self) -> None:
         user_email = SearchAttributeKey.for_keyword("UserEmail")
         parent_search_attributes = TypedSearchAttributes(
@@ -32,8 +41,15 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             tool_call_id="create-subagent-call-1",
         )
         ctx.tool_names.return_value = ["research"]
+        thinking = ClaudeThinkingConfig(
+            enabled=True,
+            mode="adaptive",
+            effort="high",
+            display="summarized",
+        )
         provider = SubagentProvider(
             default_model=lambda: "claude-sonnet-4-5",
+            thinking=lambda: thinking,
             user_ref=lambda: "user-123",
             conversation_id=lambda: "simple-chat-parent",
             github_connection_id=lambda: None,
@@ -74,6 +90,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         )
         child_request = execute_child.await_args.args[1]
         self.assertEqual(child_request.tool_names, ["research"])
+        self.assertIs(child_request.thinking, thinking)
         self.assertEqual(child_request.reference_time, "2026-07-29T18:42:00Z")
         self.assertEqual(
             child_request.parent_tool_call_id,

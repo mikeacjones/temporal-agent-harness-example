@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_harness.mcp import HttpMcpProvider
 from agent_harness.mcp_types import HttpMcpServerConfig
 from agent_harness.tools import ToolResult, ToolSet
+
+if TYPE_CHECKING:
+    from agent_harness.providers.claude import ClaudeThinkingConfig
 
 from .approval import ApprovalDecision, MutatingToolApprovalProvider
 from .attachments import AttachmentProvider, READ_ATTACHMENT_TOOL
@@ -121,6 +124,7 @@ def build_tools(
     github_connection_id: Callable[[], str | None],
     mcp_servers: Callable[[], Iterable[HttpMcpServerConfig]] | None = None,
     default_model: Callable[[], str],
+    thinking: Callable[[], ClaudeThinkingConfig | None] | None = None,
     request_mutating_tool_approval: ApprovalRequest | None = None,
 ) -> ToolSet:
     tools = AppToolSet(
@@ -147,6 +151,7 @@ def build_tools(
     tools.add_provider(
         SubagentProvider(
             default_model=default_model,
+            thinking=thinking,
             user_ref=user_ref,
             conversation_id=conversation_id,
             reference_time=reference_time,

@@ -5,7 +5,7 @@
 # in the shared namespace comes from SIMPLE_CHAT_TASK_QUEUE (own queue) +
 # SIMPLE_CHAT_WORKFLOW_PREFIX (own registry ids). The test worker streams to the
 # test API. Backends (S3, DynamoDB, secret, Temporal namespace) are shared with
-# prod.
+# prod. Streaming uses the separate testing Redis service and keyspace.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -110,6 +110,13 @@ spec:
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            - name: SIMPLE_CHAT_STREAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-harness-secrets
+                  key: SIMPLE_CHAT_STREAM_TOKEN
+            - name: SIMPLE_CHAT_REDIS_URL
+              value: redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@agent-harness-redis-testing:6379/0
             # Override shared prod secret values for OAuth redirect generation.
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.testing.tmprl-demo.cloud
@@ -214,6 +221,14 @@ spec:
               value: testing-
             - name: SIMPLE_CHAT_PUBLIC_URL
               value: https://agent-harness-demo.testing.tmprl-demo.cloud
+            - name: SIMPLE_CHAT_STREAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-harness-secrets
+                  key: SIMPLE_CHAT_STREAM_TOKEN
+            - name: SIMPLE_CHAT_REDIS_URL
+              value: redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@agent-harness-redis-testing:6379/0
+            # Old images use this during a rolling migration; new images prefer Redis.
             - name: SIMPLE_CHAT_STREAM_SINK_URL
               value: http://agent-harness-api-testing
             - name: SIMPLE_CHAT_SEARXNG_BASE_URL

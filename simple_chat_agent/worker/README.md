@@ -148,6 +148,13 @@ The default behavior is pinned. Continue-as-new calls use
 `AUTO_UPGRADE`, so a workflow can move to the latest compatible deployment when
 it checkpoints into a new run.
 
+The shared production and testing task queues currently keep the build id at
+`1.0.0`. Their long-lived user-registry and demo-workspace workflows may remain
+pinned to that version between checkpoints, so changing the build id requires a
+planned Worker Deployment rollout that keeps the old-version poller available
+until those executions have migrated. An image tag alone is not a safe build-id
+replacement.
+
 Temporary demo workspaces may disable versioning because each temp workspace has
 a unique task queue and short lifecycle.
 
@@ -169,13 +176,15 @@ results after pod restarts.
 ## Streaming And Settlement
 
 Provider and tool activities emit sideband stream events through a configured
-stream sink. In Kubernetes, the sink posts to the API's `/internal/stream`
-endpoint. Local dev can use JSONL stream files.
+stream sink. In Kubernetes, workers append directly to Redis Streams while the
+API exposes that ordered log through authenticated SSE. The sandbox Lambda still
+posts through the API's `/internal/stream` endpoint because it receives only a
+narrow HTTPS callback and token. Local dev can use JSONL stream files.
 
 Most stream events are best-effort UX. The exception is turn settlement:
 `SimpleChatWorkflow` commits transcript state, then schedules
-`emit_turn_settled`. That activity posts a durable settlement event so the UI can
-reconcile final transcript state in order.
+`emit_turn_settled`. That activity atomically appends an idempotent settlement
+event so the UI can reconcile final transcript state in order.
 
 ## Interrupts And Cancellation
 

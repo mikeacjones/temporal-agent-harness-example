@@ -739,6 +739,7 @@ class SimpleChatWorkflow:
             github_connection_id=lambda: self._github_connection_id,
             mcp_servers=lambda: self._mcp_servers,
             default_model=lambda: chat_input.model,
+            thinking=lambda: self._thinking,
             request_mutating_tool_approval=self._request_tool_approval,
         )
         return ClaudeAgent(

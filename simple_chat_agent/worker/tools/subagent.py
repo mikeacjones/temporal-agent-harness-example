@@ -12,7 +12,7 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.agent import AgentState
     from agent_harness.mcp import HttpMcpProvider
     from agent_harness.mcp_types import HttpMcpServerConfig
-    from agent_harness.providers.claude import ClaudeAgent
+    from agent_harness.providers.claude import ClaudeAgent, ClaudeThinkingConfig
     from agent_harness.tool_types import ToolType
     from agent_harness.tools import ToolContext, ToolResult, ToolSet, tool
     from simple_chat_agent import TASK_QUEUE
@@ -40,6 +40,7 @@ class SubagentRequest:
     system_prompt: str
     task: str
     model: str
+    thinking: ClaudeThinkingConfig | None = None
     max_tokens: int = _DEFAULT_SUBAGENT_MAX_TOKENS
     tool_names: list[str] = field(default_factory=list)
     denied_tool_names: list[str] = field(default_factory=list)
@@ -70,6 +71,7 @@ class SubagentProvider:
         self,
         *,
         default_model: Callable[[], str],
+        thinking: Callable[[], ClaudeThinkingConfig | None] | None = None,
         user_ref: Callable[[], str | None],
         conversation_id: Callable[[], str | None],
         github_connection_id: Callable[[], str | None],
@@ -77,6 +79,7 @@ class SubagentProvider:
         mcp_servers: Callable[[], list[HttpMcpServerConfig]] | None = None,
     ) -> None:
         self._default_model = default_model
+        self._thinking = thinking or (lambda: None)
         self._user_ref = user_ref
         self._conversation_id = conversation_id
         self._github_connection_id = github_connection_id
@@ -149,6 +152,7 @@ class SubagentProvider:
                 system_prompt=system_prompt,
                 task=task,
                 model=model or self._default_model(),
+                thinking=self._thinking(),
                 max_tokens=max_tokens,
                 tool_names=granted_tool_names,
                 denied_tool_names=denied_tool_names,
@@ -213,6 +217,7 @@ class SubagentWorkflow:
             tools,
             model=request.model,
             max_tokens=request.max_tokens,
+            thinking=request.thinking,
             tool_names=tool_names,
             stream_id=request.stream_id,
             stream_agent={
@@ -237,6 +242,7 @@ class SubagentWorkflow:
                     system_prompt=request.system_prompt,
                     task=request.task,
                     model=request.model,
+                    thinking=request.thinking,
                     max_tokens=request.max_tokens,
                     tool_names=tool_names,
                     denied_tool_names=denied_tool_names,

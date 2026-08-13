@@ -253,13 +253,6 @@ export default function App() {
     if (pinnedToBottomRef.current) {
       messages.scrollTop = messages.scrollHeight;
     }
-    messages
-      .querySelectorAll(
-        ".stream-current-turn .stream-text, .stream-current-turn .stream-thinking, .stream-agent-segment .stream-text, .stream-agent-segment .stream-thinking",
-      )
-      .forEach((node) => {
-        node.scrollTop = node.scrollHeight;
-      });
   }, [
     state.workflowState,
     state.localPending,
