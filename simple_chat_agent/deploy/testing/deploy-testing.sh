@@ -32,8 +32,14 @@ docker buildx build --platform linux/amd64 \
   -t "${IMAGE}:testing" \
   --push .
 
-echo ">> Deploying testing Python sandbox Lambda + IAM"
-"${ROOT}/simple_chat_agent/deploy/testing/deploy-python-sandbox-lambda-testing.sh"
+if ! kubectl --context "${KUBE_CONTEXT}" get secret agent-harness-workspace-executor-auth-testing -n "${NAMESPACE}" >/dev/null 2>&1; then
+  echo ">> Creating testing workspace executor authentication secret"
+  WORKSPACE_EXECUTOR_SECRET="$(openssl rand -hex 32)"
+  kubectl --context "${KUBE_CONTEXT}" create secret generic agent-harness-workspace-executor-auth-testing \
+    -n "${NAMESPACE}" \
+    --from-literal="token=${WORKSPACE_EXECUTOR_SECRET}"
+  unset WORKSPACE_EXECUTOR_SECRET
+fi
 
 echo ">> Applying testing manifests"
 kubectl --context "${KUBE_CONTEXT}" apply -f simple_chat_agent/deploy/searxng.yaml
@@ -47,8 +53,11 @@ echo ">> Setting images + rolling out the test stack"
 kubectl --context "${KUBE_CONTEXT}" set image deployment/agent-harness-web-testing web="${IMAGE}:${TAG}" -n "${NAMESPACE}"
 kubectl --context "${KUBE_CONTEXT}" set image deployment/agent-harness-api-testing api="${IMAGE}:${TAG}" -n "${NAMESPACE}"
 kubectl --context "${KUBE_CONTEXT}" set image deployment/agent-harness-worker-testing worker="${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl --context "${KUBE_CONTEXT}" set image deployment/agent-harness-workspace-executor-testing \
+  workspace-executor="${IMAGE}:${TAG}" workspace-firewall="${IMAGE}:${TAG}" -n "${NAMESPACE}"
 kubectl --context "${KUBE_CONTEXT}" rollout status deployment/agent-harness-web-testing -n "${NAMESPACE}" --timeout=300s
 kubectl --context "${KUBE_CONTEXT}" rollout status deployment/agent-harness-api-testing -n "${NAMESPACE}" --timeout=300s
+kubectl --context "${KUBE_CONTEXT}" rollout status deployment/agent-harness-workspace-executor-testing -n "${NAMESPACE}" --timeout=300s
 kubectl --context "${KUBE_CONTEXT}" rollout status deployment/agent-harness-worker-testing -n "${NAMESPACE}" --timeout=300s
 
 "${ROOT}/simple_chat_agent/deploy/configure-s3-lifecycle.sh"

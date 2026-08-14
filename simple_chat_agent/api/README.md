@@ -99,9 +99,10 @@ transcript revision carried by the event. Its idempotency key is enforced
 atomically with the Redis append.
 
 `/internal/stream` and `/internal/stream/event` remain as authenticated ingress
-for the sandbox Lambda and rolling compatibility with older workers. Those
-routes now append to Redis rather than process memory. Local development keeps
-the JSONL fallback when `SIMPLE_CHAT_REDIS_URL` is unset.
+for rolling compatibility with older workers and the retired sandbox Lambda.
+Those routes append to Redis rather than process memory. The workspace executor
+returns output to the worker over its authenticated response stream instead.
+Local development keeps the JSONL fallback when `SIMPLE_CHAT_REDIS_URL` is unset.
 
 ## Sessions And Chats
 

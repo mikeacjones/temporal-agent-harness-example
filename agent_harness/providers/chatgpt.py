@@ -64,7 +64,7 @@ ChatGPTReasoningEffort = Literal["minimal", "low", "medium", "high"]
 ChatGPTReasoningSummary = Literal["auto", "concise", "detailed"]
 
 DEFAULT_CHATGPT_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=20),
     heartbeat_timeout=timedelta(seconds=10),
 )
 CHATGPT_HEARTBEAT_INTERVAL_SECONDS = 5

@@ -1,7 +1,7 @@
 # Deploying simple_chat_agent
 
-Deploys the frontend, API, Redis stream backplane, and Temporal worker (with its
-in-process codec server) as independent workloads into the
+Deploys the frontend, API, Redis stream backplane, Temporal worker (with its
+in-process codec server), and credential-free workspace executor as independent workloads into the
 `temporal-michaelj-agent-harness-demo` namespace on the `sa-demo` EKS cluster
 (`us-west-1`, account `429214323166`), fronted by Traefik on
 `*.tmprl-demo.cloud`.
@@ -24,6 +24,13 @@ any local volume:
   existing stream token and using AOF on a pod-local `emptyDir`.
 - `agent-harness-worker` — Temporal worker + codec. Horizontally scalable (bump
   `replicas`); the codec reads claim-checks from S3, so any worker pod decodes.
+- `agent-harness-workspace-executor` — authenticated Bubblewrap command runner
+  with public-web-only egress. Production uses a persistent PVC; the current
+  `sa-demo` testing manifest uses a 5 Gi `emptyDir` because that cluster has no
+  dynamic block-storage CSI provisioner. A `NET_ADMIN` init container installs
+  the Pod's egress firewall and exits; the long-running executor is non-root and
+  capless. It receives no app secret, ServiceAccount token, or IAM role, and
+  refuses readiness if an ambient AWS or Kubernetes credential path is detected.
 
 ## Deployment Philosophy
 
@@ -34,6 +41,7 @@ processes are built from one Docker image.
 - The API pod owns login, OAuth, browser routes, artifact metadata, and the SSE
   projection of Redis Streams.
 - The worker pod owns Temporal workflow/activity execution and the codec server.
+- The workspace executor owns untrusted shell processes and persistent agent files.
 - Redis owns short-lived, ordered stream events and resumable cursors.
 - S3 and DynamoDB are the durable cross-pod stores.
 - Temporal Cloud is the durable workflow store.
@@ -57,6 +65,7 @@ Temporal workflow state.
 | `serviceaccount.yaml` | Shared ServiceAccount and IRSA role annotation. |
 | `demo-workspace-rbac.yaml` | RBAC that lets the controller create/delete temp namespaces and workloads. |
 | `searxng.yaml` | Internal SearXNG deployment/service used by research tools. |
+| `workspace-executor.yaml` | Bubblewrap executor, one-shot egress-firewall init container, PVC, internal Service, and defense-in-depth NetworkPolicy. |
 | `configure-s3-lifecycle.sh` | Applies the broad S3 expiration policy used by claim-checks, artifacts, and attachments. |
 | `deploy.sh` | Build, push, apply manifests, set images, wait for rollout, refresh S3 lifecycle. |
 | `testing/` | Parallel testing stack manifests and testing deploy scripts. |
@@ -111,6 +120,15 @@ rm -f "$ENVFILE"
 
 ## Apply
 
+`deploy.sh` creates the private `agent-harness-workspace-executor-auth` Secret on
+first use. When applying manifests manually, create it first:
+
+```bash
+kubectl -n temporal-michaelj-agent-harness-demo create secret generic \
+  agent-harness-workspace-executor-auth \
+  --from-literal="token=$(openssl rand -hex 32)"
+```
+
 ```bash
 kubectl apply -f simple_chat_agent/deploy/
 ```
@@ -137,9 +155,9 @@ Use:
 The testing script:
 
 1. builds the current branch into a `testing-<timestamp>` image tag;
-2. deploys or updates the testing Python sandbox Lambda;
+2. creates the workspace-executor authentication secret when absent;
 3. applies the shared internal SearXNG manifest;
-4. applies testing-specific web/API/worker manifests;
+4. applies testing-specific web/API/worker/executor manifests;
 5. rolls out the testing Deployments;
 6. refreshes the S3 lifecycle policy.
 
@@ -188,6 +206,8 @@ to a local on-disk store (used for local dev).
 | Claim-check payloads and artifact bytes | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; chat delete purges known prefixes |
 | GitHub/MCP OAuth tokens | DynamoDB (`SIMPLE_CHAT_DYNAMODB_TABLE`, table `…-oauth`) | survives redeploys; SSE-encrypted; accessed via IRSA |
 | Ordered deployed stream events and cursors | Redis Streams + AOF on `emptyDir` | 30-minute idle TTL; survives API and Redis-container restarts, not Redis-pod replacement |
+| Production agent command workspaces | 5 Gi `ReadWriteOnce` PVC | stable per agent workflow; survives executor and worker Pod replacement |
+| `sa-demo` testing agent command workspaces | 5 Gi `emptyDir` | stable between tool calls; lost when the executor Pod is replaced |
 | Transient OAuth handshake state and local-dev stream/artifact files | local `emptyDir` | ephemeral; lost on restart |
 
 When the S3 / DynamoDB env vars are unset (local dev), the app falls back to
@@ -200,9 +220,9 @@ Google OAuth credentials are configured.
 
 Deployed workers append sideband events directly to Redis Streams. The API reads
 the same ordered log and serves authenticated browser SSE without changing the
-frontend contract. `/internal/stream` remains for the sandbox Lambda callback
-and for rolling compatibility with older workers; the API forwards those events
-to Redis. Stream keys expire 30 minutes after their last event by default.
+frontend contract. `/internal/stream` remains for rolling compatibility with
+older workers and the retired sandbox Lambda; the API forwards those events to
+Redis. Stream keys expire 30 minutes after their last event by default.
 
 ## Temporary Demo Workspaces
 

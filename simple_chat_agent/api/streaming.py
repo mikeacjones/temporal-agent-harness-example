@@ -117,6 +117,8 @@ class StreamBroker:
         entries = replay.pop("entries", [])
         return {
             **replay,
+            "entry_count": len(entries),
+            "has_more": len(entries) >= limit,
             "events": [
                 entry["data"] for entry in entries if entry["event"] == "stream"
             ],

@@ -9,6 +9,7 @@ export function StreamPanel({
   onToggle,
   embedded = false,
   inputText = "",
+  workflowId = "",
 }) {
   const timeline = useMemo(() => normalizeStreamTimeline(turn), [turn]);
   const agents = useMemo(() => streamAgents(timeline), [timeline]);
@@ -40,7 +41,12 @@ export function StreamPanel({
           <small>Open live runtime</small>
         </button>
       ) : (
-        <AgentRuntime timeline={timeline} agents={agents} inputText={inputText} />
+        <AgentRuntime
+          timeline={timeline}
+          agents={agents}
+          inputText={inputText}
+          workflowId={workflowId}
+        />
       )}
     </section>
   );
@@ -185,7 +191,12 @@ export function streamAgents(timeline) {
     }
   }
 
-  return [...agents.values()].map((agent) => {
+  return [...agents.values()]
+    .sort((left, right) => {
+      if (left.kind === right.kind) return 0;
+      return left.kind === "main" ? -1 : 1;
+    })
+    .map((agent) => {
     const agentSegments = agent.segments.filter((segment) => segment.type === "agent");
     const latestAgentSegment = agentSegments[agentSegments.length - 1] || null;
     const hasLiveSegment = agent.segments.some((segment) =>
@@ -217,16 +228,16 @@ export function streamAgents(timeline) {
       latestAction = eventSummary(latestEvent);
     }
 
-    return {
-      ...agent,
-      status,
-      latestAction,
-      turnCount: agentSegments.length,
-      toolCount: new Set(agent.events.map((event, index) =>
-        event.tool_call_id || event.payload?.tool_use_id || event.payload?.operation_id || `${event.kind}:${index}`,
-      )).size,
-    };
-  });
+      return {
+        ...agent,
+        status,
+        latestAction,
+        turnCount: agentSegments.length,
+        toolCount: new Set(agent.events.map((event, index) =>
+          event.tool_call_id || event.payload?.tool_use_id || event.payload?.operation_id || `${event.kind}:${index}`,
+        )).size,
+      };
+    });
 }
 
 function eventSummary(event) {

@@ -1449,14 +1449,16 @@ def _approval_summary(tool_name: str, tool_args: dict[str, Any]) -> str:
             if isinstance(title, str) and title:
                 return f"Open GitHub issue in {owner}/{repo}: {title}"
             return f"Open GitHub issue in {owner}/{repo}"
-    if tool_name == "python_sandbox":
-        code = tool_args.get("code")
-        if isinstance(code, str) and code.strip():
-            preview = " ".join(code.strip().split())
+    if tool_name in ("workspace_shell", "python_sandbox"):
+        command = tool_args.get("command")
+        if not isinstance(command, str):
+            command = tool_args.get("code")
+        if isinstance(command, str) and command.strip():
+            preview = " ".join(command.strip().split())
             if len(preview) > 96:
                 preview = f"{preview[:93]}..."
-            return f"Execute Python sandbox code: {preview}"
-        return "Execute Python sandbox code"
+            return f"Run workspace command: {preview}"
+        return "Run a command in the persistent workspace"
     if tool_name == "create_artifact":
         name = tool_args.get("name")
         if isinstance(name, str) and name.strip():

@@ -3,6 +3,41 @@ import test from "node:test";
 
 import { createServer } from "vite";
 
+test("the agent switcher always keeps the main agent first", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { streamAgents } = await server.ssrLoadModule("/src/components/StreamPanel.jsx");
+  const agents = streamAgents({
+    status: "tooling",
+    segments: [
+      {
+        id: "agent:child:1",
+        type: "agent",
+        agentId: "child",
+        parentAgentId: "main",
+        agentKind: "subagent",
+        agentLabel: "Research one topic",
+        sequence: 1,
+        status: "streaming",
+      },
+      {
+        id: "agent:main:2",
+        type: "agent",
+        agentId: "main",
+        agentKind: "main",
+        agentLabel: "Main agent",
+        sequence: 2,
+        status: "streaming",
+      },
+    ],
+  });
+
+  assert.deepEqual(agents.map((agent) => agent.id), ["main", "child"]);
+});
+
 test("the runtime projects requested, running, failed, recovered, and completed tools", async (t) => {
   const server = await createServer({
     server: { middlewareMode: true },
@@ -13,6 +48,7 @@ test("the runtime projects requested, running, failed, recovered, and completed 
     buildRuntimeFrames,
     projectRuntimeFrame,
     projectSubagentTools,
+    toolStatusLabel,
   } = await server.ssrLoadModule("/src/components/AgentRuntime.jsx");
 
   const agent = {
@@ -35,6 +71,23 @@ test("the runtime projects requested, running, failed, recovered, and completed 
         afterSequence: 1,
         status: "complete",
         events: [
+          {
+            kind: "agent_tool_input_start",
+            payload: {
+              tool_use_id: "tool-1",
+              tool_name: "file_search",
+              sequence: 1,
+            },
+          },
+          {
+            kind: "agent_tool_input_delta",
+            payload: {
+              tool_use_id: "tool-1",
+              tool_name: "file_search",
+              sequence: 1,
+              partial_json: '{"query":"Temporal',
+            },
+          },
           {
             kind: "agent_tool_input_complete",
             payload: {
@@ -127,7 +180,13 @@ test("the runtime projects requested, running, failed, recovered, and completed 
     return projectRuntimeFrame(timeline, agent, frames, index);
   }
 
+  assert.equal(atEvent("agent_tool_input_start").modelStatus, "active");
+  assert.equal(atEvent("agent_tool_input_delta").modelStatus, "active");
+  assert.equal(atEvent("agent_tool_input_complete").modelStatus, "dormant");
+  assert.equal(atEvent("agent_tool_input_start").tools[0].status, "building");
+  assert.equal(atEvent("agent_tool_input_delta").tools[0].status, "building");
   assert.equal(atEvent("agent_tool_input_complete").tools[0].status, "requested");
+  assert.equal(toolStatusLabel("building"), "Building input…");
   assert.equal(atEvent("harness_tool_start").tools[0].status, "running");
   const guardedTool = atEvent("harness_tool_guard_start").tools[0];
   assert.equal(guardedTool.id, "tool-1");
@@ -324,6 +383,152 @@ test("model streams transition from thinking to response and pin to newest conte
   scrollStreamToBottom(viewport);
 
   assert.equal(viewport.scrollTop, 280);
+});
+
+test("a large tool argument stream keeps the model active after its pre-guard", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { buildRuntimeFrames, projectRuntimeFrame } = await server.ssrLoadModule(
+    "/src/components/AgentRuntime.jsx",
+  );
+  const agent = {
+    id: "main",
+    kind: "main",
+    status: "running",
+    segments: [
+      {
+        id: "guards:main:2",
+        type: "tools",
+        agentId: "main",
+        agentKind: "main",
+        afterSequence: 2,
+        status: "complete",
+        events: [{
+          kind: "harness_llm_guard_complete",
+          payload: {
+            operation_id: "main:llm:2:guard:pre:0:policy",
+            guard_name: "policy",
+            timing: "pre",
+            status: "passed",
+          },
+        }],
+      },
+      {
+        id: "agent:main:2",
+        type: "agent",
+        agentId: "main",
+        agentKind: "main",
+        sequence: 2,
+        status: "streaming",
+        text: "I will build the report.",
+      },
+      {
+        id: "tools:main:2",
+        type: "tools",
+        agentId: "main",
+        agentKind: "main",
+        afterSequence: 2,
+        status: "streaming",
+        events: [{
+          kind: "agent_tool_input_delta",
+          payload: {
+            tool_use_id: "artifact-tool-1",
+            tool_name: "create_artifact",
+            sequence: 2,
+            input_partial: '{"name":"report.html","content":"<html>',
+          },
+        }],
+      },
+    ],
+  };
+  const timeline = { status: "tooling", activeSequence: 2 };
+  const frames = buildRuntimeFrames(timeline, agent);
+  const projected = projectRuntimeFrame(timeline, agent, frames, frames.length - 1);
+
+  assert.equal(frames.some((frame) => frame.kind === "tools-settled"), false);
+  assert.equal(projected.modelStatus, "active");
+  assert.deepEqual(
+    projected.tools.map((tool) => ({ name: tool.name, status: tool.status })),
+    [{ name: "create_artifact", status: "building" }],
+  );
+});
+
+test("tool outcomes retain failure reasons and prefer durable results", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { inspectedRuntimeCard, toolOutcomeForEvents } = await server.ssrLoadModule(
+    "/src/components/AgentRuntime.jsx",
+  );
+  const events = [
+    {
+      kind: "fetch_complete",
+      payload: {
+        status: 403,
+        error: "HTTP 403: Forbidden",
+        blocked_reason: "forbidden",
+      },
+    },
+    {
+      kind: "harness_tool_complete",
+      payload: {
+        status: "failed",
+        result_preview: '{"error":"HTTP 403: Forbidden","status":403}',
+        result_truncated: false,
+      },
+    },
+  ];
+  const outcome = toolOutcomeForEvents(events);
+  assert.deepEqual(outcome.error, {
+    type: "ToolError",
+    message: "HTTP 403: Forbidden",
+  });
+  assert.deepEqual(outcome.result, {
+    error: "HTTP 403: Forbidden",
+    status: 403,
+  });
+
+  const model = {
+    tools: [
+      {
+        id: "tool-1",
+        name: "fetch_url",
+        status: "failed",
+        preview: '{"url":"https://example.test"}',
+        detail: { latest_event: "harness_tool_complete" },
+        error: outcome.error,
+        resultPreview: outcome.result,
+        resultTruncated: false,
+        events,
+      },
+    ],
+  };
+  const inspected = inspectedRuntimeCard(
+    { type: "tool", id: "tool-1" },
+    model,
+    {
+      status: "loaded",
+      data: {
+        source: "temporal_history",
+        status: "failed",
+        error: "HTTP 403: Forbidden",
+        result: {
+          error: "HTTP 403: Forbidden",
+          blocked_reason: "forbidden",
+          status: 403,
+        },
+      },
+    },
+  );
+  assert.equal(inspected.resultSource, "temporal_history");
+  assert.equal(inspected.result.blocked_reason, "forbidden");
+  assert.equal(inspected.error.message, "HTTP 403: Forbidden");
+  assert.equal(inspected.rawEvents.length, 2);
 });
 
 test("LLM guards are bundled with the model and replay precedes its tools", async (t) => {

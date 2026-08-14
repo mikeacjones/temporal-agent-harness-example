@@ -44,6 +44,7 @@ from simple_chat_agent.api.thinking import (
     good_place_enabled,
     thinking_config_from_request,
 )
+from simple_chat_agent.api.tool_results import tool_result_from_history
 from simple_chat_agent.common.attachments import (
     AttachmentValidationError,
     artifact_is_user_attachment,
@@ -733,6 +734,37 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             limit=limit,
         )
 
+    @router.get(
+        "/api/sessions/{workflow_id}/agents/{agent_workflow_id}/"
+        "tools/{tool_call_id}/result"
+    )
+    async def tool_result(
+        workflow_id: str,
+        agent_workflow_id: str,
+        tool_call_id: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        await deps.require_conversation_owner(request, workflow_id)
+        if not _is_conversation_agent(workflow_id, agent_workflow_id):
+            raise HTTPException(status_code=404, detail="Agent execution not found")
+
+        try:
+            result = await tool_result_from_history(
+                deps.client(),
+                workflow_id=agent_workflow_id,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as err:
+            if deps.is_temporal_not_found(err):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent execution not found",
+                ) from err
+            raise
+        if result is None:
+            raise HTTPException(status_code=404, detail="Tool result not found")
+        return result
+
     @router.delete("/api/sessions/{workflow_id}")
     async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
         user = await deps.require_conversation_owner(request, workflow_id)
@@ -751,6 +783,13 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         return {"status": "ok"}
 
     return router
+
+
+def _is_conversation_agent(workflow_id: str, agent_workflow_id: str) -> bool:
+    return (
+        agent_workflow_id == workflow_id
+        or agent_workflow_id.startswith(f"{workflow_id}-subagent-")
+    )
 
 
 def _attachment_refs_for_request(

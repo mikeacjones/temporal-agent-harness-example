@@ -1889,6 +1889,13 @@ main {
     animation: runtime-card-enter 360ms cubic-bezier(.16,.8,.24,1) both;
     transition: border-color 280ms ease, background 280ms ease, box-shadow 280ms ease;
 }
+.runtime-tool-card.building {
+    border-color: #79b4f8;
+    background: linear-gradient(145deg, rgba(38, 57, 78, 0.94), rgba(28, 39, 54, 0.98));
+    color: #91c4ff;
+    box-shadow: 0 0 24px rgba(92, 157, 236, 0.2), inset 0 0 18px rgba(121, 180, 248, 0.05);
+    animation: runtime-card-enter 360ms cubic-bezier(.16,.8,.24,1) both, runtime-tool-running 1.8s ease-in-out infinite;
+}
 .runtime-tool-card.running {
     border-color: #e7c653;
     background: linear-gradient(145deg, rgba(70, 64, 34, 0.9), rgba(47, 44, 28, 0.96));
@@ -2163,6 +2170,9 @@ main {
     display: grid;
     gap: 4px;
 }
+.runtime-inspector .runtime-inspector-body {
+    gap: 9px;
+}
 .runtime-inspector span {
     color: #7796c3;
     font-size: 0.56rem;
@@ -2195,6 +2205,54 @@ main {
     line-height: 1.45;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+.runtime-inspector-outcome {
+    min-width: 0;
+    display: grid;
+    gap: 5px;
+    padding: 9px 10px;
+    border: 1px solid rgba(119, 140, 171, 0.2);
+    border-radius: 7px;
+    background: rgba(5, 8, 12, 0.48);
+}
+.runtime-inspector-outcome.failed {
+    border-color: rgba(255, 111, 111, 0.45);
+    background: rgba(72, 24, 28, 0.32);
+}
+.runtime-inspector-outcome.failed span,
+.runtime-inspector-outcome.failed strong {
+    color: #ff9898;
+}
+.runtime-inspector-outcome.result {
+    border-color: rgba(91, 205, 215, 0.35);
+}
+.runtime-inspector-outcome.result > span {
+    color: #6ed4dc;
+}
+.runtime-inspector-outcome.result > pre {
+    max-height: 280px;
+}
+.runtime-inspector-notice {
+    padding: 7px 9px;
+    border-left: 2px solid rgba(123, 174, 245, 0.6);
+    background: rgba(35, 49, 70, 0.45);
+}
+.runtime-inspector-notice.error {
+    border-left-color: #ff7c7c;
+    color: #e8a0a0;
+}
+.runtime-inspector-raw {
+    min-width: 0;
+}
+.runtime-inspector-raw summary {
+    cursor: pointer;
+    color: #8193ab;
+    font-size: 0.58rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.runtime-inspector-raw[open] summary {
+    margin-bottom: 6px;
 }
 .runtime-inspector > button {
     padding: 0 9px;

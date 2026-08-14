@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   handleStreamEventInState,
+  restoreActiveStreamTurnInState,
   streamEventNeedsSettledTranscriptDelta,
   streamEventNeedsWorkflowStateRefresh,
 } from "./chatState.js";
@@ -138,6 +139,54 @@ test("concurrent subagents with colliding turn numbers retain separate traces", 
       segment.type === "agent" && segment.agentKind === "main" && segment.sequence === 2,
   );
   assert.equal(resumedMain.text, "Synthesizing delegated findings");
+});
+
+test("refresh replay restores the main agent and every in-flight subagent", () => {
+  const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
+  const children = ["sharks", "policy", "habitats"].map((topic) => ({
+    id: `chat-1-subagent-${topic}`,
+    parent_id: "chat-1",
+    kind: "subagent",
+    label: `Research ${topic}`,
+  }));
+  const events = [
+    event(AgentStart, main, { sequence: 1, provider: "claude" }),
+    event(AgentComplete, main, {
+      sequence: 1,
+      provider: "claude",
+      stop_reason: "tool_use",
+      text: "I will delegate this research.",
+    }),
+    ...children.map((child, index) =>
+      event("agent_tool_input_complete", main, {
+        sequence: 1,
+        tool_use_id: `create-subagent-${index}`,
+        tool_name: "create_subagent",
+        input: { task: child.label },
+      }),
+    ),
+    ...children.map((child) =>
+      event(AgentStart, child, { sequence: 1, provider: "claude" }),
+    ),
+  ];
+
+  const state = restoreActiveStreamTurnInState(initialState(), events);
+  const agentSegments = state.streamTurn.segments.filter(
+    (segment) => segment.type === "agent",
+  );
+
+  assert.equal(state.streamTurn.status, "tooling");
+  assert.equal(state.currentAgentSequence, 1);
+  assert.equal(
+    agentSegments.find((segment) => segment.agentKind === "main").agentId,
+    main.id,
+  );
+  assert.deepEqual(
+    agentSegments
+      .filter((segment) => segment.agentKind === "subagent")
+      .map((segment) => segment.agentId),
+    children.map((child) => child.id),
+  );
 });
 
 test("only main-agent completions trigger workflow reconciliation boundaries", () => {
@@ -290,6 +339,57 @@ test("post-LLM guard lifecycle stays attached after provider completion", () => 
       .some((streamEvent) => streamEvent.kind === "harness_llm_guard_complete"),
     true,
   );
+});
+
+test("streamed tool input starts a new segment after pre-LLM guards close", () => {
+  const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
+  let state = initialState();
+  state = handleStreamEventInState(
+    state,
+    event("harness_llm_guard_complete", main, {
+      operation_id: "chat-1:llm:2:guard:pre:0:good_place",
+      guard_name: "good_place",
+      timing: "pre",
+      llm_sequence: 2,
+      status: "passed",
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentStart, main, { sequence: 2, provider: "claude" }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentTextDelta, main, {
+      sequence: 2,
+      text: "I will build the report.",
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event("agent_tool_input_start", main, {
+      sequence: 2,
+      tool_use_id: "artifact-tool-1",
+      tool_name: "create_artifact",
+    }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event("agent_tool_input_delta", main, {
+      sequence: 2,
+      tool_use_id: "artifact-tool-1",
+      tool_name: "create_artifact",
+      partial_json: '{"name":"report.html","content":"<html>',
+    }),
+  );
+
+  const toolSegments = state.streamTurn.segments.filter(
+    (segment) => segment.type === "tools" && segment.afterSequence === 2,
+  );
+  assert.equal(toolSegments.length, 2);
+  assert.equal(toolSegments[0].status, "complete");
+  assert.equal(toolSegments[1].status, "streaming");
+  assert.equal(toolSegments[1].events[0].kind, "agent_tool_input_delta");
 });
 
 const AgentStart = "agent_start";

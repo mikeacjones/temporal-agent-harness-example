@@ -46,6 +46,7 @@ ToolParam = dict
 ToolArgsMode = Literal["signature", "raw"]
 RUN_TOOL_ACTIVITY_NAME = "agent_harness.run_tool_activity"
 _TOOL_METADATA_ATTR = "__agent_harness_tool__"
+_STREAM_RESULT_PREVIEW_CHARS = 8_000
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,39 @@ class ToolDef:
     pre_guards: list[GuardDef]
     post_guards: list[GuardDef]
     args_mode: ToolArgsMode = "signature"
+
+
+def _stream_tool_result_payload(result: ToolResult) -> dict[str, Any]:
+    """Return a bounded result envelope suitable for Redis/SSE fan-out."""
+
+    serialized = json.dumps(
+        result.payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    payload: dict[str, Any] = {
+        "result_preview": serialized[:_STREAM_RESULT_PREVIEW_CHARS],
+        "result_size": len(serialized),
+        "result_truncated": len(serialized) > _STREAM_RESULT_PREVIEW_CHARS,
+    }
+    if not result.error:
+        return payload
+
+    error = result.payload.get("error")
+    if isinstance(error, dict):
+        payload["error"] = dict(error)
+    elif error is not None:
+        payload["error"] = {
+            "type": "ToolResultError",
+            "message": str(error),
+        }
+    else:
+        payload["error"] = {
+            "type": "ToolResultError",
+            "message": str(result.payload.get("message") or "Tool returned an error."),
+        }
+    return payload
 
 
 class ToolSet:
@@ -415,6 +449,10 @@ class ToolSet:
             activity_options=resolved_activity_options,
         )
         if pre_guard_failure is not None:
+            blocked_result = ToolResult(
+                payload=pre_guard_failure.payload,
+                error=True,
+            )
             await emit_harness_event(
                 stream_id=stream_id,
                 kind="harness_tool_complete",
@@ -425,12 +463,13 @@ class ToolSet:
                     "tool_type": tool.tool_type,
                     "llm_sequence": llm_sequence,
                     "status": "blocked",
+                    **_stream_tool_result_payload(blocked_result),
                 },
                 agent=stream_agent,
                 tool_name=name,
                 tool_call_id=tool_call_id,
             )
-            return ToolResult(payload=pre_guard_failure.payload, error=True)
+            return blocked_result
 
         ctx = ToolContext(
             tool_name=name,
@@ -487,6 +526,10 @@ class ToolSet:
             activity_options=resolved_activity_options,
         )
         if post_guard_failure is not None:
+            blocked_result = ToolResult(
+                payload=post_guard_failure.payload,
+                error=True,
+            )
             await emit_harness_event(
                 stream_id=stream_id,
                 kind="harness_tool_complete",
@@ -497,12 +540,13 @@ class ToolSet:
                     "tool_type": tool.tool_type,
                     "llm_sequence": llm_sequence,
                     "status": "blocked",
+                    **_stream_tool_result_payload(blocked_result),
                 },
                 agent=stream_agent,
                 tool_name=name,
                 tool_call_id=tool_call_id,
             )
-            return ToolResult(payload=post_guard_failure.payload, error=True)
+            return blocked_result
 
         await emit_harness_event(
             stream_id=stream_id,
@@ -514,6 +558,7 @@ class ToolSet:
                 "tool_type": tool.tool_type,
                 "llm_sequence": llm_sequence,
                 "status": "failed" if tool_result.error else "complete",
+                **_stream_tool_result_payload(tool_result),
             },
             agent=stream_agent,
             tool_name=name,

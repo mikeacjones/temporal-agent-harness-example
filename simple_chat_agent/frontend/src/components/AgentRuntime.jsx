@@ -11,7 +11,12 @@ import {
   AgentStreamEventKind,
 } from "../state/streamEvents.js";
 
-export function AgentRuntime({ timeline, agents, inputText = "" }) {
+export function AgentRuntime({
+  timeline,
+  agents,
+  inputText = "",
+  workflowId = "",
+}) {
   const mainAgent = agents.find((agent) => agent.kind === "main") || agents[0] || null;
   const [activeAgentId, setActiveAgentId] = useState(mainAgent?.id || null);
   const activeAgent =
@@ -24,6 +29,8 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
   const [following, setFollowing] = useState(true);
   const [playing, setPlaying] = useState(false);
   const [selectedCard, setSelectedCard] = useState(null);
+  const [toolResultRequests, setToolResultRequests] = useState({});
+  const toolResultPendingRef = useRef(new Set());
   const toolGridRef = useRef(null);
   const modelStreamRef = useRef(null);
   const modelStreamContentRef = useRef(null);
@@ -40,6 +47,18 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
   );
   const modelStream = modelStreamForProjection(model);
   const showModelStream = Boolean(modelStream.text);
+  const selectedTool = selectedCard?.type === "tool"
+    ? model.tools.find((tool) => tool.id === selectedCard.id) || null
+    : null;
+  const resultWorkflowId = activeAgent?.kind === "subagent"
+    ? activeAgent.id
+    : workflowId;
+  const selectedResultKey = selectedTool && resultWorkflowId
+    ? `${resultWorkflowId}:${selectedTool.id}`
+    : null;
+  const selectedToolResult = selectedResultKey
+    ? toolResultRequests[selectedResultKey] || null
+    : null;
   const layoutVersion = model.tools
     .map((tool) => `${tool.id}:${tool.status}:${guardVersion(tool.guards)}`)
     .join("|");
@@ -69,6 +88,57 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
   );
 
   useEffect(() => {
+    if (!selectedTool || !selectedResultKey || !workflowId) return undefined;
+    if (!["done", "failed"].includes(selectedTool.status)) return undefined;
+    if (toolResultRequests[selectedResultKey] || toolResultPendingRef.current.has(selectedResultKey)) {
+      return undefined;
+    }
+
+    toolResultPendingRef.current.add(selectedResultKey);
+    setToolResultRequests((current) => ({
+      ...current,
+      [selectedResultKey]: { status: "loading" },
+    }));
+    const url =
+      `/api/sessions/${encodeURIComponent(workflowId)}` +
+      `/agents/${encodeURIComponent(resultWorkflowId)}` +
+      `/tools/${encodeURIComponent(selectedTool.id)}/result`;
+    fetch(url, {
+      headers: { "Cache-Control": "no-cache" },
+    })
+      .then(async (response) => {
+        if (response.status === 404) return { status: "missing" };
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || `Tool result request failed (${response.status})`);
+        }
+        return { status: "loaded", data: await response.json() };
+      })
+      .then((result) => {
+        setToolResultRequests((current) => ({
+          ...current,
+          [selectedResultKey]: result,
+        }));
+      })
+      .catch((error) => {
+        setToolResultRequests((current) => ({
+          ...current,
+          [selectedResultKey]: { status: "error", error: error.message },
+        }));
+      })
+      .finally(() => {
+        toolResultPendingRef.current.delete(selectedResultKey);
+      });
+
+    return undefined;
+  }, [
+    resultWorkflowId,
+    selectedResultKey,
+    selectedTool?.status,
+    workflowId,
+  ]);
+
+  useEffect(() => {
     if (!playing) return undefined;
     if (visibleCursor >= finalFrame) {
       setPlaying(false);
@@ -84,7 +154,11 @@ export function AgentRuntime({ timeline, agents, inputText = "" }) {
     return <div className="runtime-empty">Waiting for agent activity…</div>;
   }
 
-  const inspected = inspectedRuntimeCard(selectedCard, model);
+  const inspected = inspectedRuntimeCard(
+    selectedCard,
+    model,
+    selectedToolResult,
+  );
   const isLive = !["complete", "interrupted"].includes(timeline.status);
   const showIngress = activeAgent.kind === "main" && visibleCursor <= 1;
 
@@ -336,20 +410,66 @@ export function scrollStreamToBottom(viewport) {
 }
 
 function RuntimeInspector({ card, onClose }) {
-  const detail = card.detail && typeof card.detail === "object"
-    ? JSON.stringify(card.detail, null, 2)
-    : String(card.detail || "No additional details were retained for this event.");
+  const detail = displayValue(card.detail || {});
+  const rawEvents = card.rawEvents || [];
+  const rawDetail = displayValue(rawEvents.length ? rawEvents : card.detail || {});
+  const result = card.result === undefined || card.result === null
+    ? null
+    : displayValue(card.result);
   return (
     <aside className={`runtime-inspector ${card.status || "waiting"}`}>
-      <div>
+      <div className="runtime-inspector-summary">
         <span>{card.kind}</span>
         <strong>{card.label}</strong>
         {card.summary ? <p>{card.summary}</p> : null}
       </div>
-      <pre>{detail.length > 12_000 ? `${detail.slice(0, 12_000)}\n…` : detail}</pre>
+      <div className="runtime-inspector-body">
+        {card.error ? (
+          <section className="runtime-inspector-outcome failed">
+            <span>Failure</span>
+            <strong>{card.error.type || "Tool error"}</strong>
+            <p>{card.error.message || displayValue(card.error)}</p>
+          </section>
+        ) : null}
+        {card.resultRequestStatus === "loading" ? (
+          <p className="runtime-inspector-notice">Loading the durable result from Temporal history…</p>
+        ) : null}
+        {card.resultRequestStatus === "error" ? (
+          <p className="runtime-inspector-notice error">
+            Could not load the durable result: {card.resultRequestError}
+          </p>
+        ) : null}
+        {card.resultRequestStatus === "missing" && result === null ? (
+          <p className="runtime-inspector-notice">No durable result was found for this tool call.</p>
+        ) : null}
+        {result !== null ? (
+          <section className="runtime-inspector-outcome result">
+            <span>Result {card.resultSource ? `· ${card.resultSource}` : ""}</span>
+            <pre>{result}</pre>
+            {card.resultTruncated ? (
+              <p>Stream preview truncated; loading the durable result provides the complete output.</p>
+            ) : null}
+          </section>
+        ) : !card.error && card.kind !== "Tool" ? (
+          <pre>{detail}</pre>
+        ) : null}
+        <details className="runtime-inspector-raw">
+          <summary>{rawEvents.length ? `Raw events (${rawEvents.length})` : "Raw details"}</summary>
+          <pre>{rawDetail}</pre>
+        </details>
+      </div>
       <button type="button" onClick={onClose}>Close details</button>
     </aside>
   );
+}
+
+function displayValue(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 export function buildRuntimeFrames(_timeline, agent) {
@@ -480,7 +600,9 @@ function isSemanticToolEvent(event) {
   if (kind.endsWith("_activity_start") && Number(event.payload?.activity_attempt || 1) > 1) {
     return true;
   }
-  if (kind.startsWith("artifact_create") || kind.startsWith("python_sandbox_")) return true;
+  if (kind.startsWith("artifact_create") ||
+      kind.startsWith("python_sandbox_") ||
+      kind.startsWith("workspace_shell_")) return true;
   return false;
 }
 
@@ -538,8 +660,11 @@ export function projectRuntimeFrame(timeline, agent, frames, cursor) {
         const update = runtimeToolUpdate(event, frame.ordinal, tools);
         if (update) tools.set(update.id, update);
       }
-      modelStatus = "dormant";
-      modelBaseStatus = "dormant";
+      const modelIsStreamingToolInput =
+        frame.event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_START ||
+        frame.event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA;
+      modelStatus = modelIsStreamingToolInput ? "active" : "dormant";
+      modelBaseStatus = modelStatus;
       continue;
     }
     if (frame.kind === "tools-settled") {
@@ -622,6 +747,7 @@ function runtimeToolUpdate(event, ordinal, tools) {
   const isToolDetail = isToolActivity;
   const isArtifact = kind.startsWith("artifact_create");
   const isPython = kind.startsWith("python_sandbox_");
+  const isWorkspaceShell = kind.startsWith("workspace_shell_");
   if (isToolGuard) return runtimeToolGuardUpdate(event, ordinal, tools);
   const rawId =
     payload.tool_use_id ||
@@ -632,14 +758,20 @@ function runtimeToolUpdate(event, ordinal, tools) {
   const id = String(rawId);
   const existing = tools.get(id);
   if (isToolActivity && !existing && !payload.tool_name) return null;
-  if (!isInput && !isToolLifecycle && !isToolDetail && !isArtifact && !isPython && !event.tool_name && !payload.tool_name) {
+  if (!isInput && !isToolLifecycle && !isToolDetail && !isArtifact && !isPython && !isWorkspaceShell && !event.tool_name && !payload.tool_name) {
     return null;
   }
   const name = String(
     payload.tool_name ||
       event.tool_name ||
       existing?.name ||
-      (isArtifact ? "create_artifact" : isPython ? "python_sandbox" : "tool"),
+      (isArtifact
+        ? "create_artifact"
+        : isWorkspaceShell
+          ? "workspace_shell"
+          : isPython
+            ? "python_sandbox"
+            : "tool"),
   );
   const nextStatus = toolStatusForEvent(kind, payload, existing?.status);
   const input = payload.input ?? payload.input_partial ?? payload.input_preview;
@@ -648,6 +780,7 @@ function runtimeToolUpdate(event, ordinal, tools) {
     : compactValue(input);
   const events = [...(existing?.events || []), event];
   const guards = existing?.guards || [];
+  const outcome = toolOutcomeForEvents(events);
   return {
     id,
     name,
@@ -657,6 +790,9 @@ function runtimeToolUpdate(event, ordinal, tools) {
     preview,
     events,
     guards,
+    error: outcome.error,
+    resultPreview: outcome.result,
+    resultTruncated: outcome.truncated,
     detail: {
       tool_call_id: id,
       tool_name: name,
@@ -667,6 +803,42 @@ function runtimeToolUpdate(event, ordinal, tools) {
       event_count: events.length,
     },
   };
+}
+
+export function toolOutcomeForEvents(events) {
+  let error = null;
+  let result = null;
+  let truncated = false;
+
+  for (let index = (events || []).length - 1; index >= 0; index -= 1) {
+    const payload = events[index]?.payload || {};
+    if (error === null && payload.error !== undefined && payload.error !== null) {
+      error = normalizedToolError(payload.error);
+    }
+    if (result === null && typeof payload.result_preview === "string") {
+      result = parseResultPreview(payload.result_preview);
+      truncated = Boolean(payload.result_truncated);
+    }
+  }
+  return { error, result, truncated };
+}
+
+function normalizedToolError(error) {
+  if (error && typeof error === "object") {
+    return {
+      type: String(error.type || "ToolError"),
+      message: String(error.message || JSON.stringify(error)),
+    };
+  }
+  return { type: "ToolError", message: String(error) };
+}
+
+function parseResultPreview(preview) {
+  try {
+    return JSON.parse(preview);
+  } catch {
+    return preview;
+  }
 }
 
 function runtimeToolGuardUpdate(event, ordinal, tools) {
@@ -763,14 +935,14 @@ function guardStatusForEvent(kind, payload, fallback = "running") {
 
 function toolStatusForEvent(kind, payload, previous = "requested") {
   if (kind === AgentStreamEventKind.AGENT_TOOL_INPUT_START ||
-      kind === AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA ||
-      kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) return "requested";
+      kind === AgentStreamEventKind.AGENT_TOOL_INPUT_DELTA) return "building";
+  if (kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) return "requested";
   if (kind === "harness_tool_start" || kind.endsWith("_activity_start")) return "running";
   if (kind === "harness_tool_complete") return normalizeToolStatus(payload.status, "done");
   if (kind === "artifact_create_complete") return "done";
   if (kind.endsWith("_failed") || kind.endsWith("_rejected")) return "failed";
   if (kind.endsWith("_activity_complete")) return "running";
-  if (kind.startsWith("python_sandbox_")) return "running";
+  if (kind.startsWith("python_sandbox_") || kind.startsWith("workspace_shell_")) return "running";
   return previous || "requested";
 }
 
@@ -819,7 +991,7 @@ export function modelStreamForProjection(model) {
   return { kind: "idle", label: "Model stream", text: "" };
 }
 
-function inspectedRuntimeCard(selected, model) {
+export function inspectedRuntimeCard(selected, model, resultRequest = null) {
   if (!selected) return null;
   if (selected.type === "ingress") {
     return { kind: "Ingress", label: "Message received", status: "received", detail: {} };
@@ -839,12 +1011,26 @@ function inspectedRuntimeCard(selected, model) {
   }
   const tool = model.tools.find((candidate) => candidate.id === selected.id);
   if (!tool) return null;
+  const durable = resultRequest?.status === "loaded" ? resultRequest.data : null;
+  const durableResult = durable?.result;
+  const durableError = durable?.error || (
+    durableResult && typeof durableResult === "object" && !Array.isArray(durableResult)
+      ? durableResult.error
+      : null
+  );
   return {
     kind: "Tool",
     label: tool.name,
     status: tool.status,
     summary: tool.preview,
     detail: tool.detail,
+    error: durableError ? normalizedToolError(durableError) : tool.error,
+    result: durableResult === undefined ? tool.resultPreview : durableResult,
+    resultTruncated: durableResult === undefined && tool.resultTruncated,
+    resultRequestStatus: resultRequest?.status || null,
+    resultRequestError: resultRequest?.error || null,
+    resultSource: durable?.source || (tool.resultPreview !== null ? "stream preview" : null),
+    rawEvents: tool.events || [],
   };
 }
 
@@ -901,8 +1087,15 @@ function modelStatusLabel(status) {
   return ({ dormant: "Dormant", active: "Responding", thinking: "Thinking", guarding: "Guarding", complete: "Complete", failed: "Stopped" })[status] || "Dormant";
 }
 
-function toolStatusLabel(status) {
-  return ({ requested: "Requested", running: "Running", waiting: "Waiting", done: "Done", failed: "Failed" })[status] || "Requested";
+export function toolStatusLabel(status) {
+  return ({
+    building: "Building input…",
+    requested: "Requested",
+    running: "Running",
+    waiting: "Waiting",
+    done: "Done",
+    failed: "Failed",
+  })[status] || "Requested";
 }
 
 function guardStatusLabel(status) {

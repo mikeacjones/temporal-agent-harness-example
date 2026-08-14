@@ -72,6 +72,25 @@ class RedisReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         store.clear.assert_awaited_once_with("chat-cleanup")
 
+    async def test_replay_reports_when_another_page_may_exist(self) -> None:
+        store = AsyncMock(spec=RedisStreamStore)
+        store.replay_entries.return_value = {
+            "entries": [
+                {"id": "1-0", "event": "stream", "data": {"kind": "agent_start"}},
+                {"id": "2-0", "event": "turn_settled", "data": {"result": {}}},
+            ],
+            "cursor": "2-0",
+            "replay_available": True,
+            "reason": "",
+        }
+        broker = StreamBroker(store)
+
+        replay = await broker.replay("chat-paged", limit=2)
+
+        self.assertTrue(replay["has_more"])
+        self.assertEqual(replay["entry_count"], 2)
+        self.assertEqual(replay["events"], [{"kind": "agent_start"}])
+
     async def test_compatibility_append_uses_stable_idempotency_key(self) -> None:
         store = AsyncMock(spec=RedisStreamStore)
         store.append_event.return_value = "1-0"

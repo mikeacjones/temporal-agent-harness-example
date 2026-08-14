@@ -69,7 +69,7 @@ GeminiStopReason = str
 GeminiThinkingLevel = Literal["minimal", "low", "medium", "high"]
 
 DEFAULT_GEMINI_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=20),
     heartbeat_timeout=timedelta(seconds=10),
 )
 GEMINI_HEARTBEAT_INTERVAL_SECONDS = 5

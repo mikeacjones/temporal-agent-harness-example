@@ -1,31 +1,81 @@
 from __future__ import annotations
 
 import unittest
+import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.common import (
     SearchAttributeKey,
     SearchAttributePair,
     TypedSearchAttributes,
 )
-from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
 
-from agent_harness.providers.claude import ClaudeThinkingConfig
+from agent_harness.providers.claude import (
+    ClaudeRequest,
+    ClaudeResponse,
+    ClaudeThinkingConfig,
+)
 from agent_harness.tools import ToolSet
 from simple_chat_agent.worker.tools.subagent import (
     CREATE_SUBAGENT_TOOL,
     SubagentProvider,
+    SubagentRequest,
     SubagentResponse,
     SubagentWorkflow,
 )
+from simple_chat_agent.worker.workflow_runner import agent_harness_workflow_runner
+
+
+@activity.defn(name="call_agent_api")
+async def complete_subagent_call(_request: ClaudeRequest) -> ClaudeResponse:
+    return ClaudeResponse(
+        id="test-response",
+        model="claude-sonnet-4-5",
+        message={
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Research complete."}],
+        },
+        stop_reason="end_turn",
+        stop_sequence=None,
+        usage={},
+    )
 
 
 class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
     async def test_subagent_workflow_is_valid_in_the_temporal_sandbox(self) -> None:
-        SandboxedWorkflowRunner().prepare_workflow(
+        agent_harness_workflow_runner().prepare_workflow(
             workflow._Definition.must_from_class(SubagentWorkflow)
         )
+
+    async def test_subagent_builds_workspace_tools_in_the_temporal_sandbox(
+        self,
+    ) -> None:
+        task_queue = f"subagent-sandbox-{uuid.uuid4()}"
+        async with await WorkflowEnvironment.start_local() as env, Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[SubagentWorkflow],
+            activities=[complete_subagent_call],
+            workflow_runner=agent_harness_workflow_runner(),
+        ):
+            result = await env.client.execute_workflow(
+                SubagentWorkflow.run,
+                SubagentRequest(
+                    system_prompt="Complete the test task.",
+                    task="Verify tool registration.",
+                    model="claude-sonnet-4-5",
+                    tool_names=["workspace_shell", "python_sandbox"],
+                ),
+                id=f"subagent-sandbox-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+
+        self.assertEqual(result.text, "Research complete.")
+        self.assertIn("workspace_shell", result.tool_names)
+        self.assertIn("python_sandbox", result.tool_names)
 
     async def test_child_workflow_inherits_parent_search_attributes(self) -> None:
         user_email = SearchAttributeKey.for_keyword("UserEmail")

@@ -212,6 +212,29 @@ export function mergeReplayedTurnTracesInState(previous, events) {
   };
 }
 
+export function restoreActiveStreamTurnInState(previous, events) {
+  if (!Array.isArray(events) || !events.length) return previous;
+  const { replayState, pendingTerminalCompletion } = replayStreamTurns(
+    events,
+    previous.workflowState,
+  );
+  const streamTurn = replayState.streamTurn;
+  if (
+    !streamTurn ||
+    pendingTerminalCompletion ||
+    !isOpenStreamTurn(streamTurn) ||
+    !(streamTurn.segments || []).length
+  ) {
+    return previous;
+  }
+  return {
+    ...previous,
+    streamTurn: trimTraceTurn(cloneStreamTurn(streamTurn)),
+    currentAgentSequence: replayState.currentAgentSequence,
+    ignoreAgentUntilStart: replayState.ignoreAgentUntilStart,
+  };
+}
+
 export function prependTranscriptPageInState(previous, page) {
   if (!previous.workflowState) return previous;
   return {
@@ -836,7 +859,7 @@ function ensureToolSegment(turn, agent, sequence) {
   registerStreamSequence(turn, normalizedSequence);
   registerAgentSequence(turn, agent, normalizedSequence);
   const existing = latestToolSegmentForSequence(turn, agent.id, normalizedSequence);
-  if (existing) return existing;
+  if (existing && existing.status !== "complete") return existing;
 
   const segment = {
     id: `tools:${agent.id}:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
@@ -930,15 +953,19 @@ function mergeStreamToolEvent(events, event) {
 }
 
 function isPythonSandboxOutputEvent(event) {
-  return event.kind === "python_sandbox_stdout" || event.kind === "python_sandbox_stderr";
+  return event.kind === "python_sandbox_stdout" ||
+    event.kind === "python_sandbox_stderr" ||
+    event.kind === "workspace_shell_stdout" ||
+    event.kind === "workspace_shell_stderr";
 }
 
 function isPythonSandboxProgressEvent(event) {
-  return event.kind === "python_sandbox_progress";
+  return event.kind === "python_sandbox_progress" || event.kind === "workspace_shell_progress";
 }
 
 function isPythonSandboxEvent(event) {
-  return event.kind?.startsWith("python_sandbox_");
+  return event.kind?.startsWith("python_sandbox_") ||
+    event.kind?.startsWith("workspace_shell_");
 }
 
 function mergePythonSandboxOutputEvent(events, event) {
@@ -1080,6 +1107,26 @@ function turnTracesFromStreamEvents(events, workflowState) {
     return {};
   }
 
+  const { completedTurns } = replayStreamTurns(events, workflowState);
+
+  const traces = {};
+  const start = Math.max(0, completedTurns.length - assistantIndexes.length);
+  const visibleTurns = completedTurns.slice(start);
+  visibleTurns.forEach((turn, index) => {
+    const transcriptIndex = assistantIndexes[index];
+    if (transcriptIndex === undefined || !turn) return;
+    traces[transcriptIndex] = {
+      status: "ready",
+      source: "replay",
+      transcriptIndex,
+      capturedAt: new Date().toISOString(),
+      turn,
+    };
+  });
+  return traces;
+}
+
+function replayStreamTurns(events, workflowState) {
   let replayState = {
     workflowState: workflowState || {
       transcript: [],
@@ -1102,6 +1149,7 @@ function turnTracesFromStreamEvents(events, workflowState) {
   let pendingTerminalCompletion = false;
 
   for (const event of events) {
+    if (isWorkflowProjectionEvent(event)) continue;
     if (
       pendingTerminalCompletion &&
       event.kind === AgentStreamEventKind.AGENT_START &&
@@ -1144,22 +1192,16 @@ function turnTracesFromStreamEvents(events, workflowState) {
   if (pendingTerminalCompletion && replayState.streamTurn) {
     completedTurns.push(trimTraceTurn(cloneStreamTurn(replayState.streamTurn)));
   }
+  return { replayState, completedTurns, pendingTerminalCompletion };
+}
 
-  const traces = {};
-  const start = Math.max(0, completedTurns.length - assistantIndexes.length);
-  const visibleTurns = completedTurns.slice(start);
-  visibleTurns.forEach((turn, index) => {
-    const transcriptIndex = assistantIndexes[index];
-    if (transcriptIndex === undefined || !turn) return;
-    traces[transcriptIndex] = {
-      status: "ready",
-      source: "replay",
-      transcriptIndex,
-      capturedAt: new Date().toISOString(),
-      turn,
-    };
-  });
-  return traces;
+function isWorkflowProjectionEvent(event) {
+  return (
+    event.kind === "workflow_state" ||
+    event.kind === "workflow_transcript" ||
+    event.kind === "workflow_transcript_page" ||
+    event.kind === "artifact_create_complete"
+  );
 }
 
 function trimTraceTurn(turn) {

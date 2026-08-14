@@ -41,7 +41,7 @@ a `ClaudeAgent` for chat workflows.
 | `demo_workspace_workflow.py` | Per-user demo workspace controller workflow. |
 | `demo_workspace_activities.py` | Kubernetes provisioning/crash/delete activities for temp workspaces. |
 | `tools/` | Application tool providers and tool activities. |
-| `sandbox/` | Python sandbox runtime and Lambda handler. |
+| `sandbox/` | Credential-free Bubblewrap executor plus legacy Python sandbox compatibility. |
 
 ## Registered Workflows
 
@@ -126,7 +126,7 @@ The worker registers three broad activity categories:
 - generic routers: `agent_harness.run_tool_activity` and
   `agent_harness.run_guard_activity`;
 - application activities: turn-settlement, demo workspace Kubernetes actions,
-  sandbox Lambda invocation, artifact writes, GitHub calls, research calls, and
+  persistent workspace commands, artifact writes, GitHub calls, research calls, and
   other tool side effects.
 
 Workflow code should schedule activities with explicit timeouts. Long-running
@@ -177,9 +177,10 @@ results after pod restarts.
 
 Provider and tool activities emit sideband stream events through a configured
 stream sink. In Kubernetes, workers append directly to Redis Streams while the
-API exposes that ordered log through authenticated SSE. The sandbox Lambda still
-posts through the API's `/internal/stream` endpoint because it receives only a
-narrow HTTPS callback and token. Local dev can use JSONL stream files.
+API exposes that ordered log through authenticated SSE. Workspace executor output
+returns over its authenticated internal response stream; the worker publishes it
+to Redis without giving the sandbox Redis credentials. Local dev can use JSONL
+stream files.
 
 Most stream events are best-effort UX. The exception is turn settlement:
 `SimpleChatWorkflow` commits transcript state, then schedules

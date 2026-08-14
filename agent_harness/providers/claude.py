@@ -74,7 +74,7 @@ ClaudeThinkingMode = Literal["enabled", "adaptive"]
 ClaudeThinkingEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=20),
     heartbeat_timeout=timedelta(seconds=10),
 )
 CLAUDE_HEARTBEAT_INTERVAL_SECONDS = 5

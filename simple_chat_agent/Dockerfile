@@ -33,6 +33,30 @@ WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
+# The credential-free workspace executor runs Bubblewrap from this same image.
+# Keep the runtime intentionally small, but include the command-line tools an
+# agent needs for Codex-like shell work. The executor container runs as this
+# non-root user; the API, web, and Temporal worker keep their existing runtime
+# identities.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        bubblewrap \
+        ca-certificates \
+        curl \
+        file \
+        git \
+        iptables \
+        jq \
+        procps \
+        ripgrep \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 sandbox \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/sandbox sandbox \
+    && mkdir /workspace \
+    && chown 65532:65532 /workspace
+
 # Bring in the resolved virtualenv, then the application source.
 COPY --from=build /app/.venv /app/.venv
 COPY . .

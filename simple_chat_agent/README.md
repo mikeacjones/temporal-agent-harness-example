@@ -15,7 +15,7 @@ The app includes:
   visibility, tool approvals, tool configuration, and artifact viewing/downloading.
 - A Temporal worker that hosts the chat workflows, subagent workflow, provider
   activity, generic tool activity, and generic guard activity.
-- Example tools for URL fetches, Python sandbox execution, artifact creation,
+- Example tools for URL fetches, persistent sandboxed shell execution, artifact creation,
   GitHub operations, HTTP MCP servers, optional research/search providers, and
   subagents.
 
@@ -23,7 +23,7 @@ The Python code is split by runtime boundary:
 
 - `simple_chat_agent/api/`: FastAPI app, OAuth flows, SSE, and HTTP API routes.
 - `simple_chat_agent/worker/`: Temporal worker, workflows, tools, codec server,
-  replay tooling, and sandbox Lambda code.
+  replay tooling, and the Bubblewrap workspace executor.
 - `simple_chat_agent/common/`: shared storage, payload conversion, streaming,
   MCP auth, and environment helpers.
 - `simple_chat_agent/frontend/`: React/Vite SPA and the production static
@@ -70,35 +70,35 @@ The worker also starts a Temporal Web codec server at
 that URL to decode claim-checked payloads from the local JSON-file external
 storage.
 
-Locally, the `python_sandbox` tool runs inside a subprocess owned by the worker.
-For deployment, set `PYTHON_SANDBOX_LAMBDA_FUNCTION` on the worker to invoke a
-dedicated executor Lambda instead. The Temporal Activity remains on the normal
-worker so workflow history still shows sandbox schedule/start/close timing and
-failures, but arbitrary Python executes outside the agent worker.
+`workspace_shell` executes Bash, piped Python, curl, git, and other command-line
+work inside Bubblewrap. Each agent workflow receives a stable `/workspace`, so
+files and local virtual environments remain available to later tool calls. The
+Temporal Activity stays on the normal worker for durable orchestration, but the
+command runs in a separate credential-free executor Pod. stdout, stderr,
+progress, exit status, and changed-file metadata stream back through the worker.
 
-Package `simple_chat_agent.worker.sandbox.lambda_handler.lambda_handler` as the
-Lambda handler. The executor Lambda does not need Temporal credentials or app
-environment variables. The worker passes a narrow stream endpoint/token in the
-Lambda invoke payload so long-running code can post stdout/stderr/progress
-events back to the API; the sandbox child process still receives only its
-minimal runner environment. Do not pass agent model keys, OAuth credentials,
-artifact storage config, database config, app session secrets, or Temporal config
-into the Lambda environment. The Lambda execution role should not have app IAM
-permissions and the deploy script should force its configured environment to an
-empty map. Before spawning sandbox code on Linux, the host process marks itself
-non-dumpable where permitted; Lambda runtimes that deny that call fall back to
-overwriting sensitive AWS/Lambda entries in the C process environment before
-unsetting them so same-UID child code cannot recover those values through
-`/proc/<pid>/environ`.
+The executor has no ServiceAccount token, IRSA role, application environment, or
+mounted app secrets. A root-only init container installs Pod-network firewall
+rules permitting DNS plus public HTTP/HTTPS while excluding cluster, VPC,
+loopback, link-local, and metadata ranges, then exits before the executor starts.
+The non-root executor has no network-administration capability and cannot change
+those rules; the equivalent NetworkPolicy remains as defense in depth for
+clusters that enforce it. Readiness also fails closed if an AWS credential
+environment, ServiceAccount token, metadata endpoint, or Kubernetes API becomes
+reachable. Bubblewrap clears the command environment, masks the executor's
+`/proc`, makes the image read-only, and exposes only the selected persistent
+workspace as writable. Activity retries are disabled because an arbitrary command
+may mutate files or external systems; the executor also caches completed results
+by tool-call id to make reconnects idempotent.
 
-The worker that hosts the Temporal Activity needs permission to invoke only that
-sandbox Lambda. Set `SIMPLE_CHAT_PUBLIC_URL` on that worker to the public base
-URL for its own app environment; the Lambda callback posts to
-`/internal/stream` under that URL. Use `PYTHON_SANDBOX_STREAM_SINK_URL` only as
-an explicit override. Set `PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
-published version or alias. The activity retries Lambda invoke/control-plane
-failures, but completed sandbox execution failures are returned to the LLM
-instead of retried.
+The Kubernetes manifests and deployment scripts configure the executor. For a
+local Linux runtime, install `bubblewrap`, set `WORKSPACE_EXECUTOR_TOKEN`, choose
+a writable `WORKSPACE_EXECUTOR_ROOT`, start
+`python -m simple_chat_agent.worker.sandbox.executor`, and give the worker the
+same token plus `WORKSPACE_EXECUTOR_URL=http://127.0.0.1:8082`. The tool is hidden
+when it is not configured. The old `python_sandbox` implementation remains only
+as a rolling-compatibility path for already-running conversations and is not
+advertised to new chats.
 
 For local development, build the frontend once and let the API serve the static
 files:
@@ -139,10 +139,11 @@ registered and the UI uses Google login.
 
 - Start a new chat and ask a normal question.
 - Ask the agent to fetch a URL.
-- Ask it to write and save a small Python file. The `create_artifact` tool will
-  create a persistent artifact that can be viewed or downloaded in the UI.
-- Ask it to run Python. The sandbox tool is a mutating tool, so the workflow will
-  pause for an approval decision before the tool runs.
+- Ask it to create a Python script with `workspace_shell`, run it, and inspect a
+  generated file in a later command. Use `create_artifact` when the final file
+  should be viewable or downloadable in the UI.
+- Ask it to run a Bash pipeline or call a public HTTPS endpoint. The shell is a
+  mutating tool, so the workflow pauses for approval before it runs.
 - Connect an HTTP MCP server from the Tools window and start a new chat so the
   chat workflow receives the updated tool list.
 

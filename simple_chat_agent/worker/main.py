@@ -14,14 +14,28 @@ from agent_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
+from agent_harness.providers.claude import call_agent_api
 from agent_harness.streaming import configure_stream_sink, emit_stream_event_activity
 from agent_harness.tools import run_tool_activity
-from agent_harness.providers.claude import call_agent_api
 from simple_chat_agent import TASK_QUEUE
+from simple_chat_agent.common.env import load_dotenv
+from simple_chat_agent.common.external_storage import simple_chat_data_converter
+from simple_chat_agent.common.mcp_auth import (
+    resolve_mcp_auth_headers,
+    resolve_mcp_http_auth,
+)
+from simple_chat_agent.common.streaming import configured_stream_sink
+from simple_chat_agent.worker.codec_server import (
+    codec_server_enabled,
+    codec_server_host,
+    codec_server_port,
+    codec_server_url,
+    create_codec_app,
+)
 from simple_chat_agent.worker.demo_workspace_activities import (
     configure_demo_workspace,
-    create_demo_workspace_namespace,
     crash_demo_workspace,
+    create_demo_workspace_namespace,
     delete_demo_workspace,
     deploy_demo_workspace_workloads,
     provision_demo_workspace,
@@ -30,23 +44,12 @@ from simple_chat_agent.worker.demo_workspace_activities import (
     wait_demo_workspace_deployment,
 )
 from simple_chat_agent.worker.demo_workspace_workflow import DemoWorkspaceWorkflow
-from simple_chat_agent.worker.codec_server import (
-    codec_server_enabled,
-    codec_server_host,
-    codec_server_port,
-    codec_server_url,
-    create_codec_app,
-)
-from simple_chat_agent.common.env import load_dotenv
-from simple_chat_agent.common.external_storage import simple_chat_data_converter
-from simple_chat_agent.common.mcp_auth import resolve_mcp_auth_headers, resolve_mcp_http_auth
-from simple_chat_agent.common.streaming import configured_stream_sink
 from simple_chat_agent.worker.good_place_guards import good_place_post_guard
-from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
 from simple_chat_agent.worker.streaming_activities import emit_turn_settled
+from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
 from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
 from simple_chat_agent.worker.workflow import SimpleChatWorkflow
-
+from simple_chat_agent.worker.workflow_runner import agent_harness_workflow_runner
 
 WORKER_VERSION_ENV = "SIMPLE_CHAT_WORKER_VERSION"
 WORKER_VERSIONING_ENABLED_ENV = "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED"
@@ -119,6 +122,7 @@ async def main() -> None:
             delete_demo_workspace,
             purge_demo_workspace_payloads,
         ],
+        workflow_runner=agent_harness_workflow_runner(),
         deployment_config=deployment_config,
     )
     try:

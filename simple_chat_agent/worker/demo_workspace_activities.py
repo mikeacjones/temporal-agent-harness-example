@@ -457,20 +457,15 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, Any]]:
         "SIMPLE_CHAT_PUBLIC_URL": request.url,
         "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID": request.control_workflow_id,
         "SIMPLE_CHAT_DEMO_PARENT_PUBLIC_URL": request.parent_public_url,
+        # Temporary crash-demo namespaces do not provision a credential-free
+        # workspace executor or its NetworkPolicy/PVC yet.
+        "SIMPLE_CHAT_WORKSPACE_SHELL_ENABLED": "0",
     }
     if os.environ.get("SIMPLE_CHAT_S3_BUCKET"):
         values["SIMPLE_CHAT_S3_BUCKET"] = os.environ["SIMPLE_CHAT_S3_BUCKET"]
     if os.environ.get("SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"):
         values["SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"] = os.environ[
             "SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"
-        ]
-    if os.environ.get("PYTHON_SANDBOX_LAMBDA_FUNCTION"):
-        values["PYTHON_SANDBOX_LAMBDA_FUNCTION"] = os.environ[
-            "PYTHON_SANDBOX_LAMBDA_FUNCTION"
-        ]
-    if os.environ.get("PYTHON_SANDBOX_LAMBDA_QUALIFIER"):
-        values["PYTHON_SANDBOX_LAMBDA_QUALIFIER"] = os.environ[
-            "PYTHON_SANDBOX_LAMBDA_QUALIFIER"
         ]
     if os.environ.get(SEARXNG_BASE_URL):
         values[SEARXNG_BASE_URL] = os.environ[SEARXNG_BASE_URL]

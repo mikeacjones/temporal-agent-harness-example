@@ -20,6 +20,7 @@ import {
   mergeReplayedTurnTracesInState,
   normalizeAgentSettings,
   prependTranscriptPageInState,
+  restoreActiveStreamTurnInState,
   saveAgentSettings,
   setTurnTraceErrorInState,
   setTurnTraceLoadingInState,
@@ -34,6 +35,7 @@ import {
   emptyArtifactViewer,
   initialState,
 } from "./state/initialState.js";
+import { latestBufferedStreamCursor } from "./state/streamBuffer.js";
 import { AgentStreamEventKind } from "./state/streamEvents.js";
 
 const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:v2:";
@@ -232,7 +234,16 @@ export default function App() {
       if (document.hidden) return;
       const current = stateRef.current;
       if (current.auth === "app" && current.workflowId) {
-        reconcileWorkflow(current.workflowId, { resumeActive: true });
+        // Browsers may keep delivering SSE callbacks while suspending animation
+        // frames in a background tab. Apply anything already received before
+        // reconnecting, then replay Redis so events the browser never delivered
+        // are folded back into the live projection as well.
+        flushStreamEventsNow();
+        closeTurnStream();
+        reconcileWorkflow(current.workflowId, {
+          resumeActive: true,
+          restoreActiveStream: true,
+        });
       }
     }
 
@@ -331,6 +342,7 @@ export default function App() {
   }
 
   function beginTurnStream(workflowId) {
+    flushStreamEventsNow();
     closeTurnStream();
     clearLiveStreamState();
     turnStreamTokenRef.current += 1;
@@ -346,8 +358,8 @@ export default function App() {
     streamEventFrameRef.current = null;
   }
 
-  function enqueueStreamEvent(workflowId, event) {
-    streamEventBufferRef.current.push({ workflowId, event });
+  function enqueueStreamEvent(workflowId, event, cursor = "") {
+    streamEventBufferRef.current.push({ workflowId, event, cursor });
     if (streamEventFrameRef.current !== null) return;
     streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
   }
@@ -366,6 +378,9 @@ export default function App() {
     streamEventBufferRef.current = [];
     if (!pending.length) return;
 
+    const activeWorkflowId = stateRef.current.workflowId;
+    const appliedCursor = latestBufferedStreamCursor(pending, activeWorkflowId);
+
     setState((previous) => {
       let next = previous;
       for (const { workflowId, event } of pending) {
@@ -374,6 +389,7 @@ export default function App() {
       }
       return next;
     });
+    if (appliedCursor) streamCursorRef.current = appliedCursor;
 
     if (streamEventBufferRef.current.length) {
       streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
@@ -530,6 +546,37 @@ export default function App() {
     };
   }
 
+  async function loadActiveStreamReplayData(workflowId) {
+    const events = [];
+    let cursor = "";
+    for (let page = 0; page < 50; page += 1) {
+      const params = new URLSearchParams({ limit: "5000" });
+      if (cursor) params.set("cursor", cursor);
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(workflowId)}/stream/events?${params}`,
+        { headers: { "Cache-Control": "no-cache" } },
+      );
+      if (response.status === 401) {
+        showLogin();
+        return null;
+      }
+      if (response.status === 404) {
+        await handleMissingWorkflow();
+        return null;
+      }
+      if (!response.ok) throw new Error(await responseErrorText(response));
+      const replay = await response.json();
+      if (!replay.replay_available) return replay;
+      events.push(...(replay.events || []));
+      const nextCursor = replay.cursor || cursor;
+      if (!replay.has_more || nextCursor === cursor) {
+        return { ...replay, cursor: nextCursor, events };
+      }
+      cursor = nextCursor;
+    }
+    throw new Error("active stream replay exceeded 250,000 retained events");
+  }
+
   function logSessionLoadTiming(label, workflowId, started, response, workflowState) {
     const elapsed = Math.round(performance.now() - started);
     const serverTiming = response.headers.get("server-timing") || "";
@@ -633,6 +680,7 @@ export default function App() {
     }));
     loadWorkflowStateAndConnect(conversation.workflow_id, loadRequest, {
       resumeActive: true,
+      restoreActiveStream: true,
     }).catch((error) => {
       if (stateLoadRequestRef.current !== loadRequest) return;
       setStatusNotice(`state load failed: ${error}`);
@@ -654,8 +702,31 @@ export default function App() {
         : previous,
     );
     if (options.resumeActive && workflowHasActiveRun(loaded.workflowState)) {
+      let resumeCursor = streamCursorRef.current || loaded.streamCursor;
+      if (options.restoreActiveStream) {
+        try {
+          const replay = await loadActiveStreamReplayData(workflowId);
+          if (
+            stateLoadRequestRef.current !== loadRequest ||
+            stateRef.current.workflowId !== workflowId
+          ) {
+            return;
+          }
+          if (replay?.replay_available) {
+            resumeCursor = replay.cursor || resumeCursor;
+            streamCursorRef.current = resumeCursor;
+            setState((previous) =>
+              previous.workflowId === workflowId
+                ? restoreActiveStreamTurnInState(previous, replay.events || [])
+                : previous,
+            );
+          }
+        } catch (error) {
+          console.warn("active stream replay failed", { workflowId, error });
+        }
+      }
       resumeActiveTurnStream(workflowId, {
-        cursor: streamCursorRef.current || loaded.streamCursor,
+        cursor: resumeCursor,
         afterRevision: loaded.workflowState?.transcript_revision || 0,
       }).catch((error) => {
         setStatusNotice(`stream resume failed: ${error}`);
@@ -665,7 +736,8 @@ export default function App() {
 
   function reconcileWorkflow(workflowId, options = {}) {
     if (!workflowId) return;
-    clearLiveStreamState();
+    flushStreamEventsNow();
+    clearWorkflowStateRefresh();
     const loadRequest = nextStateLoadRequest();
     loadWorkflowStateAndConnect(workflowId, loadRequest, options).catch((error) => {
       if (stateLoadRequestRef.current !== loadRequest) return;
@@ -828,10 +900,9 @@ export default function App() {
 
       source.addEventListener("stream", (message) => {
         if (turnStreamTokenRef.current !== token) return;
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
         const streamEvent = parseStreamEventData(message);
         if (!streamEvent) return;
-        enqueueStreamEvent(workflowId, streamEvent);
+        enqueueStreamEvent(workflowId, streamEvent, message.lastEventId);
         if (
           streamEvent.kind === AgentStreamEventKind.AGENT_START &&
           streamEvent.agent?.kind !== "subagent"
@@ -845,6 +916,7 @@ export default function App() {
 
       source.addEventListener("turn_settled", async (message) => {
         if (turnStreamTokenRef.current !== token) return;
+        flushStreamEventsNow();
         if (message.lastEventId) streamCursorRef.current = message.lastEventId;
         const body = parseStreamEventData(message);
         if (!body) {
@@ -854,27 +926,34 @@ export default function App() {
         }
         if (body.cursor) streamCursorRef.current = body.cursor;
         settled = true;
-        flushStreamEventsNow();
         await applyTurnSettledResult(workflowId, body.result);
         finish();
       });
 
       source.addEventListener("reconcile", (message) => {
         if (turnStreamTokenRef.current !== token) return;
+        flushStreamEventsNow();
         if (message.lastEventId) streamCursorRef.current = message.lastEventId;
         reconciled = true;
         finish();
-        deferReconcileWorkflow(workflowId, { resumeActive: true });
+        deferReconcileWorkflow(workflowId, {
+          resumeActive: true,
+          restoreActiveStream: true,
+        });
       });
 
       source.onerror = () => {
+        flushStreamEventsNow();
         if (turnStreamTokenRef.current !== token) {
           finish();
           return;
         }
         if (source.readyState === EventSource.CLOSED && !settled && !reconciled) {
           finish();
-          deferReconcileWorkflow(workflowId, { resumeActive: true });
+          deferReconcileWorkflow(workflowId, {
+            resumeActive: true,
+            restoreActiveStream: true,
+          });
         }
       };
     });
@@ -2126,6 +2205,7 @@ export default function App() {
             }}
           >
             <Messages
+              workflowId={state.workflowId}
               workflowState={state.workflowState}
               draftConversation={state.draftConversation}
               loadingConversation={loadingConversation}
@@ -2213,6 +2293,7 @@ export default function App() {
           open={selectedTraceIndex !== null && selectedTraceIndex !== undefined}
           trace={selectedTrace}
           transcriptIndex={selectedTraceIndex}
+          workflowId={state.workflowId}
           onClose={() =>
             setState((previous) => ({
               ...previous,
