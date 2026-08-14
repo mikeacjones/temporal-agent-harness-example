@@ -136,7 +136,7 @@ spec:
         - name: workspaces
           # The sa-demo cluster currently has no dynamic block-storage CSI
           # provisioner. This still persists files between tool calls for the
-          # lifetime of the executor pod; production uses the PVC-backed form.
+          # lifetime of the executor pod.
           emptyDir:
             sizeLimit: 5Gi
         - name: executor-tmp

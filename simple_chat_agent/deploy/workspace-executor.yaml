@@ -5,18 +5,6 @@ metadata:
   namespace: temporal-michaelj-agent-harness-demo
 automountServiceAccountToken: false
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: agent-harness-workspaces
-  namespace: temporal-michaelj-agent-harness-demo
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,8 +14,8 @@ metadata:
     app: agent-harness-workspace-executor
     component: workspace-executor
 spec:
-  # The default gp2 volume is RWO, so terminate the old executor before a new
-  # Pod mounts the conversation workspaces during a rollout.
+  # Workspaces live for the lifetime of the executor pod. Recreate keeps the
+  # rollout behavior explicit and prevents overlapping command execution.
   strategy:
     type: Recreate
   replicas: 1
@@ -151,8 +139,11 @@ spec:
               memory: 1Gi
       volumes:
         - name: workspaces
-          persistentVolumeClaim:
-            claimName: agent-harness-workspaces
+          # The sa-demo cluster has no dynamic block-storage CSI provisioner.
+          # This persists files between tool calls for the executor pod's
+          # lifetime, but an executor rollout starts with a fresh workspace.
+          emptyDir:
+            sizeLimit: 5Gi
         - name: executor-tmp
           emptyDir:
             sizeLimit: 512Mi

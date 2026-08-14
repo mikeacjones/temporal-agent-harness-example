@@ -25,12 +25,14 @@ any local volume:
 - `agent-harness-worker` — Temporal worker + codec. Horizontally scalable (bump
   `replicas`); the codec reads claim-checks from S3, so any worker pod decodes.
 - `agent-harness-workspace-executor` — authenticated Bubblewrap command runner
-  with public-web-only egress. Production uses a persistent PVC; the current
-  `sa-demo` testing manifest uses a 5 Gi `emptyDir` because that cluster has no
-  dynamic block-storage CSI provisioner. A `NET_ADMIN` init container installs
-  the Pod's egress firewall and exits; the long-running executor is non-root and
-  capless. It receives no app secret, ServiceAccount token, or IAM role, and
-  refuses readiness if an ambient AWS or Kubernetes credential path is detected.
+  with public-web-only egress. Production and testing use a 5 Gi `emptyDir`
+  because the `sa-demo` cluster has no dynamic block-storage CSI provisioner.
+  Files persist between tool calls for the executor pod's lifetime, but an
+  executor rollout starts with a fresh workspace. A `NET_ADMIN` init container
+  installs the Pod's egress firewall and exits; the long-running executor is
+  non-root and capless. It receives no app secret, ServiceAccount token, or IAM
+  role, and refuses readiness if an ambient AWS or Kubernetes credential path
+  is detected.
 
 ## Deployment Philosophy
 
@@ -206,8 +208,7 @@ to a local on-disk store (used for local dev).
 | Claim-check payloads and artifact bytes | S3 (`SIMPLE_CHAT_S3_BUCKET`) | survives redeploys; chat delete purges known prefixes |
 | GitHub/MCP OAuth tokens | DynamoDB (`SIMPLE_CHAT_DYNAMODB_TABLE`, table `…-oauth`) | survives redeploys; SSE-encrypted; accessed via IRSA |
 | Ordered deployed stream events and cursors | Redis Streams + AOF on `emptyDir` | 30-minute idle TTL; survives API and Redis-container restarts, not Redis-pod replacement |
-| Production agent command workspaces | 5 Gi `ReadWriteOnce` PVC | stable per agent workflow; survives executor and worker Pod replacement |
-| `sa-demo` testing agent command workspaces | 5 Gi `emptyDir` | stable between tool calls; lost when the executor Pod is replaced |
+| Production and testing agent command workspaces | 5 Gi `emptyDir` | stable between tool calls; lost when the executor Pod is replaced |
 | Transient OAuth handshake state and local-dev stream/artifact files | local `emptyDir` | ephemeral; lost on restart |
 
 When the S3 / DynamoDB env vars are unset (local dev), the app falls back to
